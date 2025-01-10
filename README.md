@@ -57,3 +57,5 @@ Your Reddit username and password
 
 User agent subreddit_summarizer (by /u/your reddit username) 
 
+As most people do now own a paid Apple developer account, it is best to export to an IPA file and sideload through one of the available tools for that.
+
