@@ -33,3 +33,12 @@ The other button , overall (yes stupid name, working in progress) will open a ne
 
 Just like on the previous function, now just press either summarize all comments  for a more verbose and detailed summary, or ask a question for q&a
 ![image](https://github.com/user-attachments/assets/8a17713a-1285-47af-8ad0-0c3d6d042dd3)
+
+
+INSTRUCTIONS:
+Download xcode from Apple
+
+Open the file  redapp2.xcodeproj
+
+Get a gemeni api key from Google ai studio and paste on the part of the code 
+![CleanShot 2025-01-10 at 15 09 39@2x](https://github.com/user-attachments/assets/f6ad1416-bb09-42f4-bd93-8950a3359bcf)
