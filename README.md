@@ -42,3 +42,18 @@ Open the file  redapp2.xcodeproj
 
 Get a gemeni api key from Google ai studio and paste on the part of the code 
 ![CleanShot 2025-01-10 at 15 09 39@2x](https://github.com/user-attachments/assets/f6ad1416-bb09-42f4-bd93-8950a3359bcf)
+
+On your reddit account create an app : https://old.reddit.com/prefs/apps
+
+After creating the app, fill those details on this part of the code
+
+![CleanShot 2025-01-10 at 15 10 56@2x](https://github.com/user-attachments/assets/24452844-81f3-4b6a-a5df-69afd43d588f)
+
+Client ID  - as per the new app created
+
+Client Secret - as per the new app created
+
+Your Reddit username and password
+
+User agent subreddit_summarizer (by /u/your reddit username) 
+
