@@ -39,6 +39,7 @@ INSTRUCTIONS:
 Download xcode from Apple
 
 Open the file  redapp2.xcodeproj
+Install package Kingfisher
 
 Get a gemeni api key from Google ai studio and paste on the part of the code 
 ![CleanShot 2025-01-10 at 15 09 39@2x](https://github.com/user-attachments/assets/f6ad1416-bb09-42f4-bd93-8950a3359bcf)
