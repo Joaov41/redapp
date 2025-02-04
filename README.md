@@ -1,5 +1,6 @@
 # redapp
-A Reddit app that works with a free personal Reddit API key, featuring comment summarization.
+A Reddit app IOS ( Iphone layout) that works with a free personal Reddit API key, featuring comment summarization.
+There is also a version with the same functionality, but with layout for Ipad and Mac ( universal app ) 
 
 
 Inspired by the incredible work of the team at https://lo.cafe, particularly their fantastic app OpenArtemis,  set out to enhance this concept of an app that uses Reddit’s free personal API, aiming to add the functionality of comments summarization.
