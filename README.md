@@ -4,11 +4,14 @@ A Reddit Universal app ( Apple silicon Macs and Ipads) that works with a free pe
 Inspired by the incredible work of the team at https://lo.cafe, particularly their fantastic app OpenArtemis,  set out to enhance this concept of an app that uses Reddit’s free personal API, aiming to add the functionality of comments summarization.
 
 Just type the name of the subreddit (without the r/), select the nuber of posts to show ( maximum 100) and the if New, Hot, or Top and press load
-![image](https://github.com/user-attachments/assets/a1ab5dca-da77-4dc7-8b5c-b759a55bbedf)
+
+![CleanShot 2025-04-10 at 18 52 57@2x](https://github.com/user-attachments/assets/e3a2c145-3e8e-4c6b-9a1c-4bd19b22ec5a)
+
+
 
 This is the main view of the posts.Pressing the image will open same on a separate view, swiping right to left open that post on the browser if you like to comment on it, swiping left ro right will whow more of the truncated text of the post
-![image](https://github.com/user-attachments/assets/230966c7-31cd-49a7-b6c9-35bbcfd5958f)
-![image](https://github.com/user-attachments/assets/fe136ce0-52c3-4ab4-b4e1-bfd4e762cc07)
+![CleanShot 2025-04-10 at 18 53 21@2x](https://github.com/user-attachments/assets/90127103-680b-4659-ad8a-1882a5431331)
+
 
 Pressing the title of each posts will take you to the comments
 ![image](https://github.com/user-attachments/assets/8193c0b6-00cc-4dc2-a291-87de530c7521)
