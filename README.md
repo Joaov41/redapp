@@ -14,8 +14,6 @@ This is the main view of the posts.Pressing the image will open same on a separa
 
 
 Pressing the title of each posts will take you to the comments
-![image](https://github.com/user-attachments/assets/8193c0b6-00cc-4dc2-a291-87de530c7521)
-![image](https://github.com/user-attachments/assets/dcbc293d-c1c5-457d-a0a7-33faa97c3adf)
 
 There you can find the Summarize comments button which will provide a compreensive summarization of the comments. The Summarize is verbose, it was designed this for my personal preference, if you wish for something short just go directly to the ask question part and enter a simple prompt like "give me a short summary of the comments"
 Either pressing the summarize button first or going direcly to ther ask question, the ask function allows to engage in q&a about the comments of that post.
