@@ -1,7 +1,5 @@
 # redapp
-A Reddit app IOS ( Iphone layout) that works with a free personal Reddit API key, featuring comment summarization.
-There is also a version with the same functionality, but with layout for Ipad and Mac ( universal app ) 
-
+A Reddit Universal app ( Apple silicon Macs and Ipads) that works with a free personal Reddit API key, featuring comment summarization and Q&A about the comments. 
 
 Inspired by the incredible work of the team at https://lo.cafe, particularly their fantastic app OpenArtemis,  set out to enhance this concept of an app that uses Reddit’s free personal API, aiming to add the functionality of comments summarization.
 
@@ -36,6 +34,8 @@ Install package Kingfisher
 
 Get a gemeni api key from Google ai studio and paste on the part of the code 
 ![CleanShot 2025-01-10 at 15 09 39@2x](https://github.com/user-attachments/assets/f6ad1416-bb09-42f4-bd93-8950a3359bcf)
+
+Get a free reddit API credentials 
 
 
 As most people do now own a paid Apple developer account, it is best to export to an IPA file and sideload through one of the available tools for that.
