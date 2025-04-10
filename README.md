@@ -32,13 +32,13 @@ Download xcode from Apple
 Open the file  redapp2.xcodeproj
 Install package Kingfisher
 
-Get a gemeni api key from Google ai studio and paste on the part of the code 
-![CleanShot 2025-01-10 at 15 09 39@2x](https://github.com/user-attachments/assets/f6ad1416-bb09-42f4-bd93-8950a3359bcf)
-
+Get a gemeni api key from Google ai studio
 Get a free reddit API credentials 
 
 
 As most people do now own a paid Apple developer account, it is best to export to an IPA file and sideload through one of the available tools for that.
+
+UPDATE: I have added the ipa file notorized by Apple
 
 Fixed a bug where on posts with a large number of comments, the app would become slow or unresponsive. 
 Fixed a bug where on posts with a large number of comments, the app would hit a limite and would only consider up to 200 comments. Now it can handle all the comments , even if it reaches hundreds.
