@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>destination</key>
+	<string>export</string>
+	<key>method</key>
+	<string>app-store-connect</string>
+	<key>signingStyle</key>
+	<string>manual</string>
+	<key>teamID</key>
+	<string>HNG8WV554B</string>
+	<key>provisioningProfiles</key>
+	<dict>
+		<key>com.jv.redapp</key>
+		<string>IOS_APP_STORE-20260326</string>
+		<key>com.jv.redapp.widget</key>
+		<string>IOS_APP_STORE-20260326</string>
+	</dict>
+	<key>uploadBitcode</key>
+	<false/>
+	<key>uploadSymbols</key>
+	<true/>
+</dict>
+</plist>
