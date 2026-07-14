@@ -373,7 +373,7 @@ struct ResearchRunDetailView: View {
                     Button {
                         generateGroundedReport()
                     } label: {
-                        Label("Generate an additional citation-checked report", systemImage: "checkmark.seal")
+                        Label("Create a report with source links", systemImage: "checkmark.seal")
                     }
                 } label: {
                     if isGeneratingGroundedReport {
@@ -383,7 +383,7 @@ struct ResearchRunDetailView: View {
                     }
                 }
                 .disabled(isGeneratingGroundedReport || detail?.sources.isEmpty != false)
-                .accessibilityLabel("Additional report options")
+                .accessibilityLabel("More report options")
 
                 Menu {
                     Button {
@@ -445,7 +445,7 @@ struct ResearchRunDetailView: View {
             Text("Overall summary")
         } footer: {
             if detail.revisionArtifacts.overallSummary != nil {
-                Text("This reuses the batch-wide summary you already generated. The seal button is optional and creates a separate citation-checked report.")
+                Text("This is the summary you already created. Use the … menu to create a separate report with links to the original posts and comments.")
             }
         }
     }
@@ -477,7 +477,7 @@ struct ResearchRunDetailView: View {
             NavigationLink {
                 ResearchConversationView(runID: runID)
             } label: {
-                Label("New grounded conversation", systemImage: "plus.bubble")
+                Label("Ask about this saved batch", systemImage: "plus.bubble")
             }
             ForEach(detail.conversations) { conversation in
                 NavigationLink {
@@ -720,9 +720,12 @@ private struct ResearchArtifactView: View {
     private var artifactContent: some View {
         VStack(alignment: .leading, spacing: 10) {
             if artifact.legacyUncited {
-                Label("Legacy output: claim-level evidence was not captured.", systemImage: "exclamationmark.triangle")
+                Label(
+                    "This summary was created before source links were saved. Its points cannot open the original posts or comments.",
+                    systemImage: "info.circle"
+                )
                     .font(.caption)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(.secondary)
             }
             if claims.isEmpty {
                 MarkdownTextView(content: artifact.body, fontScale: 0.8)
@@ -751,7 +754,7 @@ private struct ResearchArtifactView: View {
                         if !claim.conflictingSourceIDs.isEmpty {
                             ScrollView(.horizontal, showsIndicators: false) {
                                 HStack {
-                                    Label("Conflicting evidence", systemImage: "arrow.triangle.branch")
+                                    Label("Sources disagree", systemImage: "arrow.triangle.branch")
                                         .font(.caption)
                                         .foregroundStyle(.orange)
                                     ForEach(claim.conflictingSourceIDs, id: \.self) { sourceID in
@@ -780,7 +783,7 @@ private struct ResearchArtifactView: View {
                     .padding(.vertical, 5)
                 }
                 DisclosureGroup("What does confidence mean?") {
-                    Text("Confidence describes the strength and breadth of the saved evidence. Low does not mean false; it means support may be limited, conflicting, drawn from too few independent posts, or affected by incomplete coverage.")
+                    Text("Confidence shows how much support the app found for a point. Low does not mean the point is wrong. It means there were few supporting posts or comments, some sources disagreed, or not enough comments were available.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(nil)
@@ -1444,7 +1447,7 @@ private struct ResearchComparisonReportView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             if plainLanguageNarrative.isEmpty {
-                Text("The saved evidence was not sufficient to describe a clear change in the discussion.")
+                Text("There wasn’t enough saved information to explain how the discussion changed.")
                     .foregroundStyle(.secondary)
                     .lineLimit(nil)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1457,7 +1460,7 @@ private struct ResearchComparisonReportView: View {
                     .textSelection(.enabled)
             }
 
-            DisclosureGroup("Evidence, confidence, and limitations") {
+            DisclosureGroup("Sources and limitations") {
                 evidenceContent
             }
         }
