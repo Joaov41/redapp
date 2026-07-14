@@ -49,6 +49,7 @@ struct ResearchRunDetail {
 
 struct ResearchRevisionArtifacts {
     let overallSummary: ResearchArtifactRecord?
+    let sourceLinkedReport: ResearchArtifactRecord?
     let postSummaries: [ResearchArtifactRecord]
     let remainingArtifacts: [ResearchArtifactRecord]
 
@@ -63,7 +64,8 @@ struct ResearchRevisionArtifacts {
             .filter { !$0.legacyUncited }
             .max { $0.createdAt < $1.createdAt }
         let savedBatchOverview = nonemptyOverallReports.last {
-            $0.title.caseInsensitiveCompare("Overall Summary") == .orderedSame
+            $0.legacyUncited
+                && $0.title.caseInsensitiveCompare("Overall Summary") == .orderedSame
         }
         let legacyBatchSummary = nonemptyArtifacts.last { $0.kind == .batchSummary }
         let overallTable = nonemptyArtifacts.last {
@@ -71,17 +73,20 @@ struct ResearchRevisionArtifacts {
                 && $0.title.localizedCaseInsensitiveContains("overall summary")
         }
         let categorizedSummary = nonemptyArtifacts.last { $0.kind == .categorizedReport }
-        let selectedOverall = newestLinkedOverallReport
-            ?? savedBatchOverview
+        let otherSavedOverview = nonemptyOverallReports.last { $0.legacyUncited }
+        let selectedOverall = savedBatchOverview
             ?? legacyBatchSummary
             ?? overallTable
             ?? categorizedSummary
-            ?? nonemptyOverallReports.last
+            ?? otherSavedOverview
 
         overallSummary = selectedOverall
+        sourceLinkedReport = newestLinkedOverallReport
         postSummaries = artifacts.filter { $0.kind == .postSummary }
         remainingArtifacts = artifacts.filter { artifact in
-            artifact.id != selectedOverall?.id && artifact.kind != .postSummary
+            artifact.id != selectedOverall?.id
+                && artifact.id != newestLinkedOverallReport?.id
+                && artifact.kind != .postSummary
         }
     }
 }

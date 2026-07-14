@@ -291,6 +291,7 @@ struct ResearchRunDetailView: View {
     @State private var selectedSource: ResearchSourceRecord?
     @State private var exportDocument: ResearchExportDocument?
     @State private var errorMessage: String?
+    @State private var isGeneratingCompleteOverview = false
     @State private var isGeneratingGroundedReport = false
     @State private var isUpdatingOfflinePack = false
 
@@ -298,6 +299,7 @@ struct ResearchRunDetailView: View {
         List {
             if let detail {
                 overallSummarySection(detail)
+                sourceLinkedReportSection(detail)
                 coverageSection(detail.run.coverage)
                 postSummariesSection(detail)
                 remainingArtifactsSection(detail)
@@ -370,19 +372,35 @@ struct ResearchRunDetailView: View {
                 .accessibilityLabel("Re-export")
 
                 Menu {
+                    if detail?.revisionArtifacts.overallSummary == nil,
+                       detail?.revisionArtifacts.postSummaries.isEmpty == false {
+                        Button {
+                            generateCompleteOverview()
+                        } label: {
+                            Label(
+                                "Create full overview from all saved posts",
+                                systemImage: "doc.text.magnifyingglass"
+                            )
+                        }
+                        .disabled(isGeneratingCompleteOverview)
+                    }
                     Button {
                         generateGroundedReport()
                     } label: {
-                        Label("Create a report with source links", systemImage: "checkmark.seal")
+                        Label("Create key points with source links", systemImage: "checkmark.seal")
                     }
+                    .disabled(isGeneratingGroundedReport || detail?.sources.isEmpty != false)
                 } label: {
-                    if isGeneratingGroundedReport {
+                    if isGeneratingCompleteOverview || isGeneratingGroundedReport {
                         ProgressView()
                     } else {
                         Image(systemName: "ellipsis.circle")
                     }
                 }
-                .disabled(isGeneratingGroundedReport || detail?.sources.isEmpty != false)
+                .disabled(
+                    isGeneratingCompleteOverview
+                        || isGeneratingGroundedReport
+                )
                 .accessibilityLabel("More report options")
 
                 Menu {
@@ -435,17 +453,67 @@ struct ResearchRunDetailView: View {
     @ViewBuilder
     private func overallSummarySection(_ detail: ResearchRunDetail) -> some View {
         Section {
+            Label(
+                "\(detail.revisionArtifacts.postSummaries.count) saved post summaries",
+                systemImage: "doc.on.doc"
+            )
+            .font(.subheadline.weight(.semibold))
             if let summary = detail.revisionArtifacts.overallSummary {
-                artifactView(summary, in: detail, presentation: .expanded)
+                artifactView(
+                    summary,
+                    in: detail,
+                    presentation: .expanded,
+                    showsSourceLinkNotice: false
+                )
             } else {
-                Text("No overall summary was saved for this revision.")
-                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("A full overview was not created when this revision was saved.")
+                        .foregroundStyle(.secondary)
+                    if !detail.revisionArtifacts.postSummaries.isEmpty {
+                        Button {
+                            generateCompleteOverview()
+                        } label: {
+                            if isGeneratingCompleteOverview {
+                                Label("Creating full overview…", systemImage: "hourglass")
+                            } else {
+                                Label(
+                                    "Create overview from all \(detail.revisionArtifacts.postSummaries.count) posts",
+                                    systemImage: "doc.text.magnifyingglass"
+                                )
+                            }
+                        }
+                        .disabled(isGeneratingCompleteOverview)
+                    }
+                }
             }
         } header: {
-            Text("Overall summary")
+            Text("Complete overview")
         } footer: {
             if detail.revisionArtifacts.overallSummary != nil {
-                Text("This is the summary you already created. Use the … menu to create a separate report with links to the original posts and comments.")
+                Text("This overview was created from all saved post summaries. Source-linked key points are shown separately below.")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func sourceLinkedReportSection(_ detail: ResearchRunDetail) -> some View {
+        if let report = detail.revisionArtifacts.sourceLinkedReport {
+            let representedPosts = representedPostCount(for: report, in: detail)
+            let savedPosts = max(
+                detail.revisionArtifacts.postSummaries.count,
+                Set(detail.sources.map(\.postSourceID)).count
+            )
+            Section {
+                Label(
+                    "\(representedPosts) of \(savedPosts) saved posts directly linked",
+                    systemImage: "link"
+                )
+                .font(.subheadline.weight(.semibold))
+                artifactView(report, in: detail, presentation: .expanded)
+            } header: {
+                Text("Key points with source links")
+            } footer: {
+                Text("These are selected, directly supported points—not the complete overview. The full set remains in the individual post summaries below.")
             }
         }
     }
@@ -453,9 +521,14 @@ struct ResearchRunDetailView: View {
     @ViewBuilder
     private func postSummariesSection(_ detail: ResearchRunDetail) -> some View {
         if !detail.revisionArtifacts.postSummaries.isEmpty {
-            Section("Individual post summaries") {
+            Section("Individual post summaries (\(detail.revisionArtifacts.postSummaries.count))") {
                 ForEach(detail.revisionArtifacts.postSummaries) { artifact in
-                    artifactView(artifact, in: detail, presentation: .disclosure)
+                    artifactView(
+                        artifact,
+                        in: detail,
+                        presentation: .disclosure,
+                        showsSourceLinkNotice: false
+                    )
                 }
             }
         }
@@ -497,7 +570,8 @@ struct ResearchRunDetailView: View {
     private func artifactView(
         _ artifact: ResearchArtifactRecord,
         in detail: ResearchRunDetail,
-        presentation: ResearchArtifactPresentation
+        presentation: ResearchArtifactPresentation,
+        showsSourceLinkNotice: Bool = true
     ) -> some View {
         ResearchArtifactView(
             runID: runID,
@@ -519,8 +593,22 @@ struct ResearchRunDetailView: View {
             },
             openSource: { selectedSource = $0 },
             onOfflineChange: reload,
-            presentation: presentation
+            presentation: presentation,
+            showsSourceLinkNotice: showsSourceLinkNotice
         )
+    }
+
+    private func representedPostCount(
+        for artifact: ResearchArtifactRecord,
+        in detail: ResearchRunDetail
+    ) -> Int {
+        let sourcesByID = Dictionary(uniqueKeysWithValues: detail.sources.map { ($0.sourceID, $0) })
+        let postIDs = (claimsByArtifact[artifact.id] ?? []).flatMap { claim in
+            (citationsByClaim[claim.id] ?? [])
+                .filter(\.validated)
+                .compactMap { sourcesByID[$0.sourceID]?.postSourceID }
+        }
+        return Set(postIDs).count
     }
 
     @ViewBuilder
@@ -579,6 +667,84 @@ struct ResearchRunDetailView: View {
         }
     }
 
+    private func generateCompleteOverview() {
+        guard let detail else { return }
+        let postSummaries = detail.revisionArtifacts.postSummaries
+        guard !postSummaries.isEmpty else {
+            errorMessage = "This revision has no saved post summaries to combine."
+            return
+        }
+
+        isGeneratingCompleteOverview = true
+        errorMessage = nil
+        let prompt = completeOverviewPrompt(from: postSummaries, detail: detail)
+        let startedAt = Date()
+        Task {
+            do {
+                let service = SummaryService.shared
+                let generated: String
+                if service.settings.selectedSummaryProvider == .webAI {
+                    generated = try await AppState.shared.performWebAIRequestAsync(
+                        title: "Complete Revision Overview",
+                        prompt: prompt
+                    )
+                } else {
+                    generated = try await service.summarize(text: prompt)
+                }
+
+                let body = generated.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !body.isEmpty else { throw GroundedResearchError.invalidResponse }
+                try store.addArtifact(
+                    runID: runID,
+                    kind: .overallReport,
+                    title: "Overall Summary",
+                    body: body,
+                    generationReceipt: ResearchGenerationReceiptFactory.make(
+                        settings: service.settings,
+                        startedAt: startedAt,
+                        completedAt: Date(),
+                        promptVersion: 2,
+                        responseSchemaVersion: 0
+                    ),
+                    coverage: detail.run.coverage,
+                    legacyUncited: true
+                )
+                reload()
+            } catch is CancellationError {
+                // Closing the revision while generation is running is not an error.
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+            isGeneratingCompleteOverview = false
+        }
+    }
+
+    private func completeOverviewPrompt(
+        from postSummaries: [ResearchArtifactRecord],
+        detail: ResearchRunDetail
+    ) -> String {
+        let inputBudget = 50_000
+        let perSummaryLimit = max(120, min(1_200, inputBudget / max(postSummaries.count, 1)))
+        let entries = postSummaries.enumerated().map { index, artifact in
+            """
+            Post \(index + 1): \(artifact.title)
+            Saved summary: \(String(artifact.body.prefix(perSummaryLimit)))
+            """
+        }.joined(separator: "\n\n---\n\n")
+
+        return """
+        Create a complete, plain-language overview of this saved Reddit batch.
+
+        The input contains \(postSummaries.count) saved post summaries. Consider every numbered summary before writing. Combine related posts into themes, explain the overall tone, identify repeated concerns and disagreements, and mention important minority topics so that the result is not based on only a few posts. Do not claim that every user agrees. Do not invent details.
+
+        Use clear Markdown headings and short paragraphs. End with a short coverage sentence stating that all \(postSummaries.count) saved post summaries were included in the request. Do not output a table or a post-by-post list.
+
+        Saved batch coverage: \(detail.run.coverage.postsAnalyzed) posts analyzed and \(detail.run.coverage.commentsAnalyzed) comments analyzed.
+
+        \(entries)
+        """
+    }
+
     private func generateGroundedReport() {
         guard let detail else { return }
         isGeneratingGroundedReport = true
@@ -587,7 +753,7 @@ struct ResearchRunDetailView: View {
         Task {
             do {
                 let result = try await GroundedResearchService.shared.generateReport(
-                    instruction: "Produce a concise evidence-grounded report of the most important findings in this saved batch.",
+                    instruction: "Create a concise set of selected key points with direct source links from this saved batch. Do not present these selected points as the complete overview. Prefer support from different posts when the available material allows it.",
                     sources: inputs,
                     coverage: detail.run.coverage
                 )
@@ -683,6 +849,7 @@ private struct ResearchArtifactView: View {
     let openSource: (ResearchSourceRecord) -> Void
     let onOfflineChange: () -> Void
     let presentation: ResearchArtifactPresentation
+    let showsSourceLinkNotice: Bool
     @State private var isSavingSpeech = false
     @State private var speechSaved = false
     @State private var speechError: String?
@@ -719,7 +886,7 @@ private struct ResearchArtifactView: View {
     @ViewBuilder
     private var artifactContent: some View {
         VStack(alignment: .leading, spacing: 10) {
-            if artifact.legacyUncited {
+            if artifact.legacyUncited && showsSourceLinkNotice {
                 Label(
                     "This summary was created before source links were saved. Its points cannot open the original posts or comments.",
                     systemImage: "info.circle"
@@ -800,7 +967,7 @@ private struct ResearchArtifactView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             ForEach(artifact.missingData, id: \.self) {
-                Label($0, systemImage: "questionmark.circle")
+                Label(readableMissingData($0), systemImage: "questionmark.circle")
                     .foregroundStyle(.secondary)
                     .lineLimit(nil)
                     .fixedSize(horizontal: false, vertical: true)
@@ -808,6 +975,13 @@ private struct ResearchArtifactView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func readableMissingData(_ message: String) -> String {
+        if message.localizedCaseInsensitiveContains("outside this model request's context budget") {
+            return "Only part of the saved material could be used for these linked key points. Use the complete overview and individual post summaries for the full batch."
+        }
+        return message
     }
 
     private var artifactHeader: some View {

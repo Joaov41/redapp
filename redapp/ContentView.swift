@@ -8874,7 +8874,10 @@ class RedditSubredditViewModel: ObservableObject {
         batchExtractedPosts = []
         batchCapturedSources = []
         batchCoverage = ResearchCoverageInput(
-            postsRequested: posts.count,
+            postsRequested: max(
+                posts.count,
+                Int(postLimit.trimmingCharacters(in: .whitespacesAndNewlines)) ?? posts.count
+            ),
             postsFetched: 0,
             postsAnalyzed: 0,
             commentsReported: 0,
@@ -9344,7 +9347,10 @@ class RedditSubredditViewModel: ObservableObject {
         batchExtractedPosts = []
         batchCapturedSources = []
         batchCoverage = ResearchCoverageInput(
-            postsRequested: posts.count,
+            postsRequested: max(
+                posts.count,
+                Int(postLimit.trimmingCharacters(in: .whitespacesAndNewlines)) ?? posts.count
+            ),
             postsFetched: 0,
             postsAnalyzed: 0,
             commentsReported: 0,

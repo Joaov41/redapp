@@ -227,14 +227,20 @@ actor GroundedResearchService {
         let omittedSourceCount = max(0, sources.count - selectedSources.count)
         let response: ValidatedGroundedResponse
         if omittedSourceCount > 0 {
+            let allPostIDs = Set(sources.map(\.postSourceID))
+            let selectedPostIDs = Set(selectedSources.map(\.postSourceID))
+            let coverageMessage: String
+            if !allPostIDs.isEmpty {
+                coverageMessage = "This linked report could review saved material from \(selectedPostIDs.count) of \(allPostIDs.count) posts in one pass. Use the complete overview and individual post summaries for the full batch."
+            } else {
+                coverageMessage = "This linked report used only part of the saved material. Use the complete overview for the full batch."
+            }
             response = ValidatedGroundedResponse(
                 title: validated.title,
                 overview: validated.overview,
                 claims: validated.claims,
                 conflicts: validated.conflicts,
-                missingData: validated.missingData + [
-                    "\(omittedSourceCount) saved sources were outside this model request's context budget; ask a narrower follow-up to retrieve them."
-                ]
+                missingData: validated.missingData + [coverageMessage]
             )
         } else {
             response = validated

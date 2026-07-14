@@ -200,17 +200,18 @@ final class redappTests: XCTestCase {
             claims: [
                 ResearchClaimInput(
                     order: 0,
-                    text: "The linked report replaces the original overview.",
+                    text: "The linked report supports a selected key point.",
                     citations: [ResearchCitationInput(sourceID: "t1_comment")]
                 )
             ]
         )
         let grouped = try store.detail(runID: second.id).revisionArtifacts
-        XCTAssertEqual(grouped.overallSummary?.id, laterGroundedReport.id)
+        XCTAssertEqual(grouped.overallSummary?.title, "Overall Summary")
+        XCTAssertEqual(grouped.sourceLinkedReport?.id, laterGroundedReport.id)
         XCTAssertEqual(grouped.postSummaries.count, 1)
         XCTAssertTrue(grouped.remainingArtifacts.contains { $0.id == searchableArtifact.id })
-        XCTAssertTrue(grouped.remainingArtifacts.contains { $0.title == "Overall Summary" })
         XCTAssertFalse(grouped.remainingArtifacts.contains { $0.id == laterGroundedReport.id })
+        XCTAssertFalse(grouped.remainingArtifacts.contains { $0.title == "Overall Summary" })
 
         var tableOnlyRequest = request
         tableOnlyRequest.overallSummary = nil
@@ -223,7 +224,26 @@ final class redappTests: XCTestCase {
         )
         let tableOnlyGrouped = try store.detail(runID: tableOnlyRun.id).revisionArtifacts
         XCTAssertEqual(tableOnlyGrouped.overallSummary?.id, savedOverallTable.id)
+        XCTAssertNil(tableOnlyGrouped.sourceLinkedReport)
         XCTAssertFalse(tableOnlyGrouped.remainingArtifacts.contains { $0.id == savedOverallTable.id })
+
+        let linkedOnlyRun = try store.saveBatch(tableOnlyRequest)
+        let linkedOnlyReport = try store.addArtifact(
+            runID: linkedOnlyRun.id,
+            kind: .overallReport,
+            title: "Selected linked findings",
+            body: "One selected point with a source link.",
+            claims: [
+                ResearchClaimInput(
+                    order: 0,
+                    text: "A selected point.",
+                    citations: [ResearchCitationInput(sourceID: "t1_comment")]
+                )
+            ]
+        )
+        let linkedOnlyGrouped = try store.detail(runID: linkedOnlyRun.id).revisionArtifacts
+        XCTAssertNil(linkedOnlyGrouped.overallSummary)
+        XCTAssertEqual(linkedOnlyGrouped.sourceLinkedReport?.id, linkedOnlyReport.id)
 
         let json = try store.exportJSON(runID: second.id)
         let markdown = try store.exportMarkdown(runID: second.id)
