@@ -53,14 +53,26 @@ struct ResearchRevisionArtifacts {
     let remainingArtifacts: [ResearchArtifactRecord]
 
     init(artifacts: [ResearchArtifactRecord]) {
-        let nonemptyOverallReports = artifacts.filter {
+        let nonemptyArtifacts = artifacts.filter {
+            !$0.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        let nonemptyOverallReports = nonemptyArtifacts.filter {
             $0.kind == .overallReport
-                && !$0.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
         let savedBatchOverview = nonemptyOverallReports.last {
             $0.title.caseInsensitiveCompare("Overall Summary") == .orderedSame
         }
-        let selectedOverall = savedBatchOverview ?? nonemptyOverallReports.last
+        let legacyBatchSummary = nonemptyArtifacts.last { $0.kind == .batchSummary }
+        let overallTable = nonemptyArtifacts.last {
+            $0.kind == .tableReport
+                && $0.title.localizedCaseInsensitiveContains("overall summary")
+        }
+        let categorizedSummary = nonemptyArtifacts.last { $0.kind == .categorizedReport }
+        let selectedOverall = savedBatchOverview
+            ?? legacyBatchSummary
+            ?? overallTable
+            ?? categorizedSummary
+            ?? nonemptyOverallReports.last
 
         overallSummary = selectedOverall
         postSummaries = artifacts.filter { $0.kind == .postSummary }

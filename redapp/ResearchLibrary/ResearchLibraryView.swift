@@ -293,7 +293,6 @@ struct ResearchRunDetailView: View {
     @State private var errorMessage: String?
     @State private var isGeneratingGroundedReport = false
     @State private var isUpdatingOfflinePack = false
-    @State private var sourcesExpanded = false
 
     var body: some View {
         List {
@@ -305,33 +304,16 @@ struct ResearchRunDetailView: View {
                 followUpQuestionsSection(detail)
 
                 Section("Sources") {
-                    DisclosureGroup(isExpanded: $sourcesExpanded) {
-                        ForEach(detail.sources) { source in
-                            Button {
-                                selectedSource = source
-                            } label: {
-                                sourceRow(source)
-                            }
-                            .buttonStyle(.plain)
-                            Divider()
-                        }
+                    NavigationLink {
+                        ResearchSourcesListView(sources: detail.sources)
                     } label: {
-                        Label(
-                            "\(detail.sources.count) saved source\(detail.sources.count == 1 ? "" : "s")",
-                            systemImage: "tray.full"
-                        )
-                        .font(.headline)
-                    }
-                }
-
-                Section("Generation metadata") {
-                    ForEach(detail.artifacts.compactMap(\.generationReceipt), id: \.completedAt) { receipt in
                         VStack(alignment: .leading, spacing: 4) {
-                            Text(receipt.actualProvider)
-                                .font(.headline)
-                            Text(receipt.modelID)
-                                .font(.caption.monospaced())
-                            Text(receipt.route)
+                            Label(
+                                "\(detail.sources.count) saved source\(detail.sources.count == 1 ? "" : "s")",
+                                systemImage: "tray.full"
+                            )
+                            .font(.headline)
+                            Text("Open the complete posts and comments list")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -387,17 +369,21 @@ struct ResearchRunDetailView: View {
                 }
                 .accessibilityLabel("Re-export")
 
-                Button {
-                    generateGroundedReport()
+                Menu {
+                    Button {
+                        generateGroundedReport()
+                    } label: {
+                        Label("Generate an additional citation-checked report", systemImage: "checkmark.seal")
+                    }
                 } label: {
                     if isGeneratingGroundedReport {
                         ProgressView()
                     } else {
-                        Image(systemName: "checkmark.seal")
+                        Image(systemName: "ellipsis.circle")
                     }
                 }
                 .disabled(isGeneratingGroundedReport || detail?.sources.isEmpty != false)
-                .accessibilityLabel("Generate grounded report")
+                .accessibilityLabel("Additional report options")
 
                 Menu {
                     Button {
@@ -459,7 +445,7 @@ struct ResearchRunDetailView: View {
             Text("Overall summary")
         } footer: {
             if detail.revisionArtifacts.overallSummary != nil {
-                Text("This reuses the exact overall summary previously generated for this revision.")
+                Text("This reuses the batch-wide summary you already generated. The seal button is optional and creates a separate citation-checked report.")
             }
         }
     }
@@ -535,27 +521,6 @@ struct ResearchRunDetailView: View {
             onOfflineChange: reload,
             presentation: presentation
         )
-    }
-
-    private func sourceRow(_ source: ResearchSourceRecord) -> some View {
-        HStack {
-            Image(systemName: source.kind == .post ? "doc.text" : "text.bubble")
-                .foregroundStyle(.tint)
-            VStack(alignment: .leading, spacing: 3) {
-                Text(source.title ?? source.author.map { "u/\($0)" } ?? source.sourceID)
-                    .foregroundStyle(.primary)
-                    .lineLimit(2)
-                Text(source.sourceID)
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            Image(systemName: "chevron.right")
-                .font(.caption)
-                .foregroundStyle(.tertiary)
-        }
-        .contentShape(Rectangle())
-        .padding(.vertical, 5)
     }
 
     @ViewBuilder
@@ -669,6 +634,36 @@ struct ResearchRunDetailView: View {
             }
             isUpdatingOfflinePack = false
         }
+    }
+}
+
+@MainActor
+private struct ResearchSourcesListView: View {
+    let sources: [ResearchSourceRecord]
+
+    var body: some View {
+        List(sources) { source in
+            NavigationLink {
+                ResearchSourceDetailView(source: source)
+            } label: {
+                HStack(alignment: .top, spacing: 12) {
+                    Image(systemName: source.kind == .post ? "doc.text" : "text.bubble")
+                        .foregroundStyle(.tint)
+                        .frame(width: 22)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(source.title ?? source.author.map { "u/\($0)" } ?? source.sourceID)
+                            .foregroundStyle(.primary)
+                            .lineLimit(3)
+                        Text(source.sourceID)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .padding(.vertical, 4)
+            }
+        }
+        .navigationTitle("Saved Sources")
     }
 }
 

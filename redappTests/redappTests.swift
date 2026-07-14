@@ -204,6 +204,19 @@ final class redappTests: XCTestCase {
         XCTAssertTrue(grouped.remainingArtifacts.contains { $0.id == searchableArtifact.id })
         XCTAssertTrue(grouped.remainingArtifacts.contains { $0.id == laterGroundedReport.id })
 
+        var tableOnlyRequest = request
+        tableOnlyRequest.overallSummary = nil
+        let tableOnlyRun = try store.saveBatch(tableOnlyRequest)
+        let savedOverallTable = try store.addArtifact(
+            runID: tableOnlyRun.id,
+            kind: .tableReport,
+            title: "Overall Summary Table",
+            body: "A batch-wide table summary."
+        )
+        let tableOnlyGrouped = try store.detail(runID: tableOnlyRun.id).revisionArtifacts
+        XCTAssertEqual(tableOnlyGrouped.overallSummary?.id, savedOverallTable.id)
+        XCTAssertFalse(tableOnlyGrouped.remainingArtifacts.contains { $0.id == savedOverallTable.id })
+
         let json = try store.exportJSON(runID: second.id)
         let markdown = try store.exportMarkdown(runID: second.id)
         XCTAssertFalse(json.isEmpty)

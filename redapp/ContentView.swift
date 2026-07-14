@@ -21823,7 +21823,13 @@ struct BatchResultsView: View {
                 print("DEBUG: LLM Response: \(generatedSummary)")
                 
                 await MainActor.run {
+                    self.overallSummary = generatedSummary
                     self.tableData = self.parseTableData(from: generatedSummary)
+                    self.persistLegacyBatchArtifact(
+                        kind: .tableReport,
+                        title: "Overall Summary Table",
+                        body: generatedSummary
+                    )
                     print("DEBUG: Parsed \(self.tableData.count) rows")
                     self.isGeneratingOverallSummary = false
                     self.showTableSummary = true
