@@ -334,7 +334,14 @@ struct ResearchRunDetailView: View {
                                 $0.kind == .speech && $0.artifactID == artifact.id && $0.state == .ready
                             },
                             sourceForID: { sourceID in
-                                detail.sources.first { $0.sourceID == sourceID }
+                                if let reference = ResearchComparisonSourceReference.parse(sourceID),
+                                   let source = try? store.source(
+                                       runID: reference.runID,
+                                       sourceID: reference.sourceID
+                                   ) {
+                                    return source
+                                }
+                                return detail.sources.first { $0.sourceID == sourceID }
                             },
                             openSource: { selectedSource = $0 },
                             onOfflineChange: reload
@@ -635,7 +642,9 @@ private struct ResearchArtifactView: View {
                             ResearchConfidenceBadge(confidence: claim.confidence)
                             ForEach((citationsByClaim[claim.id] ?? []).filter(\.validated)) { citation in
                                 if let source = sourceForID(citation.sourceID) {
-                                    Button(citation.sourceID) { openSource(source) }
+                                    Button(ResearchComparisonSourceReference.displayName(for: citation.sourceID)) {
+                                        openSource(source)
+                                    }
                                         .buttonStyle(.bordered)
                                         .controlSize(.small)
                                 }
@@ -649,7 +658,9 @@ private struct ResearchArtifactView: View {
                                         .foregroundStyle(.orange)
                                     ForEach(claim.conflictingSourceIDs, id: \.self) { sourceID in
                                         if let source = sourceForID(sourceID) {
-                                            Button(sourceID) { openSource(source) }
+                                            Button(ResearchComparisonSourceReference.displayName(for: sourceID)) {
+                                                openSource(source)
+                                            }
                                                 .buttonStyle(.bordered)
                                                 .controlSize(.small)
                                                 .tint(.orange)
@@ -845,11 +856,113 @@ struct ResearchComparisonView: View {
     @ObservedObject private var store = ResearchLibraryStore.shared
     @State private var left: ResearchRunDetail?
     @State private var right: ResearchRunDetail?
+    @State private var difference: ResearchRevisionDiff?
+    @State private var changeReport: ResearchArtifactRecord?
+    @State private var changeClaims: [ResearchClaimRecord] = []
+    @State private var changeCitations: [UUID: [ResearchCitationRecord]] = [:]
+    @State private var selectedSource: ResearchSourceRecord?
+    @State private var isGeneratingReport = false
     @State private var errorMessage: String?
 
     var body: some View {
         List {
-            if let left, let right {
+            if let left, let right, let difference {
+                whatChangedSection(difference)
+
+                if !difference.added.isEmpty {
+                    Section("Added sources") {
+                        ForEach(difference.added) { delta in
+                            sourceChangeRow(
+                                delta,
+                                revision: difference.newRevision,
+                                runID: difference.newRunID,
+                                systemImage: "plus.circle.fill",
+                                tint: .green
+                            )
+                        }
+                    }
+                }
+
+                if !difference.removed.isEmpty {
+                    Section("Removed sources") {
+                        ForEach(difference.removed) { delta in
+                            sourceChangeRow(
+                                delta,
+                                revision: difference.oldRevision,
+                                runID: difference.oldRunID,
+                                systemImage: "minus.circle.fill",
+                                tint: .red
+                            )
+                        }
+                    }
+                }
+
+                if !difference.edited.isEmpty {
+                    Section("Edited sources") {
+                        ForEach(difference.edited) { delta in
+                            VStack(alignment: .leading, spacing: 8) {
+                                Label(
+                                    delta.displayTitle,
+                                    systemImage: delta.kind == .post ? "doc.text" : "text.bubble"
+                                )
+                                .font(.headline)
+                                HStack {
+                                    sourceButton(
+                                        title: "Revision \(difference.oldRevision)",
+                                        runID: difference.oldRunID,
+                                        sourceID: delta.sourceID
+                                    )
+                                    sourceButton(
+                                        title: "Revision \(difference.newRevision)",
+                                        runID: difference.newRunID,
+                                        sourceID: delta.sourceID
+                                    )
+                                }
+                            }
+                            .padding(.vertical, 3)
+                        }
+                    }
+                }
+
+                if !difference.scoreChanges.isEmpty {
+                    Section {
+                        ForEach(difference.scoreChanges) { delta in
+                            Button {
+                                openSource(runID: difference.newRunID, sourceID: delta.sourceID)
+                            } label: {
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text(delta.displayTitle)
+                                            .foregroundStyle(.primary)
+                                        Text(delta.sourceID)
+                                            .font(.caption.monospaced())
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    Text(scoreLabel(delta.oldScore))
+                                        .foregroundStyle(.secondary)
+                                    Image(systemName: "arrow.right")
+                                        .foregroundStyle(.tertiary)
+                                    Text(scoreLabel(delta.newScore))
+                                        .fontWeight(.semibold)
+                                }
+                            }
+                        }
+                    } header: {
+                        Text("Score changes")
+                    } footer: {
+                        Text("Score changes measure engagement, not whether a claim is true.")
+                    }
+                }
+
+                if !difference.coverageChanges.isEmpty {
+                    Section("Coverage changes") {
+                        ForEach(difference.coverageChanges) { delta in
+                            comparisonRow(delta.title, left: delta.oldValue, right: delta.newValue)
+                        }
+                    }
+                }
+
                 Section("Coverage") {
                     comparisonRow("Posts analyzed", left: left.run.coverage.postsAnalyzed, right: right.run.coverage.postsAnalyzed)
                     comparisonRow("Comments analyzed", left: left.run.coverage.commentsAnalyzed, right: right.run.coverage.commentsAnalyzed)
@@ -889,12 +1002,10 @@ struct ResearchComparisonView: View {
         }
         .navigationTitle("Compare Revisions")
         .task {
-            do {
-                left = try store.detail(runID: leftRunID)
-                right = try store.detail(runID: rightRunID)
-            } catch {
-                errorMessage = error.localizedDescription
-            }
+            loadComparison()
+        }
+        .sheet(item: $selectedSource) { source in
+            NavigationStack { ResearchSourceDetailView(source: source) }
         }
         .alert("Comparison unavailable", isPresented: Binding(
             get: { errorMessage != nil },
@@ -904,6 +1015,211 @@ struct ResearchComparisonView: View {
         } message: {
             Text(errorMessage ?? "Unknown error")
         }
+    }
+
+    @ViewBuilder
+    private func whatChangedSection(_ difference: ResearchRevisionDiff) -> some View {
+        Section("What changed") {
+            if !difference.hasChanges {
+                Label("No saved source or coverage changes detected.", systemImage: "equal.circle")
+                    .foregroundStyle(.secondary)
+            } else {
+                LabeledContent("Added", value: "\(difference.added.count)")
+                LabeledContent("Removed", value: "\(difference.removed.count)")
+                LabeledContent("Edited", value: "\(difference.edited.count)")
+                LabeledContent("Score changes", value: "\(difference.scoreChanges.count)")
+                LabeledContent("Unchanged sources", value: "\(difference.unchangedSourceCount)")
+
+                if let changeReport {
+                    ResearchComparisonReportView(
+                        report: changeReport,
+                        claims: changeClaims,
+                        citationsByClaim: changeCitations,
+                        openSource: openComparisonSource
+                    )
+                    Button {
+                        generateWhatChangedReport(difference)
+                    } label: {
+                        Label("Regenerate What Changed", systemImage: "arrow.clockwise")
+                    }
+                    .disabled(isGeneratingReport || !difference.hasSourceChanges)
+                } else if difference.hasSourceChanges {
+                    Button {
+                        generateWhatChangedReport(difference)
+                    } label: {
+                        if isGeneratingReport {
+                            HStack {
+                                ProgressView()
+                                Text("Checking changed sources…")
+                            }
+                        } else {
+                            Label("Generate What Changed", systemImage: "sparkles.rectangle.stack")
+                        }
+                    }
+                    .disabled(isGeneratingReport)
+                } else {
+                    Text("Only coverage changed; the exact differences are listed below.")
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private func loadComparison() {
+        do {
+            let loadedLeft = try store.detail(runID: leftRunID)
+            let loadedRight = try store.detail(runID: rightRunID)
+            let loadedDifference = ResearchRevisionDiffer.compare(
+                oldRunID: loadedLeft.run.id,
+                oldRevision: loadedLeft.run.revision,
+                oldSources: loadedLeft.sources.map(ResearchSourceInput.init(record:)),
+                oldCoverage: loadedLeft.run.coverage,
+                newRunID: loadedRight.run.id,
+                newRevision: loadedRight.run.revision,
+                newSources: loadedRight.sources.map(ResearchSourceInput.init(record:)),
+                newCoverage: loadedRight.run.coverage
+            )
+            left = loadedLeft
+            right = loadedRight
+            difference = loadedDifference
+            try loadSavedChangeReport(from: loadedRight, title: loadedDifference.reportTitle)
+            errorMessage = nil
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func loadSavedChangeReport(from detail: ResearchRunDetail, title: String) throws {
+        guard let report = detail.artifacts.last(where: {
+            $0.kind == .changeReport && $0.title == title
+        }) else {
+            changeReport = nil
+            changeClaims = []
+            changeCitations = [:]
+            return
+        }
+        changeReport = report
+        changeClaims = try store.claims(artifactID: report.id)
+        changeCitations = try changeClaims.reduce(into: [:]) { result, claim in
+            result[claim.id] = try store.citations(claimID: claim.id).filter(\.validated)
+        }
+    }
+
+    private func generateWhatChangedReport(_ difference: ResearchRevisionDiff) {
+        guard let left, let right, difference.hasSourceChanges else { return }
+        let comparisonSources = difference.promptSources()
+        guard !comparisonSources.isEmpty else { return }
+        isGeneratingReport = true
+        errorMessage = nil
+
+        let instruction = """
+        Produce a concise, evidence-grounded “What Changed” report comparing revision \(difference.oldRevision) with revision \(difference.newRevision).
+
+        The deterministic manifest below is authoritative. Discuss only changes present in it. Explain important new evidence, removed evidence, edited statements, potentially changed conclusions, newly introduced or resolved conflicts, and coverage limitations. Treat score changes only as engagement changes, never as proof that a claim is true. Every factual claim must cite the revision-prefixed saved sources. If the evidence cannot establish why something changed, say so under missing data.
+
+        \(difference.promptManifest)
+
+        Previous saved report excerpts (context only, not evidence):
+        \(reportExcerpts(left.artifacts))
+
+        New saved report excerpts (context only, not evidence):
+        \(reportExcerpts(right.artifacts))
+        """
+
+        Task {
+            do {
+                let result = try await GroundedResearchService.shared.generateReport(
+                    instruction: instruction,
+                    sources: comparisonSources,
+                    coverage: right.run.coverage
+                )
+                _ = try store.addArtifact(
+                    runID: right.run.id,
+                    kind: .changeReport,
+                    title: difference.reportTitle,
+                    body: result.response.markdown,
+                    generationReceipt: result.receipt,
+                    coverage: right.run.coverage,
+                    conflicts: result.response.conflicts,
+                    missingData: result.response.missingData,
+                    claims: result.response.claims,
+                    validationSources: comparisonSources
+                )
+                loadComparison()
+            } catch is CancellationError {
+                // Leaving the comparison screen is a normal cancellation path.
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+            isGeneratingReport = false
+        }
+    }
+
+    private func reportExcerpts(_ artifacts: [ResearchArtifactRecord]) -> String {
+        let excerpts = artifacts
+            .filter { $0.kind != .changeReport }
+            .prefix(8)
+            .map { artifact in
+                let compact = artifact.body.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+                return "- \(artifact.title): \(String(compact.prefix(900)))"
+            }
+        return excerpts.isEmpty ? "None saved." : excerpts.joined(separator: "\n")
+    }
+
+    @ViewBuilder
+    private func sourceChangeRow(
+        _ delta: ResearchSourceDelta,
+        revision: Int,
+        runID: UUID,
+        systemImage: String,
+        tint: Color
+    ) -> some View {
+        Button {
+            openSource(runID: runID, sourceID: delta.sourceID)
+        } label: {
+            HStack {
+                Image(systemName: systemImage)
+                    .foregroundStyle(tint)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(delta.displayTitle)
+                        .foregroundStyle(.primary)
+                    Text("R\(revision) · \(delta.sourceID)")
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    private func sourceButton(title: String, runID: UUID, sourceID: String) -> some View {
+        Button(title) { openSource(runID: runID, sourceID: sourceID) }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+    }
+
+    private func openComparisonSource(_ encodedID: String) {
+        if let reference = ResearchComparisonSourceReference.parse(encodedID) {
+            openSource(runID: reference.runID, sourceID: reference.sourceID)
+        } else {
+            openSource(runID: rightRunID, sourceID: encodedID)
+        }
+    }
+
+    private func openSource(runID: UUID, sourceID: String) {
+        do {
+            selectedSource = try store.source(runID: runID, sourceID: sourceID)
+            if selectedSource == nil { errorMessage = "The saved comparison source is unavailable." }
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func scoreLabel(_ score: Int?) -> String {
+        score.map(String.init) ?? "—"
     }
 
     private func comparisonRow(_ title: String, left: Int, right: Int) -> some View {
@@ -916,6 +1232,56 @@ struct ResearchComparisonView: View {
                 .foregroundStyle(left == right ? Color.secondary : Color.accentColor)
             Text("\(right)")
                 .frame(minWidth: 44)
+        }
+    }
+}
+
+@MainActor
+private struct ResearchComparisonReportView: View {
+    let report: ResearchArtifactRecord
+    let claims: [ResearchClaimRecord]
+    let citationsByClaim: [UUID: [ResearchCitationRecord]]
+    let openSource: (String) -> Void
+
+    var body: some View {
+        DisclosureGroup("Grounded summary") {
+            if claims.isEmpty {
+                Text(report.body)
+                    .textSelection(.enabled)
+            } else {
+                ForEach(claims) { claim in
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(claim.text)
+                            .textSelection(.enabled)
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack {
+                                ResearchConfidenceBadge(confidence: claim.confidence)
+                                ForEach(citationsByClaim[claim.id] ?? []) { citation in
+                                    Button(ResearchComparisonSourceReference.displayName(for: citation.sourceID)) {
+                                        openSource(citation.sourceID)
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .controlSize(.small)
+                                }
+                            }
+                        }
+                        if let missing = claim.missingDataNote, !missing.isEmpty {
+                            Label(missing, systemImage: "questionmark.circle")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(.vertical, 3)
+                }
+            }
+            ForEach(report.conflicts, id: \.self) {
+                Label($0, systemImage: "arrow.triangle.branch")
+                    .foregroundStyle(.orange)
+            }
+            ForEach(report.missingData, id: \.self) {
+                Label($0, systemImage: "questionmark.circle")
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 }

@@ -15,6 +15,7 @@ enum ResearchArtifactKind: String, Codable, CaseIterable, Sendable {
     case whiteboard
     case questionAnswer
     case conversationAnswer
+    case changeReport
 
     var displayName: String {
         switch self {
@@ -28,6 +29,7 @@ enum ResearchArtifactKind: String, Codable, CaseIterable, Sendable {
         case .whiteboard: return "Whiteboard"
         case .questionAnswer: return "Q&A"
         case .conversationAnswer: return "Conversation Answer"
+        case .changeReport: return "What Changed"
         }
     }
 }

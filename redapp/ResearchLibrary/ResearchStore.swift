@@ -364,7 +364,8 @@ final class ResearchLibraryStore: ObservableObject {
         conflicts: [String] = [],
         missingData: [String] = [],
         claims: [ResearchClaimInput] = [],
-        legacyUncited: Bool = false
+        legacyUncited: Bool = false,
+        validationSources: [ResearchSourceInput]? = nil
     ) throws -> ResearchArtifactRecord {
         guard try run(id: runID) != nil else { throw ResearchStoreError.runNotFound }
         let artifact = ResearchArtifactRecord(
@@ -380,23 +381,11 @@ final class ResearchLibraryStore: ObservableObject {
             legacyUncited: legacyUncited
         )
         context.insert(artifact)
-        let sourceRecords = try sources(runID: runID).map {
-            ResearchSourceInput(
-                sourceID: $0.sourceID,
-                kind: $0.kind,
-                postSourceID: $0.postSourceID,
-                parentSourceID: $0.parentSourceID,
-                subreddit: $0.subreddit,
-                title: $0.title,
-                permalink: $0.permalink,
-                author: $0.author,
-                score: $0.score,
-                createdAt: $0.sourceCreatedAt,
-                depth: $0.depth,
-                rawMarkdown: $0.rawMarkdown,
-                mediaURLs: $0.mediaURLs,
-                sourceOrder: $0.sourceOrder
-            )
+        let sourceRecords: [ResearchSourceInput]
+        if let validationSources {
+            sourceRecords = validationSources
+        } else {
+            sourceRecords = try sources(runID: runID).map(ResearchSourceInput.init(record:))
         }
         try insertClaims(claims, for: artifact, sourceRecords: sourceRecords)
         try appendSearchText(

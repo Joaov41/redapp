@@ -13,7 +13,9 @@ final class redappTests: XCTestCase {
     private func source(
         id: String = "t1_comment",
         postID: String = "t3_post",
-        text: String = "Battery life improved after the update."
+        text: String = "Battery life improved after the update.",
+        score: Int = 12,
+        sourceOrder: Int = 0
     ) -> ResearchSourceInput {
         ResearchSourceInput(
             sourceID: id,
@@ -24,12 +26,60 @@ final class redappTests: XCTestCase {
             title: id.hasPrefix("t3_") ? "Test post" : nil,
             permalink: "/r/swift/comments/post/test/comment/",
             author: "tester",
-            score: 12,
+            score: score,
             createdAt: Date(timeIntervalSince1970: 1_700_000_000),
             depth: id.hasPrefix("t1_") ? 0 : nil,
             rawMarkdown: text,
             mediaURLs: [],
-            sourceOrder: 0
+            sourceOrder: sourceOrder
+        )
+    }
+
+    func testComputesDeterministicRevisionChangesAndComparisonSources() throws {
+        let oldRunID = UUID()
+        let newRunID = UUID()
+        var oldCoverage = ResearchCoverageInput.empty
+        oldCoverage.postsAnalyzed = 1
+        oldCoverage.commentsAnalyzed = 1
+        var newCoverage = oldCoverage
+        newCoverage.commentsAnalyzed = 2
+
+        let diff = ResearchRevisionDiffer.compare(
+            oldRunID: oldRunID,
+            oldRevision: 1,
+            oldSources: [
+                source(id: "t3_shared", postID: "t3_shared", text: "Original post text", score: 10),
+                source(id: "t1_removed", postID: "t3_shared", text: "Removed comment", sourceOrder: 1)
+            ],
+            oldCoverage: oldCoverage,
+            newRunID: newRunID,
+            newRevision: 2,
+            newSources: [
+                source(id: "t3_shared", postID: "t3_shared", text: "Edited post text", score: 15),
+                source(id: "t1_added", postID: "t3_shared", text: "Added comment", sourceOrder: 1)
+            ],
+            newCoverage: newCoverage
+        )
+
+        XCTAssertEqual(diff.added.map(\.sourceID), ["t1_added"])
+        XCTAssertEqual(diff.removed.map(\.sourceID), ["t1_removed"])
+        XCTAssertEqual(diff.edited.map(\.sourceID), ["t3_shared"])
+        XCTAssertEqual(diff.scoreChanges.map(\.sourceID), ["t3_shared"])
+        XCTAssertEqual(diff.coverageChanges.map(\.title), ["Comments analyzed"])
+        XCTAssertTrue(diff.promptManifest.contains("Comments analyzed: 1 → 2"))
+
+        let promptSources = diff.promptSources()
+        XCTAssertEqual(promptSources.count, 4)
+        XCTAssertTrue(promptSources.allSatisfy {
+            ResearchComparisonSourceReference.parse($0.sourceID) != nil
+        })
+        let parsed = try XCTUnwrap(
+            ResearchComparisonSourceReference.parse(promptSources[0].sourceID)
+        )
+        XCTAssertTrue(parsed.revision == 1 || parsed.revision == 2)
+        XCTAssertEqual(
+            ResearchComparisonSourceReference.displayName(for: parsed.encodedID),
+            "R\(parsed.revision) · \(parsed.sourceID)"
         )
     }
 
