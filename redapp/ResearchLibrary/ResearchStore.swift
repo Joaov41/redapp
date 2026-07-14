@@ -59,6 +59,9 @@ struct ResearchRevisionArtifacts {
         let nonemptyOverallReports = nonemptyArtifacts.filter {
             $0.kind == .overallReport
         }
+        let newestLinkedOverallReport = nonemptyOverallReports
+            .filter { !$0.legacyUncited }
+            .max { $0.createdAt < $1.createdAt }
         let savedBatchOverview = nonemptyOverallReports.last {
             $0.title.caseInsensitiveCompare("Overall Summary") == .orderedSame
         }
@@ -68,7 +71,8 @@ struct ResearchRevisionArtifacts {
                 && $0.title.localizedCaseInsensitiveContains("overall summary")
         }
         let categorizedSummary = nonemptyArtifacts.last { $0.kind == .categorizedReport }
-        let selectedOverall = savedBatchOverview
+        let selectedOverall = newestLinkedOverallReport
+            ?? savedBatchOverview
             ?? legacyBatchSummary
             ?? overallTable
             ?? categorizedSummary

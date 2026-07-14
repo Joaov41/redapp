@@ -196,13 +196,21 @@ final class redappTests: XCTestCase {
             runID: second.id,
             kind: .overallReport,
             title: "Grounded findings",
-            body: "A later evidence report."
+            body: "A later evidence report.",
+            claims: [
+                ResearchClaimInput(
+                    order: 0,
+                    text: "The linked report replaces the original overview.",
+                    citations: [ResearchCitationInput(sourceID: "t1_comment")]
+                )
+            ]
         )
         let grouped = try store.detail(runID: second.id).revisionArtifacts
-        XCTAssertEqual(grouped.overallSummary?.title, "Overall Summary")
+        XCTAssertEqual(grouped.overallSummary?.id, laterGroundedReport.id)
         XCTAssertEqual(grouped.postSummaries.count, 1)
         XCTAssertTrue(grouped.remainingArtifacts.contains { $0.id == searchableArtifact.id })
-        XCTAssertTrue(grouped.remainingArtifacts.contains { $0.id == laterGroundedReport.id })
+        XCTAssertTrue(grouped.remainingArtifacts.contains { $0.title == "Overall Summary" })
+        XCTAssertFalse(grouped.remainingArtifacts.contains { $0.id == laterGroundedReport.id })
 
         var tableOnlyRequest = request
         tableOnlyRequest.overallSummary = nil
