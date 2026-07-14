@@ -21217,6 +21217,9 @@ struct BatchResultsView: View {
                         viewModel.batchCurrentPostTitle = ""
                         viewModel.isGeneratingBatchOverallSummary = false
                         viewModel.showBatchResults = true
+                        if viewModel.savedResearchRunID != nil {
+                            viewModel.saveCurrentBatchToResearchLibrary()
+                        }
                     }
                 }
             },

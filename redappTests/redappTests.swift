@@ -154,6 +154,16 @@ final class redappTests: XCTestCase {
         XCTAssertEqual(first.revision, 1)
         XCTAssertEqual(second.revision, 2)
 
+        for run in [first, second] {
+            let artifacts = try store.artifacts(runID: run.id)
+            XCTAssertEqual(artifacts.filter { $0.kind == .postSummary }.count, 1)
+            let overall = try XCTUnwrap(artifacts.last {
+                $0.kind == .overallReport && $0.title == "Overall Summary"
+            })
+            XCTAssertEqual(overall.body, "Users reported better battery life.")
+            XCTAssertEqual(ResearchRevisionArtifacts(artifacts: artifacts).overallSummary?.id, overall.id)
+        }
+
         try store.setTags(["Important", "battery"], itemID: first.itemID)
         try store.setPinned(true, itemID: first.itemID)
         store.reload(searchText: "battery", tags: ["important"])
@@ -182,11 +192,24 @@ final class redappTests: XCTestCase {
         let savedClaim = try XCTUnwrap(store.claims(artifactID: searchableArtifact.id).first)
         XCTAssertEqual(try store.citations(claimID: savedClaim.id).first?.validated, true)
 
+        let laterGroundedReport = try store.addArtifact(
+            runID: second.id,
+            kind: .overallReport,
+            title: "Grounded findings",
+            body: "A later evidence report."
+        )
+        let grouped = try store.detail(runID: second.id).revisionArtifacts
+        XCTAssertEqual(grouped.overallSummary?.title, "Overall Summary")
+        XCTAssertEqual(grouped.postSummaries.count, 1)
+        XCTAssertTrue(grouped.remainingArtifacts.contains { $0.id == searchableArtifact.id })
+        XCTAssertTrue(grouped.remainingArtifacts.contains { $0.id == laterGroundedReport.id })
+
         let json = try store.exportJSON(runID: second.id)
         let markdown = try store.exportMarkdown(runID: second.id)
         XCTAssertFalse(json.isEmpty)
         XCTAssertTrue(markdown.contains("Comments analyzed: 1"))
         XCTAssertTrue(markdown.contains("t1_comment"))
+        XCTAssertTrue(markdown.contains("Users reported better battery life."))
     }
 
     func testValidatesQuotesAndComputesConfidenceFromIndependentPosts() throws {

@@ -41,6 +41,33 @@ struct ResearchRunDetail {
     let artifacts: [ResearchArtifactRecord]
     let conversations: [ResearchConversationRecord]
     let offlineAssets: [ResearchOfflineAssetRecord]
+
+    var revisionArtifacts: ResearchRevisionArtifacts {
+        ResearchRevisionArtifacts(artifacts: artifacts)
+    }
+}
+
+struct ResearchRevisionArtifacts {
+    let overallSummary: ResearchArtifactRecord?
+    let postSummaries: [ResearchArtifactRecord]
+    let remainingArtifacts: [ResearchArtifactRecord]
+
+    init(artifacts: [ResearchArtifactRecord]) {
+        let nonemptyOverallReports = artifacts.filter {
+            $0.kind == .overallReport
+                && !$0.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        let savedBatchOverview = nonemptyOverallReports.last {
+            $0.title.caseInsensitiveCompare("Overall Summary") == .orderedSame
+        }
+        let selectedOverall = savedBatchOverview ?? nonemptyOverallReports.last
+
+        overallSummary = selectedOverall
+        postSummaries = artifacts.filter { $0.kind == .postSummary }
+        remainingArtifacts = artifacts.filter { artifact in
+            artifact.id != selectedOverall?.id && artifact.kind != .postSummary
+        }
+    }
 }
 
 struct ResearchExportEnvelope: Codable {

@@ -297,57 +297,11 @@ struct ResearchRunDetailView: View {
     var body: some View {
         List {
             if let detail {
+                overallSummarySection(detail)
                 coverageSection(detail.run.coverage)
-
-                Section("Follow-up questions") {
-                    NavigationLink {
-                        ResearchConversationView(runID: runID)
-                    } label: {
-                        Label("New grounded conversation", systemImage: "plus.bubble")
-                    }
-                    ForEach(detail.conversations) { conversation in
-                        NavigationLink {
-                            ResearchConversationView(runID: runID, conversationID: conversation.id)
-                        } label: {
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(conversation.title)
-                                Text("Updated \(conversation.updatedAt.formatted(date: .abbreviated, time: .shortened))")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                    }
-                }
-
-                Section("Reports and answers") {
-                    if detail.artifacts.isEmpty {
-                        Text("No saved outputs")
-                            .foregroundStyle(.secondary)
-                    }
-                    ForEach(detail.artifacts) { artifact in
-                        ResearchArtifactView(
-                            runID: runID,
-                            artifact: artifact,
-                            claims: claimsByArtifact[artifact.id] ?? [],
-                            citationsByClaim: citationsByClaim,
-                            speechAsset: detail.offlineAssets.first {
-                                $0.kind == .speech && $0.artifactID == artifact.id && $0.state == .ready
-                            },
-                            sourceForID: { sourceID in
-                                if let reference = ResearchComparisonSourceReference.parse(sourceID),
-                                   let source = try? store.source(
-                                       runID: reference.runID,
-                                       sourceID: reference.sourceID
-                                   ) {
-                                    return source
-                                }
-                                return detail.sources.first { $0.sourceID == sourceID }
-                            },
-                            openSource: { selectedSource = $0 },
-                            onOfflineChange: reload
-                        )
-                    }
-                }
+                postSummariesSection(detail)
+                remainingArtifactsSection(detail)
+                followUpQuestionsSection(detail)
 
                 Section("Sources") {
                     ForEach(detail.sources) { source in
@@ -496,6 +450,97 @@ struct ResearchRunDetailView: View {
     }
 
     @ViewBuilder
+    private func overallSummarySection(_ detail: ResearchRunDetail) -> some View {
+        Section {
+            if let summary = detail.revisionArtifacts.overallSummary {
+                artifactView(summary, in: detail, presentation: .expanded)
+            } else {
+                Text("No overall summary was saved for this revision.")
+                    .foregroundStyle(.secondary)
+            }
+        } header: {
+            Text("Overall summary")
+        } footer: {
+            if detail.revisionArtifacts.overallSummary != nil {
+                Text("This reuses the exact overall summary previously generated for this revision.")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func postSummariesSection(_ detail: ResearchRunDetail) -> some View {
+        if !detail.revisionArtifacts.postSummaries.isEmpty {
+            Section("Individual post summaries") {
+                ForEach(detail.revisionArtifacts.postSummaries) { artifact in
+                    artifactView(artifact, in: detail, presentation: .disclosure)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func remainingArtifactsSection(_ detail: ResearchRunDetail) -> some View {
+        if !detail.revisionArtifacts.remainingArtifacts.isEmpty {
+            Section("Other reports and answers") {
+                ForEach(detail.revisionArtifacts.remainingArtifacts) { artifact in
+                    artifactView(artifact, in: detail, presentation: .disclosure)
+                }
+            }
+        }
+    }
+
+    private func followUpQuestionsSection(_ detail: ResearchRunDetail) -> some View {
+        Section("Follow-up questions") {
+            NavigationLink {
+                ResearchConversationView(runID: runID)
+            } label: {
+                Label("New grounded conversation", systemImage: "plus.bubble")
+            }
+            ForEach(detail.conversations) { conversation in
+                NavigationLink {
+                    ResearchConversationView(runID: runID, conversationID: conversation.id)
+                } label: {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(conversation.title)
+                        Text("Updated \(conversation.updatedAt.formatted(date: .abbreviated, time: .shortened))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+    }
+
+    private func artifactView(
+        _ artifact: ResearchArtifactRecord,
+        in detail: ResearchRunDetail,
+        presentation: ResearchArtifactPresentation
+    ) -> some View {
+        ResearchArtifactView(
+            runID: runID,
+            artifact: artifact,
+            claims: claimsByArtifact[artifact.id] ?? [],
+            citationsByClaim: citationsByClaim,
+            speechAsset: detail.offlineAssets.first {
+                $0.kind == .speech && $0.artifactID == artifact.id && $0.state == .ready
+            },
+            sourceForID: { sourceID in
+                if let reference = ResearchComparisonSourceReference.parse(sourceID),
+                   let source = try? store.source(
+                       runID: reference.runID,
+                       sourceID: reference.sourceID
+                   ) {
+                    return source
+                }
+                return detail.sources.first { $0.sourceID == sourceID }
+            },
+            openSource: { selectedSource = $0 },
+            onOfflineChange: reload,
+            presentation: presentation
+        )
+    }
+
+    @ViewBuilder
     private func coverageSection(_ coverage: ResearchCoverageInput) -> some View {
         Section("Coverage") {
             LabeledContent("Posts analyzed", value: "\(coverage.postsAnalyzed) of \(coverage.postsRequested)")
@@ -609,6 +654,11 @@ struct ResearchRunDetailView: View {
     }
 }
 
+private enum ResearchArtifactPresentation {
+    case disclosure
+    case expanded
+}
+
 @MainActor
 private struct ResearchArtifactView: View {
     let runID: UUID
@@ -619,13 +669,43 @@ private struct ResearchArtifactView: View {
     let sourceForID: (String) -> ResearchSourceRecord?
     let openSource: (ResearchSourceRecord) -> Void
     let onOfflineChange: () -> Void
+    let presentation: ResearchArtifactPresentation
     @State private var isSavingSpeech = false
     @State private var speechSaved = false
     @State private var speechError: String?
     @State private var offlineSpeechPlayer: AVAudioPlayer?
 
     var body: some View {
-        DisclosureGroup {
+        Group {
+            switch presentation {
+            case .disclosure:
+                DisclosureGroup {
+                    artifactContent
+                } label: {
+                    artifactHeader
+                }
+            case .expanded:
+                VStack(alignment: .leading, spacing: 12) {
+                    artifactHeader
+                    Divider()
+                    artifactContent
+                }
+                .padding(.vertical, 4)
+            }
+        }
+        .alert("Couldn’t Save Speech", isPresented: Binding(
+            get: { speechError != nil },
+            set: { if !$0 { speechError = nil } }
+        )) {
+            Button("OK", role: .cancel) { speechError = nil }
+        } message: {
+            Text(speechError ?? "Unknown error")
+        }
+    }
+
+    @ViewBuilder
+    private var artifactContent: some View {
+        VStack(alignment: .leading, spacing: 10) {
             if artifact.legacyUncited {
                 Label("Legacy output: claim-level evidence was not captured.", systemImage: "exclamationmark.triangle")
                     .font(.caption)
@@ -686,50 +766,44 @@ private struct ResearchArtifactView: View {
                 Label($0, systemImage: "questionmark.circle")
                     .foregroundStyle(.secondary)
             }
-        } label: {
-            HStack {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(artifact.title)
-                        .font(.headline)
-                    Text("\(artifact.kind.displayName) · \(artifact.createdAt.formatted(date: .abbreviated, time: .shortened))")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                if SummaryService.shared.settings.localTTSEngine == .kokoro {
-                    if let speechAsset {
-                        Button {
-                            playOfflineSpeech(speechAsset)
-                        } label: {
-                            Image(systemName: "play.circle")
-                        }
-                        .buttonStyle(.borderless)
-                        .accessibilityLabel("Play saved MLX speech")
-                    }
+        }
+    }
+
+    private var artifactHeader: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(artifact.title)
+                    .font(.headline)
+                Text("\(artifact.kind.displayName) · \(artifact.createdAt.formatted(date: .abbreviated, time: .shortened))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            if SummaryService.shared.settings.localTTSEngine == .kokoro {
+                if let speechAsset {
                     Button {
-                        saveSpeechOffline()
+                        playOfflineSpeech(speechAsset)
                     } label: {
-                        if isSavingSpeech {
-                            ProgressView()
-                        } else {
-                            Image(systemName: speechSaved ? "checkmark.circle.fill" : "waveform.badge.plus")
-                        }
+                        Image(systemName: "play.circle")
                     }
                     .buttonStyle(.borderless)
-                    .disabled(isSavingSpeech || speechSaved || speechAsset != nil)
-                    .accessibilityLabel(
-                        speechSaved || speechAsset != nil ? "Speech saved offline" : "Save MLX speech offline"
-                    )
+                    .accessibilityLabel("Play saved MLX speech")
                 }
+                Button {
+                    saveSpeechOffline()
+                } label: {
+                    if isSavingSpeech {
+                        ProgressView()
+                    } else {
+                        Image(systemName: speechSaved ? "checkmark.circle.fill" : "waveform.badge.plus")
+                    }
+                }
+                .buttonStyle(.borderless)
+                .disabled(isSavingSpeech || speechSaved || speechAsset != nil)
+                .accessibilityLabel(
+                    speechSaved || speechAsset != nil ? "Speech saved offline" : "Save MLX speech offline"
+                )
             }
-        }
-        .alert("Couldn’t Save Speech", isPresented: Binding(
-            get: { speechError != nil },
-            set: { if !$0 { speechError = nil } }
-        )) {
-            Button("OK", role: .cancel) { speechError = nil }
-        } message: {
-            Text(speechError ?? "Unknown error")
         }
     }
 
@@ -869,6 +943,8 @@ struct ResearchComparisonView: View {
         List {
             if let left, let right, let difference {
                 subredditProgressSection(difference)
+                revisionOverallSummarySection(left)
+                revisionOverallSummarySection(right)
                 exactChangesSection(difference)
 
                 if !difference.added.isEmpty {
@@ -972,32 +1048,8 @@ struct ResearchComparisonView: View {
                     comparisonRow("Reports and answers", left: left.artifacts.count, right: right.artifacts.count)
                     comparisonRow("Saved sources", left: left.sources.count, right: right.sources.count)
                 }
-                Section("Revision \(left.run.revision)") {
-                    ForEach(left.artifacts) { artifact in
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(artifact.title)
-                                .font(.headline)
-                            Text(artifact.body)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(10)
-                                .textSelection(.enabled)
-                        }
-                    }
-                }
-                Section("Revision \(right.run.revision)") {
-                    ForEach(right.artifacts) { artifact in
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(artifact.title)
-                                .font(.headline)
-                            Text(artifact.body)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(10)
-                                .textSelection(.enabled)
-                        }
-                    }
-                }
+                revisionRemainingOutputsSection(left)
+                revisionRemainingOutputsSection(right)
             } else {
                 ProgressView()
             }
@@ -1019,6 +1071,49 @@ struct ResearchComparisonView: View {
             Button("OK", role: .cancel) { errorMessage = nil }
         } message: {
             Text(errorMessage ?? "Unknown error")
+        }
+    }
+
+    @ViewBuilder
+    private func revisionOverallSummarySection(_ detail: ResearchRunDetail) -> some View {
+        Section("Revision \(detail.run.revision) — Overall summary") {
+            if let summary = detail.revisionArtifacts.overallSummary {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(summary.body)
+                        .textSelection(.enabled)
+                    Text("Saved \(summary.createdAt.formatted(date: .abbreviated, time: .shortened))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 3)
+            } else {
+                Text("No overall summary was saved for this revision.")
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func revisionRemainingOutputsSection(_ detail: ResearchRunDetail) -> some View {
+        let overallID = detail.revisionArtifacts.overallSummary?.id
+        let remaining = detail.artifacts.filter { $0.id != overallID }
+        if !remaining.isEmpty {
+            Section("Revision \(detail.run.revision) — Individual summaries and reports") {
+                ForEach(remaining) { artifact in
+                    DisclosureGroup {
+                        Text(artifact.body)
+                            .textSelection(.enabled)
+                    } label: {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(artifact.title)
+                                .font(.headline)
+                            Text(artifact.kind.displayName)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
         }
     }
 
