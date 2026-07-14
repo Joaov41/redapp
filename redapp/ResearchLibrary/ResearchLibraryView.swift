@@ -754,10 +754,46 @@ private struct ResearchArtifactView: View {
                 let url = try await ResearchOfflinePackManager.shared.localURL(
                     relativePath: asset.relativePath
                 )
-                let player = try AVAudioPlayer(contentsOf: url)
-                player.prepareToPlay()
+
+                #if os(iOS)
+                let audioSession = AVAudioSession.sharedInstance()
+                do {
+                    try audioSession.setCategory(
+                        .playback,
+                        mode: .spokenAudio,
+                        options: [.duckOthers, .allowBluetooth, .allowBluetoothA2DP]
+                    )
+                } catch {
+                    // Some iPad audio routes reject the Bluetooth option combination.
+                    try audioSession.setCategory(
+                        .playback,
+                        mode: .spokenAudio,
+                        options: [.duckOthers]
+                    )
+                }
+                try audioSession.setActive(true)
+                #endif
+
+                // Match the established MLX playback path used elsewhere in the app.
+                // AVAudioPlayer's URL initializer can reject this generated Float32 WAV
+                // with OSStatus -50 even though its in-memory initializer accepts it.
+                let audioData = try Data(contentsOf: url)
+                let player = try AVAudioPlayer(data: audioData)
+                guard player.prepareToPlay() else {
+                    throw NSError(
+                        domain: "ResearchLibraryPlayback",
+                        code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "The saved speech file could not be prepared for playback."]
+                    )
+                }
                 offlineSpeechPlayer = player
-                player.play()
+                guard player.play() else {
+                    throw NSError(
+                        domain: "ResearchLibraryPlayback",
+                        code: 2,
+                        userInfo: [NSLocalizedDescriptionKey: "The saved speech file could not start playing."]
+                    )
+                }
             } catch {
                 speechError = error.localizedDescription
             }
