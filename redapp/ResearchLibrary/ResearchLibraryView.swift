@@ -725,11 +725,8 @@ private struct ResearchArtifactView: View {
                     .foregroundStyle(.orange)
             }
             if claims.isEmpty {
-                Text(artifact.body)
-                    .lineLimit(nil)
-                    .fixedSize(horizontal: false, vertical: true)
+                MarkdownTextView(content: artifact.body, fontScale: 0.8)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .textSelection(.enabled)
             } else {
                 ForEach(claims) { claim in
                     VStack(alignment: .leading, spacing: 8) {
