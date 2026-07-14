@@ -293,6 +293,7 @@ struct ResearchRunDetailView: View {
     @State private var errorMessage: String?
     @State private var isGeneratingGroundedReport = false
     @State private var isUpdatingOfflinePack = false
+    @State private var sourcesExpanded = false
 
     var body: some View {
         List {
@@ -304,26 +305,22 @@ struct ResearchRunDetailView: View {
                 followUpQuestionsSection(detail)
 
                 Section("Sources") {
-                    ForEach(detail.sources) { source in
-                        Button {
-                            selectedSource = source
-                        } label: {
-                            HStack {
-                                Image(systemName: source.kind == .post ? "doc.text" : "text.bubble")
-                                VStack(alignment: .leading, spacing: 3) {
-                                    Text(source.title ?? source.author.map { "u/\($0)" } ?? source.sourceID)
-                                        .foregroundStyle(.primary)
-                                        .lineLimit(2)
-                                    Text(source.sourceID)
-                                        .font(.caption.monospaced())
-                                        .foregroundStyle(.secondary)
-                                }
-                                Spacer()
-                                Image(systemName: "chevron.right")
-                                    .font(.caption)
-                                    .foregroundStyle(.tertiary)
+                    DisclosureGroup(isExpanded: $sourcesExpanded) {
+                        ForEach(detail.sources) { source in
+                            Button {
+                                selectedSource = source
+                            } label: {
+                                sourceRow(source)
                             }
+                            .buttonStyle(.plain)
+                            Divider()
                         }
+                    } label: {
+                        Label(
+                            "\(detail.sources.count) saved source\(detail.sources.count == 1 ? "" : "s")",
+                            systemImage: "tray.full"
+                        )
+                        .font(.headline)
                     }
                 }
 
@@ -540,6 +537,27 @@ struct ResearchRunDetailView: View {
         )
     }
 
+    private func sourceRow(_ source: ResearchSourceRecord) -> some View {
+        HStack {
+            Image(systemName: source.kind == .post ? "doc.text" : "text.bubble")
+                .foregroundStyle(.tint)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(source.title ?? source.author.map { "u/\($0)" } ?? source.sourceID)
+                    .foregroundStyle(.primary)
+                    .lineLimit(2)
+                Text(source.sourceID)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            Image(systemName: "chevron.right")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+        }
+        .contentShape(Rectangle())
+        .padding(.vertical, 5)
+    }
+
     @ViewBuilder
     private func coverageSection(_ coverage: ResearchCoverageInput) -> some View {
         Section("Coverage") {
@@ -713,20 +731,28 @@ private struct ResearchArtifactView: View {
             }
             if claims.isEmpty {
                 Text(artifact.body)
+                    .lineLimit(nil)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .textSelection(.enabled)
             } else {
                 ForEach(claims) { claim in
                     VStack(alignment: .leading, spacing: 8) {
                         Text(claim.text)
-                        HStack {
-                            ResearchConfidenceBadge(confidence: claim.confidence)
-                            ForEach((citationsByClaim[claim.id] ?? []).filter(\.validated)) { citation in
-                                if let source = sourceForID(citation.sourceID) {
-                                    Button(ResearchComparisonSourceReference.displayName(for: citation.sourceID)) {
-                                        openSource(source)
+                            .lineLimit(nil)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack {
+                                ResearchConfidenceBadge(confidence: claim.confidence)
+                                ForEach((citationsByClaim[claim.id] ?? []).filter(\.validated)) { citation in
+                                    if let source = sourceForID(citation.sourceID) {
+                                        Button(ResearchComparisonSourceReference.displayName(for: citation.sourceID)) {
+                                            openSource(source)
+                                        }
+                                            .buttonStyle(.bordered)
+                                            .controlSize(.small)
                                     }
-                                        .buttonStyle(.bordered)
-                                        .controlSize(.small)
                                 }
                             }
                         }
@@ -753,20 +779,40 @@ private struct ResearchArtifactView: View {
                             Label(note, systemImage: "questionmark.circle")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
+                                .lineLimit(nil)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .frame(maxWidth: .infinity, alignment: .leading)
                         }
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.vertical, 5)
                 }
+                DisclosureGroup("What does confidence mean?") {
+                    Text("Confidence describes the strength and breadth of the saved evidence. Low does not mean false; it means support may be limited, conflicting, drawn from too few independent posts, or affected by incomplete coverage.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(nil)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .font(.caption.weight(.semibold))
             }
             ForEach(artifact.conflicts, id: \.self) {
                 Label($0, systemImage: "arrow.triangle.branch")
                     .foregroundStyle(.orange)
+                    .lineLimit(nil)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
             ForEach(artifact.missingData, id: \.self) {
                 Label($0, systemImage: "questionmark.circle")
                     .foregroundStyle(.secondary)
+                    .lineLimit(nil)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var artifactHeader: some View {
@@ -774,10 +820,13 @@ private struct ResearchArtifactView: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(artifact.title)
                     .font(.headline)
+                    .lineLimit(nil)
+                    .fixedSize(horizontal: false, vertical: true)
                 Text("\(artifact.kind.displayName) · \(artifact.createdAt.formatted(date: .abbreviated, time: .shortened))")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            .layoutPriority(1)
             Spacer()
             if SummaryService.shared.settings.localTTSEngine == .kokoro {
                 if let speechAsset {
@@ -1080,6 +1129,9 @@ struct ResearchComparisonView: View {
             if let summary = detail.revisionArtifacts.overallSummary {
                 VStack(alignment: .leading, spacing: 8) {
                     Text(summary.body)
+                        .lineLimit(nil)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                         .textSelection(.enabled)
                     Text("Saved \(summary.createdAt.formatted(date: .abbreviated, time: .shortened))")
                         .font(.caption)
@@ -1102,6 +1154,9 @@ struct ResearchComparisonView: View {
                 ForEach(remaining) { artifact in
                     DisclosureGroup {
                         Text(artifact.body)
+                            .lineLimit(nil)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                             .textSelection(.enabled)
                     } label: {
                         VStack(alignment: .leading, spacing: 3) {
@@ -1399,9 +1454,14 @@ private struct ResearchComparisonReportView: View {
             if plainLanguageNarrative.isEmpty {
                 Text("The saved evidence was not sufficient to describe a clear change in the discussion.")
                     .foregroundStyle(.secondary)
+                    .lineLimit(nil)
+                    .fixedSize(horizontal: false, vertical: true)
             } else {
                 Text(plainLanguageNarrative)
                     .font(.body)
+                    .lineLimit(nil)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .textSelection(.enabled)
             }
 
@@ -1421,11 +1481,17 @@ private struct ResearchComparisonReportView: View {
         VStack(alignment: .leading, spacing: 10) {
             if claims.isEmpty {
                 Text(report.body)
+                    .lineLimit(nil)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .textSelection(.enabled)
             } else {
                 ForEach(claims) { claim in
                     VStack(alignment: .leading, spacing: 8) {
                         Text(claim.text)
+                            .lineLimit(nil)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                             .textSelection(.enabled)
                         ScrollView(.horizontal, showsIndicators: false) {
                             HStack {
@@ -1443,20 +1509,37 @@ private struct ResearchComparisonReportView: View {
                             Label(missing, systemImage: "questionmark.circle")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
+                                .lineLimit(nil)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .frame(maxWidth: .infinity, alignment: .leading)
                         }
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.vertical, 3)
                 }
+                DisclosureGroup("What does confidence mean?") {
+                    Text("Low does not mean false. It means the saved support may be limited, conflicting, drawn from too few independent posts, or affected by incomplete coverage.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(nil)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .font(.caption.weight(.semibold))
             }
             ForEach(report.conflicts, id: \.self) {
                 Label($0, systemImage: "arrow.triangle.branch")
                     .foregroundStyle(.orange)
+                    .lineLimit(nil)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             ForEach(report.missingData, id: \.self) {
                 Label($0, systemImage: "questionmark.circle")
                     .foregroundStyle(.secondary)
+                    .lineLimit(nil)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -1479,6 +1562,7 @@ struct ResearchConfidenceBadge: View {
     var body: some View {
         Label(confidence.displayName, systemImage: "checkmark.shield")
             .font(.caption2.weight(.semibold))
+            .fixedSize(horizontal: true, vertical: false)
             .padding(.horizontal, 7)
             .padding(.vertical, 4)
             .background(color.opacity(0.15))
