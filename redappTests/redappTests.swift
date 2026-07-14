@@ -83,6 +83,44 @@ final class redappTests: XCTestCase {
         )
     }
 
+    func testBuildsReadableChangeNarrativeFromValidatedClaimText() {
+        let narrative = ResearchChangeNarrative.plainText(from: [
+            "  The saved discussion moved toward practical deployment questions  ",
+            "",
+            "Concern about battery use became more visible.",
+            "Participants remained divided about reliability",
+            "Fourth point",
+            "Fifth point",
+            "Sixth point",
+            "This seventh point should be omitted"
+        ])
+
+        XCTAssertEqual(
+            narrative,
+            "The saved discussion moved toward practical deployment questions. Concern about battery use became more visible. Participants remained divided about reliability. Fourth point. Fifth point. Sixth point."
+        )
+
+        let body = ResearchChangeNarrative.artifactBody(
+            claimTexts: ["A new concern appeared"],
+            evidenceMarkdown: "- A new concern appeared [R2]"
+        )
+        XCTAssertTrue(body.hasPrefix("### How the subreddit progressed"))
+        XCTAssertTrue(body.contains("A new concern appeared."))
+        XCTAssertTrue(body.contains("### Supporting evidence"))
+
+        let coverageText = ResearchChangeNarrative.coverageOnlyText(
+            changes: [
+                ResearchCoverageDelta(
+                    title: "Comments analyzed",
+                    oldValue: 20,
+                    newValue: 35
+                )
+            ]
+        )
+        XCTAssertTrue(coverageText.contains("comments analyzed increased from 20 to 35"))
+        XCTAssertTrue(coverageText.contains("capture difference"))
+    }
+
     @MainActor
     func testSavesSearchesPinsTagsAndCreatesHistory() throws {
         let store = ResearchLibraryStore(inMemory: true)

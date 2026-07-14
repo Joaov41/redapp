@@ -862,12 +862,14 @@ struct ResearchComparisonView: View {
     @State private var changeCitations: [UUID: [ResearchCitationRecord]] = [:]
     @State private var selectedSource: ResearchSourceRecord?
     @State private var isGeneratingReport = false
+    @State private var generationTask: Task<Void, Never>?
     @State private var errorMessage: String?
 
     var body: some View {
         List {
             if let left, let right, let difference {
-                whatChangedSection(difference)
+                subredditProgressSection(difference)
+                exactChangesSection(difference)
 
                 if !difference.added.isEmpty {
                     Section("Added sources") {
@@ -1004,6 +1006,9 @@ struct ResearchComparisonView: View {
         .task {
             loadComparison()
         }
+        .onDisappear {
+            generationTask?.cancel()
+        }
         .sheet(item: $selectedSource) { source in
             NavigationStack { ResearchSourceDetailView(source: source) }
         }
@@ -1018,8 +1023,61 @@ struct ResearchComparisonView: View {
     }
 
     @ViewBuilder
-    private func whatChangedSection(_ difference: ResearchRevisionDiff) -> some View {
-        Section("What changed") {
+    private func subredditProgressSection(_ difference: ResearchRevisionDiff) -> some View {
+        Section {
+            if let changeReport {
+                ResearchComparisonReportView(
+                    report: changeReport,
+                    claims: changeClaims,
+                    citationsByClaim: changeCitations,
+                    openSource: openComparisonSource
+                )
+                Button {
+                    generateWhatChangedReport(difference)
+                } label: {
+                    if isGeneratingReport {
+                        HStack {
+                            ProgressView()
+                            Text("Rewriting the plain-language update…")
+                        }
+                    } else {
+                        Label("Regenerate plain-language update", systemImage: "arrow.clockwise")
+                    }
+                }
+                .disabled(isGeneratingReport || !difference.hasSourceChanges)
+            } else if difference.hasSourceChanges {
+                Text("Create a short, everyday-language explanation of how the saved subreddit discussion moved from the earlier snapshot to the later one.")
+                    .foregroundStyle(.secondary)
+                Button {
+                    generateWhatChangedReport(difference)
+                } label: {
+                    if isGeneratingReport {
+                        HStack {
+                            ProgressView()
+                            Text("Writing the plain-language update…")
+                        }
+                    } else {
+                        Label("Explain the progress in plain language", systemImage: "text.quote")
+                    }
+                }
+                .disabled(isGeneratingReport)
+            } else if difference.hasChanges {
+                Text(ResearchChangeNarrative.coverageOnlyText(changes: difference.coverageChanges))
+                    .foregroundStyle(.secondary)
+            } else {
+                Text(ResearchChangeNarrative.noChangeText)
+                    .foregroundStyle(.secondary)
+            }
+        } header: {
+            Text(subredditProgressTitle)
+        } footer: {
+            Text("This describes the saved sample, not every person or discussion in the subreddit.")
+        }
+    }
+
+    @ViewBuilder
+    private func exactChangesSection(_ difference: ResearchRevisionDiff) -> some View {
+        Section("Exact changes") {
             if !difference.hasChanges {
                 Label("No saved source or coverage changes detected.", systemImage: "equal.circle")
                     .foregroundStyle(.secondary)
@@ -1029,40 +1087,17 @@ struct ResearchComparisonView: View {
                 LabeledContent("Edited", value: "\(difference.edited.count)")
                 LabeledContent("Score changes", value: "\(difference.scoreChanges.count)")
                 LabeledContent("Unchanged sources", value: "\(difference.unchangedSourceCount)")
-
-                if let changeReport {
-                    ResearchComparisonReportView(
-                        report: changeReport,
-                        claims: changeClaims,
-                        citationsByClaim: changeCitations,
-                        openSource: openComparisonSource
-                    )
-                    Button {
-                        generateWhatChangedReport(difference)
-                    } label: {
-                        Label("Regenerate What Changed", systemImage: "arrow.clockwise")
-                    }
-                    .disabled(isGeneratingReport || !difference.hasSourceChanges)
-                } else if difference.hasSourceChanges {
-                    Button {
-                        generateWhatChangedReport(difference)
-                    } label: {
-                        if isGeneratingReport {
-                            HStack {
-                                ProgressView()
-                                Text("Checking changed sources…")
-                            }
-                        } else {
-                            Label("Generate What Changed", systemImage: "sparkles.rectangle.stack")
-                        }
-                    }
-                    .disabled(isGeneratingReport)
-                } else {
-                    Text("Only coverage changed; the exact differences are listed below.")
-                        .foregroundStyle(.secondary)
-                }
             }
         }
+    }
+
+    private var subredditProgressTitle: String {
+        guard let subreddit = right?.sources
+            .map(\.subreddit)
+            .first(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else {
+            return "How the subreddit progressed"
+        }
+        return "How r/\(subreddit) progressed"
     }
 
     private func loadComparison() {
@@ -1111,11 +1146,23 @@ struct ResearchComparisonView: View {
         guard !comparisonSources.isEmpty else { return }
         isGeneratingReport = true
         errorMessage = nil
+        let subreddit = right.sources
+            .map(\.subreddit)
+            .first(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
+            .map { "r/\($0)" } ?? "the saved subreddit"
 
         let instruction = """
-        Produce a concise, evidence-grounded “What Changed” report comparing revision \(difference.oldRevision) with revision \(difference.newRevision).
+        Explain, in plain everyday language, how the saved subreddit discussion progressed from revision \(difference.oldRevision) to revision \(difference.newRevision).
 
-        The deterministic manifest below is authoritative. Discuss only changes present in it. Explain important new evidence, removed evidence, edited statements, potentially changed conclusions, newly introduced or resolved conflicts, and coverage limitations. Treat score changes only as engagement changes, never as proof that a claim is true. Every factual claim must cite the revision-prefixed saved sources. If the evidence cannot establish why something changed, say so under missing data.
+        Subreddit: \(subreddit)
+        Earlier snapshot: \(left.run.capturedAt.formatted(date: .abbreviated, time: .shortened))
+        Later snapshot: \(right.run.capturedAt.formatted(date: .abbreviated, time: .shortened))
+
+        Write for a reader who does not want a technical data-diff report. Return 3 to 6 short claims in a natural reading order so that, when read together, they form a clear update. Focus on which topics or concerns appeared, faded, or changed; whether the saved discussion became more supportive, critical, uncertain, or divided; and what new consensus or conflict emerged. Only describe those shifts when the saved evidence supports them.
+
+        In claim text, do not mention source IDs, manifests, digests, database terms, or raw added/removed counts. Say “the saved discussion” or “this saved sample” rather than claiming to represent every member of the subreddit. Comparative claims should cite evidence from both revisions when available. If the material only establishes that something is new or absent in one snapshot, state that carefully without guessing why.
+
+        The deterministic manifest below is authoritative. Discuss only changes present in it. Treat score changes only as engagement changes, never as proof that a claim is true. Every factual claim must cite the revision-prefixed saved sources. If the evidence cannot establish why something changed, say so under missing data.
 
         \(difference.promptManifest)
 
@@ -1126,18 +1173,28 @@ struct ResearchComparisonView: View {
         \(reportExcerpts(right.artifacts))
         """
 
-        Task {
+        generationTask = Task {
+            defer {
+                isGeneratingReport = false
+                generationTask = nil
+            }
             do {
                 let result = try await GroundedResearchService.shared.generateReport(
                     instruction: instruction,
                     sources: comparisonSources,
-                    coverage: right.run.coverage
+                    coverage: right.run.coverage,
+                    promptVersion: 2
+                )
+                try Task.checkCancellation()
+                let artifactBody = ResearchChangeNarrative.artifactBody(
+                    claimTexts: result.response.claims.map(\.text),
+                    evidenceMarkdown: result.response.markdown
                 )
                 _ = try store.addArtifact(
                     runID: right.run.id,
                     kind: .changeReport,
                     title: difference.reportTitle,
-                    body: result.response.markdown,
+                    body: artifactBody,
                     generationReceipt: result.receipt,
                     coverage: right.run.coverage,
                     conflicts: result.response.conflicts,
@@ -1151,7 +1208,6 @@ struct ResearchComparisonView: View {
             } catch {
                 errorMessage = error.localizedDescription
             }
-            isGeneratingReport = false
         }
     }
 
@@ -1244,7 +1300,30 @@ private struct ResearchComparisonReportView: View {
     let openSource: (String) -> Void
 
     var body: some View {
-        DisclosureGroup("Grounded summary") {
+        VStack(alignment: .leading, spacing: 12) {
+            if plainLanguageNarrative.isEmpty {
+                Text("The saved evidence was not sufficient to describe a clear change in the discussion.")
+                    .foregroundStyle(.secondary)
+            } else {
+                Text(plainLanguageNarrative)
+                    .font(.body)
+                    .textSelection(.enabled)
+            }
+
+            DisclosureGroup("Evidence, confidence, and limitations") {
+                evidenceContent
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    private var plainLanguageNarrative: String {
+        ResearchChangeNarrative.plainText(from: claims.map(\.text))
+    }
+
+    @ViewBuilder
+    private var evidenceContent: some View {
+        VStack(alignment: .leading, spacing: 10) {
             if claims.isEmpty {
                 Text(report.body)
                     .textSelection(.enabled)

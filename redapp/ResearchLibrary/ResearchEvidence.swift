@@ -191,7 +191,8 @@ actor GroundedResearchService {
         instruction: String,
         sources: [ResearchSourceInput],
         coverage: ResearchCoverageInput,
-        conversationContext: String? = nil
+        conversationContext: String? = nil,
+        promptVersion: Int = 1
     ) async throws -> (response: ValidatedGroundedResponse, receipt: ResearchGenerationReceiptInput) {
         guard !sources.isEmpty else { throw GroundedResearchError.noSources }
         let selectedSources = Self.relevantSources(
@@ -244,7 +245,7 @@ actor GroundedResearchService {
                 settings: service.settings,
                 startedAt: startedAt,
                 completedAt: Date(),
-                promptVersion: 1,
+                promptVersion: promptVersion,
                 responseSchemaVersion: 1
             )
         )

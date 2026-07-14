@@ -1,5 +1,45 @@
 import Foundation
 
+enum ResearchChangeNarrative {
+    static let noChangeText = "No meaningful change was detected between these two saved snapshots."
+
+    static func plainText(from claimTexts: [String], maximumSentences: Int = 6) -> String {
+        let sentences = claimTexts
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .prefix(maximumSentences)
+            .map(endingWithSentencePunctuation)
+        return sentences.joined(separator: " ")
+    }
+
+    static func artifactBody(claimTexts: [String], evidenceMarkdown: String) -> String {
+        let narrative = plainText(from: claimTexts)
+        let evidence = evidenceMarkdown.trimmingCharacters(in: .whitespacesAndNewlines)
+        var sections: [String] = []
+        if !narrative.isEmpty {
+            sections.append("### How the subreddit progressed\n\n\(narrative)")
+        }
+        if !evidence.isEmpty {
+            sections.append("### Supporting evidence\n\n\(evidence)")
+        }
+        return sections.joined(separator: "\n\n")
+    }
+
+    static func coverageOnlyText(changes: [ResearchCoverageDelta]) -> String {
+        guard !changes.isEmpty else { return noChangeText }
+        let details = changes.map { change in
+            let direction = change.newValue > change.oldValue ? "increased" : "decreased"
+            return "\(change.title.lowercased()) \(direction) from \(change.oldValue) to \(change.newValue)"
+        }.joined(separator: "; ")
+        return "The saved posts and comments are unchanged. Only collection coverage changed: \(details). Any apparent shift should therefore be treated as a capture difference, not a change in the community discussion."
+    }
+
+    private static func endingWithSentencePunctuation(_ text: String) -> String {
+        guard let last = text.last, !".!?".contains(last) else { return text }
+        return text + "."
+    }
+}
+
 struct ResearchComparisonSourceReference: Hashable, Sendable {
     let runID: UUID
     let revision: Int
