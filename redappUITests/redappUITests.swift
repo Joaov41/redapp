@@ -24,11 +24,12 @@ final class redappUITests: XCTestCase {
 
     @MainActor
     func testExample() throws {
-        // UI tests must launch the application that they test.
         let app = XCUIApplication()
         app.launch()
-
-        // Use XCTAssert and related functions to verify your tests produce the correct results.
+        let libraryButton = app.buttons["Research Library"]
+        XCTAssertTrue(libraryButton.waitForExistence(timeout: 8))
+        libraryButton.tap()
+        XCTAssertTrue(app.navigationBars["Research Library"].waitForExistence(timeout: 5))
     }
 
     @MainActor

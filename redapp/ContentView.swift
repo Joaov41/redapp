@@ -352,6 +352,8 @@ struct SubredditPostData: Codable, Identifiable {
     let media_metadata: [String: MediaMetadata]?
     let gallery_data: GalleryData?
     let stickied: Bool?
+    let author: String?
+    let subreddit: String?
     
     // Processed content fields (not encoded/decoded)
     var processedSelftext: String = ""
@@ -359,7 +361,7 @@ struct SubredditPostData: Codable, Identifiable {
     var links: [(String, URL)] = []
     
     enum CodingKeys: String, CodingKey {
-        case id, title, selftext, ups, num_comments, created_utc, permalink, thumbnail, url, preview, media_metadata, gallery_data, stickied
+        case id, title, selftext, ups, num_comments, created_utc, permalink, thumbnail, url, preview, media_metadata, gallery_data, stickied, author, subreddit
     }
 
     var previewText: String {
@@ -481,8 +483,26 @@ class CommentData: Identifiable, ObservableObject {
     let imageURLs: [URL]
     let links: [(String, URL)]
     let depth: Int
+    let parentSourceID: String?
+    let postSourceID: String?
+    let permalink: String?
+    let createdAt: Date?
 
-    init(id: String, author: String, score: Int, rawText: String, replies: [CommentData], processedText: String, imageURLs: [URL], links: [(String, URL)], depth: Int = 0) {
+    init(
+        id: String,
+        author: String,
+        score: Int,
+        rawText: String,
+        replies: [CommentData],
+        processedText: String,
+        imageURLs: [URL],
+        links: [(String, URL)],
+        depth: Int = 0,
+        parentSourceID: String? = nil,
+        postSourceID: String? = nil,
+        permalink: String? = nil,
+        createdAt: Date? = nil
+    ) {
         self.id = id
         self.author = author
         self.score = score
@@ -492,6 +512,10 @@ class CommentData: Identifiable, ObservableObject {
         self.imageURLs = imageURLs
         self.links = links
         self.depth = depth
+        self.parentSourceID = parentSourceID
+        self.postSourceID = postSourceID
+        self.permalink = permalink
+        self.createdAt = createdAt
     }
 
     var limitedImageURLs: [URL] {
@@ -6306,8 +6330,13 @@ enum VoteDirection: Int {
 
 // MARK: - Reddit API
 struct PostAndComments {
+    let postID: String
     let postTitle: String
     let postContent: String
+    let subreddit: String
+    let permalink: String
+    let score: Int?
+    let createdAt: Date?
     let comments: [CommentData]
 }
 
@@ -7841,7 +7870,16 @@ class RedditAPI {
         print("📝 Found \(commentsArray.count) top-level comments")
         let comments = try await parseAllComments(commentsArray)
         
-        return PostAndComments(postTitle: postTitle, postContent: postContent, comments: comments)
+        return PostAndComments(
+            postID: "t3_\(postId)",
+            postTitle: postTitle,
+            postContent: postContent,
+            subreddit: subredditName ?? "",
+            permalink: firstPost["permalink"] as? String ?? permalink,
+            score: firstPost["score"] as? Int,
+            createdAt: (firstPost["created_utc"] as? Double).map(Date.init(timeIntervalSince1970:)),
+            comments: comments
+        )
     }
     
     func fetchComments(permalink: String) async throws -> [CommentData] {
@@ -7954,7 +7992,11 @@ class RedditAPI {
                         processedText: processedText,
                         imageURLs: imageURLs,
                         links: links,
-                        depth: commentDepth
+                        depth: commentDepth,
+                        parentSourceID: commentData["parent_id"] as? String,
+                        postSourceID: commentData["link_id"] as? String ?? self.linkId,
+                        permalink: commentData["permalink"] as? String,
+                        createdAt: (commentData["created_utc"] as? Double).map(Date.init(timeIntervalSince1970:))
                     )
                     result.append(newComment)
                     
@@ -8496,6 +8538,10 @@ class RedditSubredditViewModel: ObservableObject {
     @Published var batchRawComments: String = ""
     @Published var batchExecutionMode: BatchExecutionMode = .settings
     @Published var batchExtractedPosts: [BatchExtractedPost] = []
+    @Published private(set) var batchCapturedSources: [ResearchSourceInput] = []
+    @Published private(set) var batchCoverage: ResearchCoverageInput = .empty
+    @Published private(set) var savedResearchRunID: UUID?
+    @Published var researchLibraryError: String?
     @Published var hasAttemptedFetch = false
     private var batchProcessingTask: Task<Void, Error>?
     private var currentSubreddit: String = "SwiftUI"
@@ -8687,6 +8733,10 @@ class RedditSubredditViewModel: ObservableObject {
         requiresImmediateWidgetRefresh = false
         batchExecutionMode = .settings
         batchExtractedPosts = []
+        batchCapturedSources = []
+        batchCoverage = .empty
+        savedResearchRunID = nil
+        researchLibraryError = nil
         currentBatchContextName = nil
     }
 
@@ -8822,6 +8872,20 @@ class RedditSubredditViewModel: ObservableObject {
         pendingBatchReroute = nil
         batchRawComments = ""
         batchExtractedPosts = []
+        batchCapturedSources = []
+        batchCoverage = ResearchCoverageInput(
+            postsRequested: posts.count,
+            postsFetched: 0,
+            postsAnalyzed: 0,
+            commentsReported: 0,
+            commentsFetched: 0,
+            commentsAnalyzed: 0,
+            commentsOmitted: 0,
+            failureMessages: [],
+            truncationMessages: []
+        )
+        savedResearchRunID = nil
+        researchLibraryError = nil
         requiresImmediateWidgetRefresh = false
 
         #if os(iOS)
@@ -8954,6 +9018,13 @@ class RedditSubredditViewModel: ObservableObject {
                                         )
                                         self.recordRateLimitIfNeeded(info: rateInfo, subreddit: subreddit)
 
+                                        await MainActor.run {
+                                            self.captureResearchSources(
+                                                post: post,
+                                                response: postAndComments,
+                                                analyzedCommentLimit: 500
+                                            )
+                                        }
                                         let allRawCommentsFlattened = self.flattenCommentsWithLimit(comments: postAndComments.comments, limit: 500)
                                         let allRawComments = allRawCommentsFlattened.joined(separator: "\n\n")
                                         batchPostData.append((title: post.title, comments: allRawComments, permalink: post.permalink))
@@ -8997,6 +9068,9 @@ class RedditSubredditViewModel: ObservableObject {
                                     } catch {
                                         // If fetching fails, skip this post (same as version 1)
                                         print("Failed to fetch comments for post: \(post.title)")
+                                        await MainActor.run {
+                                            self.recordResearchFailure(postTitle: post.title, error: error)
+                                        }
                                         break
                                     }
                                 }
@@ -9268,6 +9342,20 @@ class RedditSubredditViewModel: ObservableObject {
         pendingBatchReroute = nil
         batchRawComments = ""
         batchExtractedPosts = []
+        batchCapturedSources = []
+        batchCoverage = ResearchCoverageInput(
+            postsRequested: posts.count,
+            postsFetched: 0,
+            postsAnalyzed: 0,
+            commentsReported: 0,
+            commentsFetched: 0,
+            commentsAnalyzed: 0,
+            commentsOmitted: 0,
+            failureMessages: [],
+            truncationMessages: []
+        )
+        savedResearchRunID = nil
+        researchLibraryError = nil
         requiresImmediateWidgetRefresh = false
 
 	        batchProcessingTask = Task {
@@ -9665,6 +9753,13 @@ class RedditSubredditViewModel: ObservableObject {
                     let fetchTime = Date().timeIntervalSince(startTime)
                     print("⏱️ [AppleCloud Batch] Fetched '\(post.title.prefix(30))' in \(String(format: "%.1f", fetchTime))s")
 
+                    await MainActor.run {
+                        self.captureResearchSources(
+                            post: post,
+                            response: postAndComments,
+                            analyzedCommentLimit: 500
+                        )
+                    }
                     let allRawCommentsFlattened = flattenCommentsWithLimit(comments: postAndComments.comments, limit: 500) // Same as Gemini batch
                     let allRawComments = allRawCommentsFlattened.joined(separator: "\n\n")
                     allPostData.append((title: post.title, comments: allRawComments, permalink: post.permalink))
@@ -9712,6 +9807,9 @@ class RedditSubredditViewModel: ObservableObject {
                 } catch {
                     // If fetching fails, skip this post (same as version 1)
                     print("Failed to fetch comments for post: \(post.title)")
+                    await MainActor.run {
+                        self.recordResearchFailure(postTitle: post.title, error: error)
+                    }
                     break
                 }
             }
@@ -10130,6 +10228,94 @@ class RedditSubredditViewModel: ObservableObject {
         pendingBatchReroute = nil
     }
 
+    @MainActor
+    @discardableResult
+    func saveCurrentBatchToResearchLibrary() -> UUID? {
+        guard !batchSummaries.isEmpty || !(batchFinalSummary?.isEmpty ?? true) else {
+            researchLibraryError = "There are no completed summaries to save yet."
+            return nil
+        }
+        if let savedResearchRunID {
+            if let overall = batchFinalSummary?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !overall.isEmpty {
+                do {
+                    let existing = try ResearchLibraryStore.shared.artifacts(runID: savedResearchRunID)
+                    if !existing.contains(where: { $0.kind == .overallReport && $0.body == overall }) {
+                        let now = Date()
+                        try ResearchLibraryStore.shared.addArtifact(
+                            runID: savedResearchRunID,
+                            kind: .overallReport,
+                            title: "Overall Summary",
+                            body: overall,
+                            generationReceipt: ResearchGenerationReceiptFactory.make(
+                                settings: SummaryService.shared.settings,
+                                startedAt: now,
+                                completedAt: now,
+                                promptVersion: 0,
+                                responseSchemaVersion: 0
+                            ),
+                            coverage: batchCoverage,
+                            legacyUncited: true
+                        )
+                    }
+                } catch {
+                    researchLibraryError = error.localizedDescription
+                }
+            }
+            return savedResearchRunID
+        }
+
+        var coverage = batchCoverage
+        coverage.postsRequested = max(coverage.postsRequested, max(batchTotalPosts, posts.count))
+        coverage.postsAnalyzed = max(coverage.postsAnalyzed, batchSummaries.count)
+        if let batchError, !batchError.isEmpty, !coverage.failureMessages.contains(batchError) {
+            coverage.failureMessages.append(batchError)
+        }
+
+        let contextName = effectiveBatchContextName
+        let scope = [
+            selectedFeedMode == .home ? "home" : "subreddit",
+            contextName,
+            selectedPostType.rawValue,
+            selectedPostType == .top ? selectedTopPostTimeRange.rawValue : "all"
+        ].joined(separator: "|")
+        let now = Date()
+        let receipt = ResearchGenerationReceiptFactory.make(
+            settings: SummaryService.shared.settings,
+            startedAt: now,
+            completedAt: now,
+            promptVersion: 0,
+            responseSchemaVersion: 0
+        )
+        let request = ResearchBatchSaveRequest(
+            title: selectedFeedMode == .home
+                ? "Home Feed Research"
+                : "r/\(contextName) Research",
+            scope: scope,
+            subreddit: selectedFeedMode == .home ? "home" : contextName,
+            feedMode: selectedFeedMode == .home ? "home" : "subreddit",
+            sortMode: selectedPostType.rawValue,
+            timeRange: selectedPostType == .top ? selectedTopPostTimeRange.rawValue : "all",
+            sources: batchCapturedSources,
+            coverage: coverage,
+            perPostSummaries: batchSummaries.map {
+                (title: $0.postTitle, summary: $0.summary, permalink: $0.permalink)
+            },
+            overallSummary: batchFinalSummary,
+            generationReceipt: receipt
+        )
+
+        do {
+            let run = try ResearchLibraryStore.shared.saveBatch(request)
+            savedResearchRunID = run.id
+            researchLibraryError = nil
+            return run.id
+        } catch {
+            researchLibraryError = error.localizedDescription
+            return nil
+        }
+    }
+
 	    func extractBatchCommentsText(
         subreddit: String,
         perPostCommentLimit: Int = 500,
@@ -10172,6 +10358,13 @@ class RedditSubredditViewModel: ObservableObject {
                     )
                     recordRateLimitIfNeeded(info: rateInfo, subreddit: subredditName.isEmpty ? activeFeedStatusKey : subredditName)
 
+                    await MainActor.run {
+                        self.captureResearchSources(
+                            post: post,
+                            response: postAndComments,
+                            analyzedCommentLimit: max(1, perPostCommentLimit)
+                        )
+                    }
                     let flattened = flattenCommentsWithLimit(comments: postAndComments.comments, limit: max(1, perPostCommentLimit))
                     let comments = flattened.joined(separator: "\n\n")
 
@@ -10190,6 +10383,9 @@ class RedditSubredditViewModel: ObservableObject {
                 } catch {
                     // If fetching fails, skip this post (same as version 1)
                     print("Failed to fetch comments for post: \(post.title)")
+                    await MainActor.run {
+                        self.recordResearchFailure(postTitle: post.title, error: error)
+                    }
                     break
                 }
             }
@@ -10242,6 +10438,13 @@ class RedditSubredditViewModel: ObservableObject {
                     )
                     recordRateLimitIfNeeded(info: rateInfo, subreddit: subredditName.isEmpty ? activeFeedStatusKey : subredditName)
 
+                    await MainActor.run {
+                        self.captureResearchSources(
+                            post: post,
+                            response: postAndComments,
+                            analyzedCommentLimit: max(1, perPostCommentLimit)
+                        )
+                    }
                     let flattened = flattenCommentsWithLimit(comments: postAndComments.comments, limit: max(1, perPostCommentLimit))
                     let comments = flattened.joined(separator: "\n\n")
 
@@ -10263,6 +10466,9 @@ class RedditSubredditViewModel: ObservableObject {
                     throw rateLimitError
                 } catch {
                     print("Failed to fetch comments for post: \(post.title)")
+                    await MainActor.run {
+                        self.recordResearchFailure(postTitle: post.title, error: error)
+                    }
                     break
                 }
             }
@@ -10403,6 +10609,9 @@ class RedditSubredditViewModel: ObservableObject {
                 self.requiresImmediateWidgetRefresh = true
                 self.isApplyingFinalSummaryUpdate = false
                 self.publishWidgetSnapshot()
+                if self.savedResearchRunID != nil {
+                    self.saveCurrentBatchToResearchLibrary()
+                }
                 #if os(iOS)
                 if #available(iOS 16.1, *) {
                     BatchSummaryLiveActivityController.shared.end(
@@ -10455,7 +10664,8 @@ class RedditSubredditViewModel: ObservableObject {
                 if commentCount >= limit {
                     return
                 }
-                let formattedComment = "\(indent)- \(comment.rawText)"
+                let sourceID = comment.id.hasPrefix("t1_") ? comment.id : "t1_\(comment.id)"
+                let formattedComment = "\(indent)- [SOURCE:\(sourceID)] u/\(comment.author) (score: \(comment.score)): \(comment.rawText)"
                 allRawComments.append(formattedComment)
                 commentCount += 1
                 
@@ -10467,6 +10677,105 @@ class RedditSubredditViewModel: ObservableObject {
         
         collectComments(from: comments, currentDepth: depth)
         return allRawComments
+    }
+
+    @MainActor
+    private func captureResearchSources(
+        post: SubredditPostData,
+        response: PostAndComments,
+        analyzedCommentLimit: Int
+    ) {
+        var captured = batchCapturedSources
+        var knownIDs = Set(captured.map(\.sourceID))
+        let postSourceID = response.postID
+        let subreddit = response.subreddit.isEmpty
+            ? (post.subreddit ?? currentSubreddit)
+            : response.subreddit
+
+        if knownIDs.insert(postSourceID).inserted {
+            let mediaURLs = Array(
+                Set(post.allImageURLs.map(\.absoluteString))
+            ).sorted()
+            captured.append(
+                ResearchSourceInput(
+                    sourceID: postSourceID,
+                    kind: .post,
+                    postSourceID: postSourceID,
+                    parentSourceID: nil,
+                    subreddit: subreddit,
+                    title: response.postTitle.isEmpty ? post.title : response.postTitle,
+                    permalink: response.permalink,
+                    author: post.author,
+                    score: response.score ?? post.ups,
+                    createdAt: response.createdAt ?? post.created_utc.map { Date(timeIntervalSince1970: $0) },
+                    depth: nil,
+                    rawMarkdown: response.postContent.isEmpty ? post.selftext : response.postContent,
+                    mediaURLs: mediaURLs,
+                    sourceOrder: captured.count
+                )
+            )
+        }
+
+        let comments = flattenedCommentRecords(response.comments)
+        for comment in comments {
+            let sourceID = comment.id.hasPrefix("t1_") ? comment.id : "t1_\(comment.id)"
+            guard knownIDs.insert(sourceID).inserted else { continue }
+            let directPermalink = comment.permalink
+                ?? "\(response.permalink)?context=3&comment=\(comment.id.replacingOccurrences(of: "t1_", with: ""))"
+            captured.append(
+                ResearchSourceInput(
+                    sourceID: sourceID,
+                    kind: .comment,
+                    postSourceID: comment.postSourceID ?? postSourceID,
+                    parentSourceID: comment.parentSourceID,
+                    subreddit: subreddit,
+                    title: nil,
+                    permalink: directPermalink,
+                    author: comment.author,
+                    score: comment.score,
+                    createdAt: comment.createdAt,
+                    depth: comment.depth,
+                    rawMarkdown: comment.rawText,
+                    mediaURLs: comment.imageURLs.map(\.absoluteString),
+                    sourceOrder: captured.count
+                )
+            )
+        }
+
+        batchCapturedSources = captured
+        batchCoverage.postsFetched += 1
+        batchCoverage.postsAnalyzed += 1
+        batchCoverage.commentsReported += max(0, post.num_comments)
+        batchCoverage.commentsFetched += comments.count
+        let analyzedCount = min(max(0, analyzedCommentLimit), comments.count)
+        batchCoverage.commentsAnalyzed += analyzedCount
+        let omittedCount = max(0, comments.count - analyzedCount)
+        batchCoverage.commentsOmitted += omittedCount
+        if omittedCount > 0 {
+            batchCoverage.truncationMessages.append(
+                "\(post.title): analyzed \(analyzedCount) of \(comments.count) fetched comments."
+            )
+        }
+    }
+
+    @MainActor
+    private func recordResearchFailure(postTitle: String, error: Error) {
+        let message = "\(postTitle): \(error.localizedDescription)"
+        if !batchCoverage.failureMessages.contains(message) {
+            batchCoverage.failureMessages.append(message)
+        }
+    }
+
+    private func flattenedCommentRecords(_ comments: [CommentData]) -> [CommentData] {
+        var result: [CommentData] = []
+        func append(_ records: [CommentData]) {
+            for record in records {
+                result.append(record)
+                append(record.replies)
+            }
+        }
+        append(comments)
+        return result
     }
 
     func generateWidgetCondensedSummary(from text: String) async -> String? {
@@ -14577,6 +14886,7 @@ struct CommentView: View {
     @State private var visibleRepliesCount: Int = 2
     @State private var showReplyField = false
     @State private var replyText = ""
+    @State private var replyDraftSaveTask: Task<Void, Never>?
     @State private var isSubmittingReply = false
     @State private var showReplyError = false
     @State private var replyError = ""
@@ -14699,9 +15009,7 @@ struct CommentView: View {
             Text(replyError)
         }
         .sheet(isPresented: $showReplyField, onDismiss: {
-            if !isSubmittingReply {
-                replyText = ""
-            }
+            saveReplyDraftImmediately()
         }) {
             ReplyComposer(
                 text: $replyText,
@@ -14715,9 +15023,10 @@ struct CommentView: View {
                 },
                 onCancel: {
                     showReplyField = false
-                    replyText = ""
                 }
             )
+            .onAppear(perform: restoreReplyDraft)
+            .onChange(of: replyText) { _, _ in scheduleReplyDraftSave() }
         }
     }
 
@@ -15028,6 +15337,11 @@ struct CommentView: View {
                     
                     // Close the reply field and reset
                     showReplyField = false
+                    try? ResearchLibraryStore.shared.deleteDraft(
+                        kind: .reply,
+                        destinationKey: replyDraftKey
+                    )
+                    replyDraftSaveTask?.cancel()
                     replyText = ""
                     isSubmittingReply = false
                 }
@@ -15038,6 +15352,42 @@ struct CommentView: View {
                     isSubmittingReply = false
                 }
             }
+        }
+    }
+
+    private var replyDraftKey: String {
+        let sourceID = comment.id.hasPrefix("t1_") ? comment.id : "t1_\(comment.id)"
+        return "reply:\(sourceID)"
+    }
+
+    private func restoreReplyDraft() {
+        guard replyText.isEmpty,
+              let draft = try? ResearchLibraryStore.shared.draft(kind: .reply, destinationKey: replyDraftKey) else { return }
+        replyText = draft.body
+    }
+
+    private func scheduleReplyDraftSave() {
+        replyDraftSaveTask?.cancel()
+        replyDraftSaveTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(450))
+            guard !Task.isCancelled else { return }
+            saveReplyDraftImmediately()
+        }
+    }
+
+    private func saveReplyDraftImmediately() {
+        replyDraftSaveTask?.cancel()
+        let body = replyText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if body.isEmpty {
+            try? ResearchLibraryStore.shared.deleteDraft(kind: .reply, destinationKey: replyDraftKey)
+        } else {
+            _ = try? ResearchLibraryStore.shared.saveDraft(
+                kind: .reply,
+                destinationKey: replyDraftKey,
+                parentSourceID: comment.id.hasPrefix("t1_") ? comment.id : "t1_\(comment.id)",
+                permalink: comment.permalink ?? postPermalink,
+                body: replyText
+            )
         }
     }
 }
@@ -15536,6 +15886,7 @@ struct PostComposer: View {
     @State private var showError = false
     @State private var availableFlairs: [RedditAPI.FlairChoice] = []
     @State private var selectedFlair: RedditAPI.FlairChoice?
+    @State private var restoredFlairID: String?
     @State private var customFlairText = ""
     @State private var isLoadingFlairs = false
     @State private var selectedImages: [ImageData] = []
@@ -15544,6 +15895,8 @@ struct PostComposer: View {
     @State private var uploadProgress: Double = 0.0
     @State private var isDraggingOverTextEditor = false
     @State private var isDraggingOverImageSection = false
+    @State private var draftSaveTask: Task<Void, Never>?
+    @State private var didSubmitSuccessfully = false
     
     struct ImageData: Identifiable {
         let id = UUID()
@@ -15632,6 +15985,7 @@ struct PostComposer: View {
         }
         #endif
         .onAppear {
+            restorePostDraft()
             loadFlairs()
         }
         .onChange(of: title) { _, newValue in
@@ -15643,6 +15997,12 @@ struct PostComposer: View {
             if newValue.count > maxBodyCharacters {
                 postBody = String(newValue.prefix(maxBodyCharacters))
             }
+        }
+        .onChange(of: postDraftSignature) { _, _ in
+            schedulePostDraftSave()
+        }
+        .onDisappear {
+            savePostDraftImmediately()
         }
     }
 
@@ -16011,6 +16371,9 @@ struct PostComposer: View {
                 print("Loaded \(flairs.count) flairs for r/\(subreddit)")
                 await MainActor.run {
                     self.availableFlairs = flairs
+                    if let restoredFlairID = self.restoredFlairID {
+                        self.selectedFlair = flairs.first { $0.id == restoredFlairID }
+                    }
                     self.isLoadingFlairs = false
                 }
             } catch {
@@ -16162,6 +16525,9 @@ struct PostComposer: View {
                 }
                 
                 await MainActor.run {
+                    didSubmitSuccessfully = true
+                    try? ResearchLibraryStore.shared.deleteDraft(kind: .post, destinationKey: postDraftKey)
+                    draftSaveTask?.cancel()
                     isPresented = false
                     // Optionally refresh the posts list
                     NotificationCenter.default.post(name: NSNotification.Name("RefreshPosts"), object: nil)
@@ -16174,6 +16540,56 @@ struct PostComposer: View {
                     isUploadingImages = false
                 }
             }
+        }
+    }
+
+    private var postDraftKey: String {
+        "post:\(subreddit.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())"
+    }
+
+    private var postDraftSignature: String {
+        [title, postBody, url, postType.rawValue, selectedFlair?.id ?? "", customFlairText]
+            .joined(separator: "\u{1f}")
+    }
+
+    private func restorePostDraft() {
+        guard let draft = try? ResearchLibraryStore.shared.draft(kind: .post, destinationKey: postDraftKey) else { return }
+        title = draft.title
+        postBody = draft.body
+        url = draft.linkURL
+        postType = draft.linkURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .text : .link
+        restoredFlairID = draft.flairID
+        customFlairText = draft.flairText ?? ""
+    }
+
+    private func schedulePostDraftSave() {
+        draftSaveTask?.cancel()
+        draftSaveTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(500))
+            guard !Task.isCancelled else { return }
+            savePostDraftImmediately()
+        }
+    }
+
+    private func savePostDraftImmediately() {
+        draftSaveTask?.cancel()
+        guard !didSubmitSuccessfully else { return }
+        let isEmpty = title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && postBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && url.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        if isEmpty {
+            try? ResearchLibraryStore.shared.deleteDraft(kind: .post, destinationKey: postDraftKey)
+        } else {
+            _ = try? ResearchLibraryStore.shared.saveDraft(
+                kind: .post,
+                destinationKey: postDraftKey,
+                subreddit: subreddit,
+                title: title,
+                body: postBody,
+                linkURL: url,
+                flairID: selectedFlair?.id,
+                flairText: customFlairText
+            )
         }
     }
 }
@@ -17069,6 +17485,9 @@ struct BatchResultsView: View {
     @State private var isSummarizingAnswer: Bool = false
     @State private var answerSummaryError: String?
     @State private var showingSummary: Bool = false
+    @State private var groundedAnswerResponse: ValidatedGroundedResponse?
+    @State private var groundedAnswerSources: [String: ResearchSourceRecord] = [:]
+    @State private var selectedGroundedAnswerSource: ResearchSourceRecord?
     @State private var showSelectionAskAIResponse: Bool = false
     @State private var isSelectionAskAIInFlight: Bool = false
     @State private var selectionAskAIResponse: String?
@@ -17531,7 +17950,9 @@ struct BatchResultsView: View {
                                                 .padding(.vertical, 4)
                                         }
                                         
-                                        ReadableReplyText(content: showingSummary && answerSummary != nil ? answerSummary! : answer, fontScale: 0.9)
+                                        renderedBatchAnswer(
+                                            showingSummary && answerSummary != nil ? answerSummary! : answer
+                                        )
                                             .frame(maxWidth: .infinity, alignment: .leading)
                                             .fixedSize(horizontal: false, vertical: true)
                                             .padding()
@@ -17954,7 +18375,27 @@ struct BatchResultsView: View {
 	                        handleClose()
                     }
                     }
+                    ToolbarItem(placement: .primaryAction) {
+                        Button {
+                            viewModel.saveCurrentBatchToResearchLibrary()
+                        } label: {
+                            Label(
+                                viewModel.savedResearchRunID == nil ? "Save" : "Saved",
+                                systemImage: viewModel.savedResearchRunID == nil ? "books.vertical" : "checkmark.circle.fill"
+                            )
+                        }
+                        .disabled(viewModel.savedResearchRunID != nil || (viewModel.batchSummaries.isEmpty && viewModel.batchFinalSummary == nil))
+                        .accessibilityLabel(viewModel.savedResearchRunID == nil ? "Save to Research Library" : "Saved to Research Library")
+                    }
                 }
+            }
+            .alert("Couldn’t Save Research", isPresented: Binding(
+                get: { viewModel.researchLibraryError != nil },
+                set: { if !$0 { viewModel.researchLibraryError = nil } }
+            )) {
+                Button("OK", role: .cancel) { viewModel.researchLibraryError = nil }
+            } message: {
+                Text(viewModel.researchLibraryError ?? "Unknown error")
             }
             .alert("Generate Overall Summary First?", isPresented: $showQuestionReliabilityWarning) {
                 Button("Generate Overall Summary") {
@@ -18029,6 +18470,11 @@ struct BatchResultsView: View {
                 )
             }
 #endif
+            .sheet(item: $selectedGroundedAnswerSource) { source in
+                NavigationStack {
+                    ResearchSourceDetailView(source: source)
+                }
+            }
             // Clear stale infographic/whiteboard/table content when batch summaries change (new subreddit)
             .onChange(of: viewModel.batchSummaries.count) { _, _ in
                 // Cancel any in-progress generation tasks
@@ -20419,7 +20865,7 @@ struct BatchResultsView: View {
                         #endif
                     }
 
-                    ReadableReplyText(content: answer, fontScale: 0.9)
+                    renderedBatchAnswer(answer)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .fixedSize(horizontal: false, vertical: true)
                         .padding()
@@ -20813,6 +21259,7 @@ struct BatchResultsView: View {
             prompt: prompt,
             onSuccess: { response in
                 batchLLMResponse = response
+                persistLegacyBatchArtifact(kind: .categorizedReport, title: "Categorized Summary", body: response)
                 isSendingBatchResultsToLLM = false
             },
             onFailure: { message in
@@ -20835,6 +21282,7 @@ struct BatchResultsView: View {
                 prompt: prompt,
                 onSuccess: { response in
                     self.tableData = self.parseTableData(from: response)
+                    self.persistLegacyBatchArtifact(kind: .tableReport, title: "Overall Summary Table", body: response)
                     self.isGeneratingOverallSummary = false
                     self.showTableSummary = true
                 },
@@ -20868,6 +21316,7 @@ struct BatchResultsView: View {
             prompt: prompt,
             onSuccess: { response in
                 self.tableData = self.parseTableData(from: response)
+                self.persistLegacyBatchArtifact(kind: .tableReport, title: "Overall Summary Table", body: response)
                 self.isGeneratingOverallSummary = false
                 self.showTableSummary = true
             },
@@ -20879,32 +21328,11 @@ struct BatchResultsView: View {
     }
 
     private func openWebBatchQuestion() {
-        let questionToAsk = question.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !questionToAsk.isEmpty else {
+        guard !question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             appState.showWebAIStatus("Enter a question before sending it to \(summaryService.settings.selectedWebAIProvider.displayName).")
             return
         }
-
-        answerGenerationTask?.cancel()
-        question = ""
-        answer = ""
-        answerError = nil
-        answerSummary = nil
-        showingSummary = false
-        isAnswering = true
-
-        appState.performWebAIRequest(
-            title: "Subreddit Q&A",
-            prompt: batchQuestionPrompt(for: questionToAsk),
-            onSuccess: { response in
-                answer = response
-                isAnswering = false
-            },
-            onFailure: { message in
-                answerError = message
-                isAnswering = false
-            }
-        )
+        askQuestion()
     }
 
     private func infographicWebPrompt() -> String {
@@ -21117,6 +21545,7 @@ struct BatchResultsView: View {
                 )
                 await MainActor.run {
                     self.batchLLMResponse = response
+                    self.persistLegacyBatchArtifact(kind: .categorizedReport, title: "Categorized Summary", body: response)
                     self.isSendingBatchResultsToLLM = false
                 }
             } catch is CancellationError {
@@ -21643,15 +22072,23 @@ struct BatchResultsView: View {
         answerError = nil
         answerSummary = nil
         showingSummary = false
+        groundedAnswerResponse = nil
+        groundedAnswerSources = [:]
+        selectedGroundedAnswerSource = nil
         
         answerGenerationTask = Task {
             do {
-                let fetchedAnswer = try await fetchAskQuestionAnswer(
-                    for: questionToAsk,
-                    onPartial: { token in
-                        self.answer = (self.answer ?? "") + token
-                    }
-                )
+                let fetchedAnswer: String
+                if !viewModel.batchCapturedSources.isEmpty {
+                    fetchedAnswer = try await groundedBatchAnswer(for: questionToAsk)
+                } else {
+                    fetchedAnswer = try await fetchAskQuestionAnswer(
+                        for: questionToAsk,
+                        onPartial: { token in
+                            self.answer = (self.answer ?? "") + token
+                        }
+                    )
+                }
                 await MainActor.run {
                     self.answer = fetchedAnswer
                     self.isAnswering = false
@@ -21666,6 +22103,156 @@ struct BatchResultsView: View {
                     self.isAnswering = false
                 }
             }
+        }
+    }
+
+    private func groundedBatchAnswer(for question: String) async throws -> String {
+        let runID = await MainActor.run {
+            viewModel.saveCurrentBatchToResearchLibrary()
+        }
+        guard let runID else {
+            throw NSError(
+                domain: "ResearchLibrary",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: viewModel.researchLibraryError ?? "The batch could not be saved before answering."]
+            )
+        }
+        let result = try await GroundedResearchService.shared.generateReport(
+            instruction: "Answer this question about the saved batch: \(question)",
+            sources: viewModel.batchCapturedSources,
+            coverage: viewModel.batchCoverage
+        )
+        try await MainActor.run {
+            try ResearchLibraryStore.shared.addArtifact(
+                runID: runID,
+                kind: .questionAnswer,
+                title: "Q: \(String(question.prefix(100)))",
+                body: result.response.markdown,
+                generationReceipt: result.receipt,
+                coverage: viewModel.batchCoverage,
+                conflicts: result.response.conflicts,
+                missingData: result.response.missingData,
+                claims: result.response.claims
+            )
+            let savedSources = try ResearchLibraryStore.shared.detail(runID: runID).sources
+            groundedAnswerResponse = result.response
+            groundedAnswerSources = Dictionary(
+                uniqueKeysWithValues: savedSources.map { ($0.sourceID, $0) }
+            )
+        }
+        return result.response.markdown
+    }
+
+    @ViewBuilder
+    private func renderedBatchAnswer(_ fallback: String) -> some View {
+        if let response = groundedAnswerResponse, !showingSummary {
+            VStack(alignment: .leading, spacing: 12) {
+                Label(
+                    "\(viewModel.batchCoverage.commentsAnalyzed) comments analyzed from \(viewModel.batchCoverage.postsAnalyzed) posts",
+                    systemImage: "checkmark.shield"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                if let overview = response.overview, !overview.isEmpty {
+                    Text(overview)
+                        .textSelection(.enabled)
+                }
+
+                ForEach(response.claims) { claim in
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(claim.text)
+                            .textSelection(.enabled)
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                ResearchConfidenceBadge(confidence: claim.confidence)
+                                ForEach(claim.citations) { citation in
+                                    if let source = groundedAnswerSources[citation.sourceID] {
+                                        Button(citation.sourceID) {
+                                            selectedGroundedAnswerSource = source
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .controlSize(.small)
+                                        .accessibilityLabel("Open supporting source \(citation.sourceID)")
+                                    }
+                                }
+                            }
+                        }
+                        if !claim.conflictingSourceIDs.isEmpty {
+                            ScrollView(.horizontal, showsIndicators: false) {
+                                HStack(spacing: 8) {
+                                    Label("Conflicting evidence", systemImage: "arrow.triangle.branch")
+                                        .font(.caption)
+                                        .foregroundStyle(.orange)
+                                    ForEach(claim.conflictingSourceIDs, id: \.self) { sourceID in
+                                        if let source = groundedAnswerSources[sourceID] {
+                                            Button(sourceID) {
+                                                selectedGroundedAnswerSource = source
+                                            }
+                                            .buttonStyle(.bordered)
+                                            .controlSize(.small)
+                                            .tint(.orange)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if let missing = claim.missingDataNote, !missing.isEmpty {
+                            Label(missing, systemImage: "questionmark.circle")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+
+                ForEach(response.conflicts, id: \.self) { conflict in
+                    Label(conflict, systemImage: "arrow.triangle.branch")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+                ForEach(response.missingData, id: \.self) { missing in
+                    Label(missing, systemImage: "questionmark.circle")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        } else {
+            ReadableReplyText(content: fallback, fontScale: 0.9)
+        }
+    }
+
+    @MainActor
+    private func persistLegacyBatchArtifact(
+        kind: ResearchArtifactKind,
+        title: String,
+        body: String
+    ) {
+        let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let runID = viewModel.saveCurrentBatchToResearchLibrary() else { return }
+        do {
+            let existing = try ResearchLibraryStore.shared.artifacts(runID: runID)
+            guard !existing.contains(where: { $0.kind == kind && $0.body == body }) else { return }
+            let now = Date()
+            let receipt = ResearchGenerationReceiptFactory.make(
+                settings: SummaryService.shared.settings,
+                startedAt: now,
+                completedAt: now,
+                promptVersion: 0,
+                responseSchemaVersion: 0
+            )
+            try ResearchLibraryStore.shared.addArtifact(
+                runID: runID,
+                kind: kind,
+                title: title,
+                body: body,
+                generationReceipt: receipt,
+                coverage: viewModel.batchCoverage,
+                legacyUncited: true
+            )
+        } catch {
+            viewModel.researchLibraryError = error.localizedDescription
         }
     }
 
@@ -22137,6 +22724,7 @@ struct BatchResultsView: View {
                 )
                 await MainActor.run {
                     self.topicSummary = summary
+                    self.persistLegacyBatchArtifact(kind: .categorizedReport, title: "Topics by Subject", body: summary)
                     self.isSummarizingTopics = false
                 }
             } catch is CancellationError {
@@ -24154,6 +24742,7 @@ struct ContentView: View {
     @StateObject private var viewModel = RedditSubredditViewModel()
     @State private var showSettings = false
     @State private var showCreatePost = false
+    @State private var showResearchLibrary = false
     @State private var sidebarOverlayHeight: CGFloat = 180
     @State private var isSidebarScrolling = false
     @State private var sidebarScrollRevealTask: Task<Void, Never>? = nil
@@ -24260,6 +24849,9 @@ struct ContentView: View {
             }
             .sheet(isPresented: $showCreatePost) {
                 PostComposer(isPresented: $showCreatePost, subreddit: subreddit)
+            }
+            .sheet(isPresented: $showResearchLibrary) {
+                ResearchLibraryView()
             }
             .confirmationDialog(
                 "Local batch is too large",
@@ -24484,6 +25076,14 @@ struct ContentView: View {
     private var primaryToolbarContent: some ToolbarContent {
         #if os(iOS)
         ToolbarItemGroup(placement: .navigationBarTrailing) {
+            Button(action: {
+                showResearchLibrary = true
+            }) {
+                Image(systemName: "books.vertical")
+            }
+            .help("Research Library")
+            .accessibilityLabel("Research Library")
+
             if RedditAuthManager.shared.isAuthenticated {
                 Button(action: {
                     showCreatePost = true
@@ -24503,6 +25103,14 @@ struct ContentView: View {
         #else
         ToolbarItem(placement: .automatic) {
             HStack(spacing: 16) {
+                Button(action: {
+                    showResearchLibrary = true
+                }) {
+                    Image(systemName: "books.vertical")
+                }
+                .help("Research Library")
+                .accessibilityLabel("Research Library")
+
                 if RedditAuthManager.shared.isAuthenticated {
                     Button(action: {
                         showCreatePost = true
@@ -24783,6 +25391,7 @@ struct RedditCommentsView: View {
         // Reply to post state
         @State private var isReplyingToPost = false
         @State private var postReplyText = ""
+        @State private var postReplyDraftSaveTask: Task<Void, Never>?
         @State private var isSubmittingPostReply = false
         @State private var showBottomActions = false
         private let askQuestionSectionID = "askQuestionSection"
@@ -25850,9 +26459,7 @@ struct RedditCommentsView: View {
                 }
             }
             .sheet(isPresented: $isReplyingToPost, onDismiss: {
-                if !isSubmittingPostReply {
-                    postReplyText = ""
-                }
+                savePostReplyDraftImmediately()
             }) {
                 ReplyComposer(
                     text: $postReplyText,
@@ -25866,9 +26473,10 @@ struct RedditCommentsView: View {
                     },
                     onCancel: {
                         isReplyingToPost = false
-                        postReplyText = ""
                     }
                 )
+                .onAppear(perform: restorePostReplyDraft)
+                .onChange(of: postReplyText) { _, _ in schedulePostReplyDraftSave() }
             }
             .sheet(isPresented: $isShowingPostSummary) {
                 PostSummaryView(
@@ -27887,6 +28495,11 @@ struct RedditCommentsView: View {
                         
                         // Reset reply state
                         isReplyingToPost = false
+                        try? ResearchLibraryStore.shared.deleteDraft(
+                            kind: .reply,
+                            destinationKey: postReplyDraftKey
+                        )
+                        postReplyDraftSaveTask?.cancel()
                         postReplyText = ""
                         isSubmittingPostReply = false
                     }
@@ -27897,6 +28510,41 @@ struct RedditCommentsView: View {
                         // You could add an alert here similar to CommentView
                     }
                 }
+            }
+        }
+
+        private var postReplyDraftKey: String {
+            "reply:post:\(postPermalink)"
+        }
+
+        private func restorePostReplyDraft() {
+            guard postReplyText.isEmpty,
+                  let draft = try? ResearchLibraryStore.shared.draft(kind: .reply, destinationKey: postReplyDraftKey) else { return }
+            postReplyText = draft.body
+        }
+
+        private func schedulePostReplyDraftSave() {
+            postReplyDraftSaveTask?.cancel()
+            postReplyDraftSaveTask = Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(450))
+                guard !Task.isCancelled else { return }
+                savePostReplyDraftImmediately()
+            }
+        }
+
+        private func savePostReplyDraftImmediately() {
+            postReplyDraftSaveTask?.cancel()
+            let body = postReplyText.trimmingCharacters(in: .whitespacesAndNewlines)
+            if body.isEmpty {
+                try? ResearchLibraryStore.shared.deleteDraft(kind: .reply, destinationKey: postReplyDraftKey)
+            } else {
+                _ = try? ResearchLibraryStore.shared.saveDraft(
+                    kind: .reply,
+                    destinationKey: postReplyDraftKey,
+                    parentSourceID: "post:\(postPermalink)",
+                    permalink: postPermalink,
+                    body: postReplyText
+                )
             }
         }
         
