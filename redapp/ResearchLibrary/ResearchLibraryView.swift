@@ -372,7 +372,7 @@ struct ResearchRunDetailView: View {
                 .accessibilityLabel("Re-export")
 
                 Menu {
-                    if detail?.revisionArtifacts.overallSummary == nil,
+                    if detail?.revisionArtifacts.completeOverview == nil,
                        detail?.revisionArtifacts.postSummaries.isEmpty == false {
                         Button {
                             generateCompleteOverview()
@@ -387,7 +387,12 @@ struct ResearchRunDetailView: View {
                     Button {
                         generateGroundedReport()
                     } label: {
-                        Label("Create key points with source links", systemImage: "checkmark.seal")
+                        Label(
+                            detail?.revisionArtifacts.sourceLinkedReport == nil
+                                ? "Create key points with source links"
+                                : "Update key points from complete overview",
+                            systemImage: "checkmark.seal"
+                        )
                     }
                     .disabled(isGeneratingGroundedReport || detail?.sources.isEmpty != false)
                 } label: {
@@ -458,7 +463,7 @@ struct ResearchRunDetailView: View {
                 systemImage: "doc.on.doc"
             )
             .font(.subheadline.weight(.semibold))
-            if let summary = detail.revisionArtifacts.overallSummary {
+            if let summary = detail.revisionArtifacts.completeOverview {
                 artifactView(
                     summary,
                     in: detail,
@@ -489,7 +494,7 @@ struct ResearchRunDetailView: View {
         } header: {
             Text("Complete overview")
         } footer: {
-            if detail.revisionArtifacts.overallSummary != nil {
+            if detail.revisionArtifacts.completeOverview != nil {
                 Text("This overview was created from all saved post summaries. Source-linked key points are shown separately below.")
             }
         }
@@ -505,7 +510,7 @@ struct ResearchRunDetailView: View {
             )
             Section {
                 Label(
-                    "\(representedPosts) of \(savedPosts) saved posts directly linked",
+                    "\(representedPosts) of \(savedPosts) saved posts provide direct examples",
                     systemImage: "link"
                 )
                 .font(.subheadline.weight(.semibold))
@@ -513,7 +518,7 @@ struct ResearchRunDetailView: View {
             } header: {
                 Text("Key points with source links")
             } footer: {
-                Text("These are selected, directly supported points—not the complete overview. The full set remains in the individual post summaries below.")
+                Text("The themes come from the complete overview of all saved post summaries. This count shows how many original posts provide direct supporting or conflicting links.")
             }
         }
     }
@@ -604,9 +609,13 @@ struct ResearchRunDetailView: View {
     ) -> Int {
         let sourcesByID = Dictionary(uniqueKeysWithValues: detail.sources.map { ($0.sourceID, $0) })
         let postIDs = (claimsByArtifact[artifact.id] ?? []).flatMap { claim in
-            (citationsByClaim[claim.id] ?? [])
+            let supportingPostIDs = (citationsByClaim[claim.id] ?? [])
                 .filter(\.validated)
                 .compactMap { sourcesByID[$0.sourceID]?.postSourceID }
+            let conflictingPostIDs = claim.conflictingSourceIDs.compactMap {
+                sourcesByID[$0]?.postSourceID
+            }
+            return supportingPostIDs + conflictingPostIDs
         }
         return Set(postIDs).count
     }
@@ -669,54 +678,66 @@ struct ResearchRunDetailView: View {
 
     private func generateCompleteOverview() {
         guard let detail else { return }
-        let postSummaries = detail.revisionArtifacts.postSummaries
-        guard !postSummaries.isEmpty else {
-            errorMessage = "This revision has no saved post summaries to combine."
-            return
-        }
-
         isGeneratingCompleteOverview = true
         errorMessage = nil
-        let prompt = completeOverviewPrompt(from: postSummaries, detail: detail)
-        let startedAt = Date()
         Task {
+            defer { isGeneratingCompleteOverview = false }
             do {
-                let service = SummaryService.shared
-                let generated: String
-                if service.settings.selectedSummaryProvider == .webAI {
-                    generated = try await AppState.shared.performWebAIRequestAsync(
-                        title: "Complete Revision Overview",
-                        prompt: prompt
-                    )
-                } else {
-                    generated = try await service.summarize(text: prompt)
-                }
-
-                let body = generated.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !body.isEmpty else { throw GroundedResearchError.invalidResponse }
-                try store.addArtifact(
-                    runID: runID,
-                    kind: .overallReport,
-                    title: "Overall Summary",
-                    body: body,
-                    generationReceipt: ResearchGenerationReceiptFactory.make(
-                        settings: service.settings,
-                        startedAt: startedAt,
-                        completedAt: Date(),
-                        promptVersion: 2,
-                        responseSchemaVersion: 0
-                    ),
-                    coverage: detail.run.coverage,
-                    legacyUncited: true
-                )
+                _ = try await ensureCompleteOverview(for: detail)
                 reload()
             } catch is CancellationError {
                 // Closing the revision while generation is running is not an error.
             } catch {
                 errorMessage = error.localizedDescription
             }
-            isGeneratingCompleteOverview = false
         }
+    }
+
+    private func ensureCompleteOverview(
+        for initialDetail: ResearchRunDetail
+    ) async throws -> ResearchArtifactRecord {
+        let latestDetail = try store.detail(runID: runID)
+        if let existing = latestDetail.revisionArtifacts.completeOverview {
+            return existing
+        }
+
+        let postSummaries = latestDetail.revisionArtifacts.postSummaries
+        guard !postSummaries.isEmpty else { throw GroundedResearchError.noPostSummaries }
+        let prompt = completeOverviewPrompt(from: postSummaries, detail: latestDetail)
+        let startedAt = Date()
+        let service = SummaryService.shared
+        let generated: String
+        if service.settings.selectedSummaryProvider == .webAI {
+            generated = try await AppState.shared.performWebAIRequestAsync(
+                title: "Complete Revision Overview",
+                prompt: prompt
+            )
+        } else {
+            generated = try await service.summarize(text: prompt)
+        }
+
+        let body = generated.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !body.isEmpty else { throw GroundedResearchError.invalidResponse }
+
+        // A second action may have finished while the model was working.
+        if let existing = try store.detail(runID: runID).revisionArtifacts.completeOverview {
+            return existing
+        }
+        return try store.addArtifact(
+            runID: runID,
+            kind: .overallReport,
+            title: "Overall Summary",
+            body: body,
+            generationReceipt: ResearchGenerationReceiptFactory.make(
+                settings: service.settings,
+                startedAt: startedAt,
+                completedAt: Date(),
+                promptVersion: 2,
+                responseSchemaVersion: 0
+            ),
+            coverage: initialDetail.run.coverage,
+            legacyUncited: true
+        )
     }
 
     private func completeOverviewPrompt(
@@ -751,11 +772,27 @@ struct ResearchRunDetailView: View {
         errorMessage = nil
         let inputs = detail.sources.map(ResearchSourceInput.init(record:))
         Task {
+            defer {
+                isGeneratingCompleteOverview = false
+                isGeneratingGroundedReport = false
+            }
             do {
+                let overview: ResearchArtifactRecord
+                if let savedOverview = detail.revisionArtifacts.completeOverview {
+                    overview = savedOverview
+                } else {
+                    isGeneratingCompleteOverview = true
+                    overview = try await ensureCompleteOverview(for: detail)
+                    isGeneratingCompleteOverview = false
+                    reload()
+                }
                 let result = try await GroundedResearchService.shared.generateReport(
-                    instruction: "Create a concise set of selected key points with direct source links from this saved batch. Do not present these selected points as the complete overview. Prefer support from different posts when the available material allows it.",
+                    instruction: "Using the complete overview only to decide what matters, produce 8 to 12 representative key points. Cover the major recurring themes, meaningful disagreement, and important minority topics. Prefer support from different posts. When a recurring point is supported by multiple posts, cite at least two different posts. Every point and quotation must still be supported by the saved Reddit sources. Do not claim that these linked examples are exhaustive.",
                     sources: inputs,
-                    coverage: detail.run.coverage
+                    coverage: detail.run.coverage,
+                    guidingOverview: overview.body,
+                    balanceAcrossPosts: true,
+                    promptVersion: 3
                 )
                 try store.addArtifact(
                     runID: runID,
@@ -772,7 +809,6 @@ struct ResearchRunDetailView: View {
             } catch {
                 errorMessage = error.localizedDescription
             }
-            isGeneratingGroundedReport = false
         }
     }
 

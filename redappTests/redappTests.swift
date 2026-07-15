@@ -161,6 +161,7 @@ final class redappTests: XCTestCase {
                 $0.kind == .overallReport && $0.title == "Overall Summary"
             })
             XCTAssertEqual(overall.body, "Users reported better battery life.")
+            XCTAssertEqual(ResearchRevisionArtifacts(artifacts: artifacts).completeOverview?.id, overall.id)
             XCTAssertEqual(ResearchRevisionArtifacts(artifacts: artifacts).overallSummary?.id, overall.id)
         }
 
@@ -201,7 +202,8 @@ final class redappTests: XCTestCase {
                 ResearchClaimInput(
                     order: 0,
                     text: "The linked report supports a selected key point.",
-                    citations: [ResearchCitationInput(sourceID: "t1_comment")]
+                    citations: [ResearchCitationInput(sourceID: "t1_comment")],
+                    confidence: .low
                 )
             ]
         )
@@ -223,9 +225,10 @@ final class redappTests: XCTestCase {
             body: "A batch-wide table summary."
         )
         let tableOnlyGrouped = try store.detail(runID: tableOnlyRun.id).revisionArtifacts
+        XCTAssertNil(tableOnlyGrouped.completeOverview)
         XCTAssertEqual(tableOnlyGrouped.overallSummary?.id, savedOverallTable.id)
         XCTAssertNil(tableOnlyGrouped.sourceLinkedReport)
-        XCTAssertFalse(tableOnlyGrouped.remainingArtifacts.contains { $0.id == savedOverallTable.id })
+        XCTAssertTrue(tableOnlyGrouped.remainingArtifacts.contains { $0.id == savedOverallTable.id })
 
         let linkedOnlyRun = try store.saveBatch(tableOnlyRequest)
         let linkedOnlyReport = try store.addArtifact(
@@ -237,7 +240,8 @@ final class redappTests: XCTestCase {
                 ResearchClaimInput(
                     order: 0,
                     text: "A selected point.",
-                    citations: [ResearchCitationInput(sourceID: "t1_comment")]
+                    citations: [ResearchCitationInput(sourceID: "t1_comment")],
+                    confidence: .low
                 )
             ]
         )
@@ -311,6 +315,133 @@ final class redappTests: XCTestCase {
         )
         XCTAssertTrue(unanswered.claims.isEmpty)
         XCTAssertEqual(unanswered.missingData.first, "The saved sources do not answer this question.")
+    }
+
+    func testRepresentativeSourcesBalancePostsDeterministicallyWithinBudget() throws {
+        var sources: [ResearchSourceInput] = []
+        var order = 0
+        for postIndex in 0..<12 {
+            let postID = "t3_post_\(postIndex)"
+            sources.append(
+                source(
+                    id: postID,
+                    postID: postID,
+                    text: "General opening text for saved post \(postIndex).",
+                    score: 2,
+                    sourceOrder: order
+                )
+            )
+            order += 1
+            let leadIn = String(repeating: "background context \(postIndex) ", count: 55)
+            sources.append(
+                source(
+                    id: "t1_theme_\(postIndex)",
+                    postID: postID,
+                    text: leadIn + "battery reliability deployment concern \(postIndex) with a concrete user example.",
+                    score: 40 - postIndex,
+                    sourceOrder: order
+                )
+            )
+            order += 1
+        }
+
+        // Simulate one very active post. Its many matching comments must not crowd
+        // the other eleven post groups out of the request.
+        for commentIndex in 0..<20 {
+            sources.append(
+                source(
+                    id: "t1_crowded_\(commentIndex)",
+                    postID: "t3_post_0",
+                    text: "battery reliability deployment repeated comment \(commentIndex)",
+                    score: 500 - commentIndex,
+                    sourceOrder: order
+                )
+            )
+            order += 1
+        }
+
+        let guidance = String(
+            repeating: "Battery reliability and deployment are the main recurring themes. ",
+            count: 8
+        ) + "A smaller privacy concern should also remain visible."
+        let budget = 6_000
+        let selected = GroundedResearchService.representativeSources(
+            for: guidance,
+            from: sources,
+            characterBudget: budget
+        )
+        let reversedSelection = GroundedResearchService.representativeSources(
+            for: guidance,
+            from: Array(sources.reversed()),
+            characterBudget: budget
+        )
+
+        XCTAssertEqual(Set(selected.map(\.postSourceID)).count, 12)
+        XCTAssertEqual(
+            selected.map { "\($0.sourceID)|\($0.rawMarkdown)" },
+            reversedSelection.map { "\($0.sourceID)|\($0.rawMarkdown)" }
+        )
+
+        let originals = Dictionary(uniqueKeysWithValues: sources.map { ($0.sourceID, $0) })
+        XCTAssertTrue(selected.allSatisfy { chosen in
+            originals[chosen.sourceID]?.rawMarkdown.contains(chosen.rawMarkdown) == true
+        })
+        XCTAssertTrue(selected.contains { chosen in
+            chosen.rawMarkdown.localizedCaseInsensitiveContains("battery reliability")
+                && chosen.rawMarkdown.count < (originals[chosen.sourceID]?.rawMarkdown.count ?? 0)
+        })
+
+        let estimatedCost = selected.reduce(0) { result, chosen in
+            result
+                + chosen.rawMarkdown.count
+                + (chosen.title?.count ?? 0)
+                + chosen.sourceID.count
+                + chosen.postSourceID.count
+                + chosen.permalink.count
+                + (chosen.author?.count ?? 0)
+                + chosen.subreddit.count
+                + 180
+        }
+        XCTAssertLessThanOrEqual(estimatedCost, budget)
+
+        let quotedSource = try XCTUnwrap(selected.first {
+            $0.rawMarkdown.localizedCaseInsensitiveContains("battery reliability deployment concern")
+        })
+        let validated = try ResearchEvidenceValidator.validate(
+            GroundedResearchPayload(
+                title: "Representative themes",
+                overview: nil,
+                claims: [
+                    .init(
+                        text: "Battery reliability and deployment were recurring concerns.",
+                        claimType: "finding",
+                        citations: [
+                            .init(
+                                sourceID: quotedSource.sourceID,
+                                quote: "battery reliability deployment concern"
+                            )
+                        ],
+                        conflictingSourceIDs: [],
+                        missingData: nil
+                    )
+                ],
+                conflicts: [],
+                missingData: []
+            ),
+            sources: selected,
+            coverage: ResearchCoverageInput(
+                postsRequested: 12,
+                postsFetched: 12,
+                postsAnalyzed: 12,
+                commentsReported: 32,
+                commentsFetched: 32,
+                commentsAnalyzed: 32,
+                commentsOmitted: 0,
+                failureMessages: [],
+                truncationMessages: []
+            )
+        )
+        XCTAssertEqual(validated.claims.count, 1)
     }
 
     @MainActor

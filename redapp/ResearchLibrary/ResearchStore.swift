@@ -48,6 +48,7 @@ struct ResearchRunDetail {
 }
 
 struct ResearchRevisionArtifacts {
+    let completeOverview: ResearchArtifactRecord?
     let overallSummary: ResearchArtifactRecord?
     let sourceLinkedReport: ResearchArtifactRecord?
     let postSummaries: [ResearchArtifactRecord]
@@ -80,11 +81,12 @@ struct ResearchRevisionArtifacts {
             ?? categorizedSummary
             ?? otherSavedOverview
 
+        completeOverview = savedBatchOverview
         overallSummary = selectedOverall
         sourceLinkedReport = newestLinkedOverallReport
         postSummaries = artifacts.filter { $0.kind == .postSummary }
         remainingArtifacts = artifacts.filter { artifact in
-            artifact.id != selectedOverall?.id
+            artifact.id != savedBatchOverview?.id
                 && artifact.id != newestLinkedOverallReport?.id
                 && artifact.kind != .postSummary
         }
