@@ -2133,14 +2133,21 @@ struct ResearchComparisonView: View {
         Section("\(snapshotName(detail)) — Overall summary") {
             if let summary = detail.revisionArtifacts.overallSummary {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text(summary.body)
-                        .lineLimit(nil)
-                        .fixedSize(horizontal: false, vertical: true)
+                    MarkdownTextView(content: summary.body, fontScale: 0.8)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .textSelection(.enabled)
-                    Text("Saved \(summary.createdAt.formatted(date: .abbreviated, time: .shortened))")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    HStack(alignment: .top) {
+                        Text("Saved \(summary.createdAt.formatted(date: .abbreviated, time: .shortened))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        ResearchMLXSpeechControls(
+                            text: summary.body,
+                            runID: summary.runID,
+                            artifactID: summary.id,
+                            label: "overall summary"
+                        )
+                    }
                 }
                 .padding(.vertical, 3)
             } else {
@@ -2158,18 +2165,25 @@ struct ResearchComparisonView: View {
             Section("\(snapshotName(detail)) — Individual summaries and reports") {
                 ForEach(remaining) { artifact in
                     DisclosureGroup {
-                        Text(artifact.body)
-                            .lineLimit(nil)
-                            .fixedSize(horizontal: false, vertical: true)
+                        MarkdownTextView(content: artifact.body, fontScale: 0.8)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .textSelection(.enabled)
                     } label: {
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(artifact.title)
-                                .font(.headline)
-                            Text(artifact.kind.displayName)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                        HStack(alignment: .top) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(artifact.title)
+                                    .font(.headline)
+                                Text(artifact.kind.displayName)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            ResearchMLXSpeechControls(
+                                text: artifact.body,
+                                runID: artifact.runID,
+                                artifactID: artifact.id,
+                                label: artifact.kind.displayName.lowercased()
+                            )
                         }
                     }
                 }
@@ -2754,6 +2768,17 @@ private struct ResearchComparisonReportView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Plain-language comparison")
+                    .font(.headline)
+                Spacer()
+                ResearchMLXSpeechControls(
+                    text: speechText,
+                    runID: report.runID,
+                    artifactID: report.id,
+                    label: "comparison"
+                )
+            }
             if plainLanguageNarrative.isEmpty {
                 Text("There wasn’t enough saved information to produce a clear comparison.")
                     .foregroundStyle(.secondary)
@@ -2779,13 +2804,15 @@ private struct ResearchComparisonReportView: View {
         ResearchChangeNarrative.plainText(from: claims.map(\.text))
     }
 
+    private var speechText: String {
+        plainLanguageNarrative.isEmpty ? report.body : plainLanguageNarrative
+    }
+
     @ViewBuilder
     private var evidenceContent: some View {
         VStack(alignment: .leading, spacing: 10) {
             if claims.isEmpty {
-                Text(report.body)
-                    .lineLimit(nil)
-                    .fixedSize(horizontal: false, vertical: true)
+                MarkdownTextView(content: report.body, fontScale: 0.8)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .textSelection(.enabled)
             } else {

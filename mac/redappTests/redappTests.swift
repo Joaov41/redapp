@@ -11,6 +11,29 @@ import XCTest
 
 final class redappTests: XCTestCase {
 
+    func testMarkdownRendererRecognizesIndentedHeadingsAndLists() throws {
+        let elements = MarkdownTextView(content: "").parseMarkdownContent(
+            "  ## Main themes\n   ### First theme\n    - Supporting point"
+        )
+
+        guard case let .heading(mainHeading, mainLevel) = try XCTUnwrap(elements.first) else {
+            return XCTFail("Expected the indented Markdown heading to be parsed as a heading.")
+        }
+        XCTAssertEqual(mainHeading, "Main themes")
+        XCTAssertEqual(mainLevel, 2)
+
+        guard case let .heading(subheading, subheadingLevel) = elements[1] else {
+            return XCTFail("Expected the indented subheading to be parsed as a heading.")
+        }
+        XCTAssertEqual(subheading, "First theme")
+        XCTAssertEqual(subheadingLevel, 3)
+
+        guard case let .bulletPoint(point) = elements[2] else {
+            return XCTFail("Expected the indented list item to be parsed as a bullet point.")
+        }
+        XCTAssertEqual(point, "Supporting point")
+    }
+
     func testExplainsLegacyLoadedFeedPostShortfall() {
         let coverage = ResearchCoverageInput(
             postsRequested: 5,

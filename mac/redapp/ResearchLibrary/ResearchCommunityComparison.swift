@@ -559,6 +559,19 @@ struct ResearchCommunityComparisonView: View {
     private func followUpAnswer(_ answer: ResearchArtifactRecord) -> some View {
         let prefix = "Community Q&A [\(comparisonID.uuidString)]: "
         return DisclosureGroup(answer.title.replacingOccurrences(of: prefix, with: "")) {
+            HStack {
+                Spacer()
+                ResearchMLXSpeechControls(
+                    text: answer.body,
+                    runID: answer.runID,
+                    artifactID: answer.id,
+                    label: "answer"
+                )
+            }
+            if (followUpClaims[answer.id] ?? []).isEmpty {
+                MarkdownTextView(content: answer.body, fontScale: 0.8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
             ForEach(followUpClaims[answer.id] ?? []) { claim in
                 claimView(claim)
             }
@@ -576,6 +589,19 @@ struct ResearchCommunityComparisonView: View {
         first: ResearchRunDetail,
         second: ResearchRunDetail
     ) -> some View {
+        Section("Listen") {
+            HStack {
+                Text("Read this comparison aloud with MLX TTS")
+                    .foregroundStyle(.secondary)
+                Spacer()
+                ResearchMLXSpeechControls(
+                    text: comparisonSpeechText(artifact),
+                    runID: artifact.runID,
+                    artifactID: artifact.id,
+                    label: "community comparison"
+                )
+            }
+        }
         let groups: [(String, [String])] = [
             ("Common ground", ["common_ground"]),
             ("How r/\(first.run.subreddit) discusses it", ["first_community"]),
@@ -602,6 +628,11 @@ struct ResearchCommunityComparisonView: View {
                 ForEach(artifact.missingData, id: \.self) { Text($0) }
             }
         }
+    }
+
+    private func comparisonSpeechText(_ artifact: ResearchArtifactRecord) -> String {
+        let supportedPoints = claims.map(\.text).joined(separator: "\n\n")
+        return supportedPoints.isEmpty ? artifact.body : supportedPoints
     }
 
     private func claimView(_ claim: ResearchClaimRecord) -> some View {

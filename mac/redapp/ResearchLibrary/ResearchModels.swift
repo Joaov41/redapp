@@ -63,7 +63,7 @@ enum ResearchRunState: String, Codable, Sendable {
         case .ready:
             return "All requested material that was fetched was included."
         case .partial:
-            return "Some requested posts or comments could not be fetched, were omitted by the analysis limit, or failed during processing."
+            return "Reddit returned fewer posts or comments than requested, or the available content exceeded the analysis limit. This revision includes everything that was available for analysis."
         case .failed:
             return "The revision could not be completed."
         }

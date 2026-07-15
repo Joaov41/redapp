@@ -14015,8 +14015,9 @@ struct MarkdownTextView: View {
         var codeBlockLanguage: String? = nil
         
         for line in lines {
+            let structuralLine = line.trimmingCharacters(in: .whitespaces)
             // Handle code blocks
-            if line.starts(with: "```") {
+            if structuralLine.starts(with: "```") {
                 if isInCodeBlock {
                     // End of code block
                     elements.append(.codeBlock(codeBlockContent.trimmingCharacters(in: .whitespacesAndNewlines), language: codeBlockLanguage))
@@ -14026,7 +14027,7 @@ struct MarkdownTextView: View {
                 } else {
                     // Start of code block
                     isInCodeBlock = true
-                    let language = String(line.dropFirst(3)).trimmingCharacters(in: .whitespaces)
+                    let language = String(structuralLine.dropFirst(3)).trimmingCharacters(in: .whitespaces)
                     codeBlockLanguage = language.isEmpty ? nil : language
                 }
                 continue
@@ -14038,24 +14039,24 @@ struct MarkdownTextView: View {
             }
             
             // Handle headings
-            if line.starts(with: "#") {
-                let level = line.prefix(while: { $0 == "#" }).count
-                let content = String(line.dropFirst(level)).trimmingCharacters(in: .whitespaces)
+            if structuralLine.starts(with: "#") {
+                let level = structuralLine.prefix(while: { $0 == "#" }).count
+                let content = String(structuralLine.dropFirst(level)).trimmingCharacters(in: .whitespaces)
                 elements.append(.heading(content, level: min(level, 6)))
                 continue
             }
             
             // Handle bullet points
-            if line.trimmingCharacters(in: .whitespaces).starts(with: "- ") ||
-               line.trimmingCharacters(in: .whitespaces).starts(with: "* ") ||
-               line.trimmingCharacters(in: .whitespaces).starts(with: "+ ") {
-                let content = String(line.trimmingCharacters(in: .whitespaces).dropFirst(2))
+            if structuralLine.starts(with: "- ") ||
+               structuralLine.starts(with: "* ") ||
+               structuralLine.starts(with: "+ ") {
+                let content = String(structuralLine.dropFirst(2))
                 elements.append(.bulletPoint(parseInlineMarkdown(content)))
                 continue
             }
             
             // Handle numbered lists
-            let trimmedLine = line.trimmingCharacters(in: .whitespaces)
+            let trimmedLine = structuralLine
             if let dotIndex = trimmedLine.firstIndex(of: "."),
                dotIndex != trimmedLine.startIndex {
                 let numberString = String(trimmedLine[..<dotIndex])
@@ -14072,8 +14073,8 @@ struct MarkdownTextView: View {
             }
             
             // Handle paragraphs and inline elements
-            if !line.trimmingCharacters(in: .whitespaces).isEmpty {
-                elements.append(.paragraph(parseInlineMarkdown(line)))
+            if !structuralLine.isEmpty {
+                elements.append(.paragraph(parseInlineMarkdown(structuralLine)))
             }
         }
         
