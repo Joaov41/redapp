@@ -197,6 +197,7 @@ actor GroundedResearchService {
         conversationContext: String? = nil,
         guidingOverview: String? = nil,
         balanceAcrossPosts: Bool = false,
+        maximumSourceCharacters: Int? = nil,
         promptVersion: Int = 1
     ) async throws -> (response: ValidatedGroundedResponse, receipt: ResearchGenerationReceiptInput) {
         guard !sources.isEmpty else { throw GroundedResearchError.noSources }
@@ -208,9 +209,12 @@ actor GroundedResearchService {
         // Keep guidance and evidence within the same overall character envelope.
         // The overview helps choose themes; 4,000 characters remain reserved for
         // instructions, coverage, and the response schema around the source blocks.
-        let sourceCharacterBudget = balanceAcrossPosts
+        let calculatedSourceCharacterBudget = balanceAcrossPosts
             ? max(24_000, 38_000 - (boundedOverview?.count ?? 0))
             : 42_000
+        let sourceCharacterBudget = maximumSourceCharacters.map {
+            min(calculatedSourceCharacterBudget, max(4_000, $0))
+        } ?? calculatedSourceCharacterBudget
         let selectedSources: [ResearchSourceInput]
         if balanceAcrossPosts {
             selectedSources = Self.representativeSources(

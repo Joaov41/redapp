@@ -1477,6 +1477,17 @@ struct ResearchSourceDetailView: View {
     }
 }
 
+private enum ResearchComparisonGenerationError: LocalizedError {
+    case summarizeBridgeUnavailable
+
+    var errorDescription: String? {
+        switch self {
+        case .summarizeBridgeUnavailable:
+            return "The comparison could not reach the configured Codex / Summarize service. Check that the bridge or daemon is available, then try again."
+        }
+    }
+}
+
 @MainActor
 struct ResearchComparisonView: View {
     let leftRunID: UUID
@@ -1491,6 +1502,8 @@ struct ResearchComparisonView: View {
     @State private var selectedSource: ResearchSourceRecord?
     @State private var isGeneratingReport = false
     @State private var generationTask: Task<Void, Never>?
+    @State private var generationStatus = ""
+    @State private var generationProgress = 0.0
     @State private var errorMessage: String?
 
     var body: some View {
@@ -1612,9 +1625,6 @@ struct ResearchComparisonView: View {
         .navigationTitle(comparesDifferentFilters ? "Compare Feeds" : "Compare Revisions")
         .task {
             loadComparison()
-        }
-        .onDisappear {
-            generationTask?.cancel()
         }
         .sheet(item: $selectedSource) { source in
             NavigationStack { ResearchSourceDetailView(source: source) }
@@ -1738,9 +1748,9 @@ struct ResearchComparisonView: View {
                     generateWhatChangedReport(difference)
                 } label: {
                     if isGeneratingReport {
-                        HStack {
-                            ProgressView()
-                            Text("Rewriting the plain-language update…")
+                        VStack(alignment: .leading, spacing: 7) {
+                            ProgressView(value: generationProgress)
+                            Text(generationStatus)
                         }
                     } else {
                         Label(
@@ -1763,9 +1773,9 @@ struct ResearchComparisonView: View {
                     generateWhatChangedReport(difference)
                 } label: {
                     if isGeneratingReport {
-                        HStack {
-                            ProgressView()
-                            Text("Writing the plain-language update…")
+                        VStack(alignment: .leading, spacing: 7) {
+                            ProgressView(value: generationProgress)
+                            Text(generationStatus)
                         }
                     } else {
                         Label(
@@ -1913,6 +1923,8 @@ struct ResearchComparisonView: View {
         let comparisonSources = difference.promptSources()
         guard !comparisonSources.isEmpty else { return }
         isGeneratingReport = true
+        generationStatus = "Preparing a balanced comparison…"
+        generationProgress = 0.05
         errorMessage = nil
         let subreddit = right.sources
             .map(\.subreddit)
@@ -1940,9 +1952,9 @@ struct ResearchComparisonView: View {
 
         In claim text, do not mention source IDs, manifests, digests, database terms, or raw added/removed counts. Say “the saved discussion,” “the saved feed,” or “this saved sample” rather than claiming to represent every member of the subreddit. Comparative claims should cite evidence from both snapshots when available. \(comparisonCaution)
 
-        The deterministic manifest below is authoritative. Discuss only changes present in it. Treat score changes only as engagement changes, never as proof that a claim is true. Every factual claim must cite the revision-prefixed saved sources. If the evidence cannot establish why something changed, say so under missing data.
+        The deterministic manifest below is authoritative. Its totals describe the complete comparison, while its source IDs are bounded examples. Discuss only differences supported by the supplied evidence. Treat score changes only as engagement changes, never as proof that a claim is true. Every factual claim must cite the revision-prefixed saved sources. If the evidence cannot establish why something changed, say so under missing data.
 
-        \(difference.promptManifest)
+        \(difference.compactPromptManifest())
 
         Previous saved report excerpts (context only, not evidence):
         \(reportExcerpts(left.artifacts))
@@ -1951,19 +1963,101 @@ struct ResearchComparisonView: View {
         \(reportExcerpts(right.artifacts))
         """
 
-        generationTask = Task {
+        let guidingOverview = comparisonGuidance(left: left, right: right)
+        let selectedProvider = SummaryService.shared.settings.selectedSummaryProvider
+
+#if os(iOS)
+        let backgroundHandle = GeminiBackgroundTaskManager.shared.beginLongRunningTask(
+            identifier: .summarization,
+            title: "Comparing \(subreddit) feeds"
+        )
+        BatchSummaryLiveActivityController.shared.start(subreddit: subreddit, totalPosts: 4)
+#endif
+
+        let task = Task {
+            var succeeded = false
             defer {
                 isGeneratingReport = false
                 generationTask = nil
+#if os(iOS)
+                backgroundHandle.finish(success: succeeded)
+                if succeeded {
+                    BatchSummaryLiveActivityController.shared.end(
+                        with: "Feed comparison ready",
+                        processedPosts: 4,
+                        totalPosts: 4
+                    )
+                }
+#endif
             }
             do {
+#if os(iOS)
+                await backgroundHandle.waitForTaskStartIfNeeded()
+#endif
+                try Task.checkCancellation()
+                if selectedProvider == .summarizeDaemon {
+                    generationStatus = "Checking the Mac connection…"
+                    generationProgress = 0.12
+#if os(iOS)
+                    backgroundHandle.reportProgress(fractionCompleted: 0.12)
+                    BatchSummaryLiveActivityController.shared.update(
+                        status: "Checking the Mac connection…",
+                        processedPosts: 0,
+                        totalPosts: 4,
+                        progress: 0.12
+                    )
+#endif
+                    do {
+                        try await SummaryService.shared.testSummarizeDaemonConnection()
+                    } catch {
+                        throw ResearchComparisonGenerationError.summarizeBridgeUnavailable
+                    }
+                }
+
+                generationStatus = "Selecting the most representative evidence…"
+                generationProgress = 0.25
+#if os(iOS)
+                backgroundHandle.reportProgress(fractionCompleted: 0.25)
+                BatchSummaryLiveActivityController.shared.update(
+                    status: "Selecting representative evidence…",
+                    processedPosts: 1,
+                    totalPosts: 4,
+                    progress: 0.25
+                )
+#endif
+
+                generationStatus = "Writing the plain-language comparison…"
+                generationProgress = 0.42
+#if os(iOS)
+                backgroundHandle.reportProgress(fractionCompleted: 0.42)
+                BatchSummaryLiveActivityController.shared.update(
+                    status: "Writing the feed comparison…",
+                    processedPosts: 2,
+                    totalPosts: 4,
+                    progress: 0.42
+                )
+#endif
                 let result = try await GroundedResearchService.shared.generateReport(
                     instruction: instruction,
                     sources: comparisonSources,
                     coverage: right.run.coverage,
-                    promptVersion: 2
+                    guidingOverview: guidingOverview,
+                    balanceAcrossPosts: true,
+                    maximumSourceCharacters: 18_000,
+                    promptVersion: 3
                 )
                 try Task.checkCancellation()
+                generationStatus = "Checking links and saving…"
+                generationProgress = 0.88
+#if os(iOS)
+                backgroundHandle.reportProgress(fractionCompleted: 0.88)
+                BatchSummaryLiveActivityController.shared.update(
+                    status: "Checking links and saving…",
+                    processedPosts: 3,
+                    totalPosts: 4,
+                    progress: 0.88
+                )
+#endif
                 let artifactBody = ResearchChangeNarrative.artifactBody(
                     claimTexts: result.response.claims.map(\.text),
                     evidenceMarkdown: result.response.markdown,
@@ -1988,23 +2082,59 @@ struct ResearchComparisonView: View {
                     validationSources: comparisonSources
                 )
                 loadComparison()
+                generationProgress = 1.0
+                generationStatus = "Feed comparison ready"
+                succeeded = true
             } catch is CancellationError {
-                // Leaving the comparison screen is a normal cancellation path.
+                errorMessage = "The comparison was stopped before it finished."
+#if os(iOS)
+                BatchSummaryLiveActivityController.shared.cancel(
+                    reason: "Feed comparison stopped",
+                    processedPosts: 0,
+                    totalPosts: 4
+                )
+#endif
             } catch {
                 errorMessage = error.localizedDescription
+#if os(iOS)
+                BatchSummaryLiveActivityController.shared.cancel(
+                    reason: "Feed comparison needs attention",
+                    processedPosts: 0,
+                    totalPosts: 4
+                )
+#endif
             }
         }
+        generationTask = task
+#if os(iOS)
+        backgroundHandle.registerCancellationHandler { task.cancel() }
+#endif
     }
 
     private func reportExcerpts(_ artifacts: [ResearchArtifactRecord]) -> String {
         let excerpts = artifacts
             .filter { $0.kind != .changeReport }
-            .prefix(8)
+            .prefix(4)
             .map { artifact in
                 let compact = artifact.body.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
-                return "- \(artifact.title): \(String(compact.prefix(900)))"
+                return "- \(artifact.title): \(String(compact.prefix(450)))"
             }
         return excerpts.isEmpty ? "None saved." : excerpts.joined(separator: "\n")
+    }
+
+    private func comparisonGuidance(
+        left: ResearchRunDetail,
+        right: ResearchRunDetail
+    ) -> String? {
+        let snapshots = [left, right].compactMap { detail -> String? in
+            guard let summary = detail.revisionArtifacts.overallSummary else { return nil }
+            let compact = summary.body
+                .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !compact.isEmpty else { return nil }
+            return "\(captureName(detail.run)): \(String(compact.prefix(3_000)))"
+        }
+        return snapshots.isEmpty ? nil : snapshots.joined(separator: "\n\n")
     }
 
     @ViewBuilder

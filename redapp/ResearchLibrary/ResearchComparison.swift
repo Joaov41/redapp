@@ -184,6 +184,58 @@ struct ResearchRevisionDiff: Hashable, Sendable {
         return sections.joined(separator: "\n\n")
     }
 
+    /// A bounded version of the deterministic manifest for model prompts.
+    /// Counts remain authoritative while examples prevent large feed comparisons
+    /// from producing an oversized request.
+    func compactPromptManifest(maximumExamplesPerSection: Int = 12) -> String {
+        let limit = max(1, maximumExamplesPerSection)
+        var sections = [
+            "Deterministic comparison: revision \(oldRevision) to revision \(newRevision).",
+            deterministicSummary
+        ]
+
+        func boundedSection<T>(
+            title: String,
+            values: [T],
+            render: (T) -> String
+        ) -> String? {
+            guard !values.isEmpty else { return nil }
+            var lines = values.prefix(limit).map { "- \(render($0))" }
+            let remaining = values.count - lines.count
+            if remaining > 0 {
+                lines.append("- …and \(remaining) more (included in the total above)")
+            }
+            return "\(title):\n" + lines.joined(separator: "\n")
+        }
+
+        if let section = boundedSection(title: "ADDED EXAMPLES", values: added, render: {
+            "\($0.sourceID) (\($0.kind.rawValue))"
+        }) {
+            sections.append(section)
+        }
+        if let section = boundedSection(title: "REMOVED EXAMPLES", values: removed, render: {
+            "\($0.sourceID) (\($0.kind.rawValue))"
+        }) {
+            sections.append(section)
+        }
+        if let section = boundedSection(title: "EDITED EXAMPLES", values: edited, render: {
+            "\($0.sourceID) (\($0.kind.rawValue))"
+        }) {
+            sections.append(section)
+        }
+        if let section = boundedSection(title: "SCORE CHANGE EXAMPLES", values: scoreChanges, render: {
+            "\($0.sourceID): \($0.oldScore.map(String.init) ?? "missing") → \($0.newScore.map(String.init) ?? "missing")"
+        }) {
+            sections.append(section)
+        }
+        if let section = boundedSection(title: "COVERAGE CHANGES", values: coverageChanges, render: {
+            "\($0.title): \($0.oldValue) → \($0.newValue)"
+        }) {
+            sections.append(section)
+        }
+        return sections.joined(separator: "\n\n")
+    }
+
     func promptSources() -> [ResearchSourceInput] {
         var result: [ResearchSourceInput] = []
         var seen = Set<String>()

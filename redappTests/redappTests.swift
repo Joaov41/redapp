@@ -154,6 +154,7 @@ final class redappTests: XCTestCase {
         XCTAssertEqual(diff.scoreChanges.map(\.sourceID), ["t3_shared"])
         XCTAssertEqual(diff.coverageChanges.map(\.title), ["Comments analyzed"])
         XCTAssertTrue(diff.promptManifest.contains("Comments analyzed: 1 → 2"))
+        XCTAssertTrue(diff.compactPromptManifest().contains("Comments analyzed: 1 → 2"))
 
         let promptSources = diff.promptSources()
         XCTAssertEqual(promptSources.count, 4)
@@ -168,6 +169,36 @@ final class redappTests: XCTestCase {
             ResearchComparisonSourceReference.displayName(for: parsed.encodedID),
             "R\(parsed.revision) · \(parsed.sourceID)"
         )
+    }
+
+    func testCompactRevisionManifestKeepsCountsAndBoundsExamples() {
+        let oldRunID = UUID()
+        let newRunID = UUID()
+        let addedSources = (0..<30).map { index in
+            source(
+                id: "t1_added_\(index)",
+                postID: "t3_post_\(index)",
+                text: "Added comment \(index)",
+                sourceOrder: index
+            )
+        }
+        let diff = ResearchRevisionDiffer.compare(
+            oldRunID: oldRunID,
+            oldRevision: 1,
+            oldSources: [],
+            oldCoverage: .empty,
+            newRunID: newRunID,
+            newRevision: 2,
+            newSources: addedSources,
+            newCoverage: .empty
+        )
+
+        let manifest = diff.compactPromptManifest(maximumExamplesPerSection: 5)
+        XCTAssertTrue(manifest.contains("Added sources: 30"))
+        XCTAssertTrue(manifest.contains("…and 25 more"))
+        XCTAssertTrue(manifest.contains("t1_added_0"))
+        XCTAssertFalse(manifest.contains("t1_added_29"))
+        XCTAssertLessThan(manifest.count, 1_500)
     }
 
     func testBuildsReadableChangeNarrativeFromValidatedClaimText() {
