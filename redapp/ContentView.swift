@@ -17070,14 +17070,29 @@ struct SidebarControls: View {
     }
 
     private func subredditField(maxWidth: CGFloat?) -> some View {
-        TextField("Enter subreddit", text: $subreddit)
-            .textFieldStyle(LiquidGlassTextFieldStyle())
-            .focused(focusedField, equals: .subreddit)
-            .frame(maxWidth: maxWidth)
-            .submitLabel(.search)
-            .onSubmit {
-                triggerLoad()
+        HStack(spacing: 6) {
+            TextField("Enter subreddit", text: $subreddit)
+                .textFieldStyle(LiquidGlassTextFieldStyle())
+                .focused(focusedField, equals: .subreddit)
+                .submitLabel(.search)
+                .onSubmit {
+                    triggerLoad()
+                }
+
+            if !subreddit.isEmpty {
+                Button {
+                    subreddit = ""
+                    focusedField.wrappedValue = .subreddit
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Clear subreddit search")
+                .accessibilityHint("Removes the current subreddit so you can enter another one")
             }
+        }
+        .frame(maxWidth: maxWidth)
     }
 
     private func selectFavorite(_ favorite: String) {
