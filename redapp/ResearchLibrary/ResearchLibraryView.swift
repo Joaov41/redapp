@@ -209,7 +209,7 @@ struct ResearchLibraryView: View {
                         .controlSize(.small)
                         .accessibilityLabel("Comparison in progress")
                 }
-                Button("Done", action: close)
+                Button("Close", action: close)
             }
         }
         .environment(\.researchLibraryMinimizeAction, minimize)

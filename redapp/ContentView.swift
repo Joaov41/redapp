@@ -24776,6 +24776,7 @@ struct ContentView: View {
     @State private var showResearchLibrary = false
     @State private var isResearchLibraryMinimized = false
     @State private var isResearchLibraryExplicitlyClosing = false
+    @State private var hiddenResearchComparisonStatusIDs = Set<String>()
     @State private var comparisonToResume: ResearchComparisonGenerationState?
     @State private var sidebarOverlayHeight: CGFloat = 180
     @State private var isSidebarScrolling = false
@@ -24855,7 +24856,8 @@ struct ContentView: View {
                 }
 
                 if !showResearchLibrary {
-                    if let job = comparisonJobs.latestStatusJob {
+                    if let job = comparisonJobs.latestStatusJob,
+                       !hiddenResearchComparisonStatusIDs.contains(job.id) {
                         VStack {
                             Spacer()
                             HStack(spacing: 9) {
@@ -24893,18 +24895,25 @@ struct ContentView: View {
                                 .buttonStyle(.plain)
                                 .accessibilityLabel("Return to \(job.title)")
                                 .accessibilityHint(job.status)
-                                if job.phase != .running {
-                                    Button {
+                                Button {
+                                    hiddenResearchComparisonStatusIDs.insert(job.id)
+                                    isResearchLibraryMinimized = false
+                                    if job.phase != .running {
                                         comparisonJobs.dismissStatus(key: job.id)
-                                    } label: {
-                                        Image(systemName: "xmark")
-                                            .font(.caption.weight(.bold))
-                                            .frame(width: 32, height: 32)
-                                            .background(.regularMaterial, in: Circle())
                                     }
-                                    .buttonStyle(.plain)
-                                    .accessibilityLabel("Dismiss comparison status")
+                                } label: {
+                                    Image(systemName: "xmark")
+                                        .font(.caption.weight(.bold))
+                                        .frame(width: 32, height: 32)
+                                        .background(.regularMaterial, in: Circle())
                                 }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel("Close minimized Research Library")
+                                .accessibilityHint(
+                                    job.phase == .running
+                                        ? "Hides this pill while the comparison continues in the background"
+                                        : "Hides this pill"
+                                )
                             }
                         }
                         .padding(.trailing, 24)
@@ -24947,6 +24956,16 @@ struct ContentView: View {
                                 .buttonStyle(.plain)
                                 .accessibilityLabel("Restore Research Library")
                                 .accessibilityHint("Returns to the minimized Research Library")
+                                Button {
+                                    isResearchLibraryMinimized = false
+                                } label: {
+                                    Image(systemName: "xmark")
+                                        .font(.caption.weight(.bold))
+                                        .frame(width: 32, height: 32)
+                                        .background(.regularMaterial, in: Circle())
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel("Close minimized Research Library")
                             }
                         }
                         .padding(.trailing, 24)
