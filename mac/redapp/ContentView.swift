@@ -1836,9 +1836,6 @@ class SummaryService: ObservableObject {
     @Published var settings = AppSettings.load() {
         didSet {
             settings.save()
-            #if os(macOS)
-            RedappSummarizeBridgeServer.shared.reconfigure(settings: settings)
-            #endif
         }
     }
     @Published var mlxThroughputState: MLXThroughputState? = nil
@@ -26310,9 +26307,6 @@ struct ContentView: View {
             .onAppear {
                 currentLayoutIsCompact = useCompactLayout
                 updateColumnVisibility(animated: false)
-                #if os(macOS)
-                RedappSummarizeBridgeServer.shared.reconfigure(settings: SummaryService.shared.settings)
-                #endif
             }
             .onChange(of: useCompactLayout) { newValue in
                 currentLayoutIsCompact = newValue
@@ -30294,7 +30288,8 @@ struct RedditCommentsView: View {
         }
         #elseif os(macOS)
         init() {
-            RedappSummarizeBridgeServer.shared.reconfigure(settings: SummaryService.shared.settings)
+            // macOS connects directly to the local Summarize CLI/daemon.
+            // Do not start or advertise the iOS relay bridge from this app.
             SummaryService.shared.warmUpKokoroIfNeeded()
             SummaryService.shared.warmUpMLXIfNeeded()
             Task { @MainActor in
