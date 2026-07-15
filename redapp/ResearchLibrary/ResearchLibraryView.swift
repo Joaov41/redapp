@@ -12,9 +12,28 @@ extension EnvironmentValues {
     }
 }
 
-private enum ResearchLibraryRoute: Hashable {
+enum ResearchLibraryRoute: Hashable {
+    case item(id: UUID)
+    case run(id: UUID)
     case comparison(leftRunID: UUID, rightRunID: UUID)
+    case crossFilterPicker(baseRunID: UUID)
+    case communityPicker(baseRunID: UUID)
+    case communitySetup(firstRunID: UUID, secondRunID: UUID)
     case communityComparison(id: UUID)
+    case conversation(runID: UUID, conversationID: UUID?)
+    case sources(runID: UUID)
+    case source(runID: UUID, sourceID: String)
+}
+
+private struct ResearchLibraryNavigateActionKey: EnvironmentKey {
+    static let defaultValue: (ResearchLibraryRoute) -> Void = { _ in }
+}
+
+extension EnvironmentValues {
+    var researchLibraryNavigate: (ResearchLibraryRoute) -> Void {
+        get { self[ResearchLibraryNavigateActionKey.self] }
+        set { self[ResearchLibraryNavigateActionKey.self] = newValue }
+    }
 }
 
 @MainActor
@@ -25,7 +44,7 @@ struct ResearchLibraryView: View {
     @ObservedObject private var store = ResearchLibraryStore.shared
     @ObservedObject private var comparisonJobs = ResearchComparisonGenerationCoordinator.shared
     @Environment(\.dismiss) private var dismiss
-    @State private var navigationPath = NavigationPath()
+    @Binding private var navigationPath: NavigationPath
     @State private var searchText = ""
     @State private var selectedTags = Set<String>()
     @State private var presentedExport: ResearchExportDocument?
@@ -33,10 +52,12 @@ struct ResearchLibraryView: View {
     @State private var errorMessage: String?
 
     init(
+        navigationPath: Binding<NavigationPath>,
         initialComparison: ResearchComparisonGenerationState? = nil,
         onMinimize: @escaping () -> Void = {},
         onClose: @escaping () -> Void = {}
     ) {
+        _navigationPath = navigationPath
         self.initialComparison = initialComparison
         self.onMinimize = onMinimize
         self.onClose = onClose
@@ -54,16 +75,12 @@ struct ResearchLibraryView: View {
                 if !comparisonJobs.activeJobs.isEmpty {
                     Section("Comparison in progress") {
                         ForEach(comparisonJobs.activeJobs) { job in
-                            NavigationLink {
-                                if let comparisonID = job.communityComparisonID {
-                                    ResearchCommunityComparisonView(comparisonID: comparisonID)
-                                } else {
-                                    ResearchComparisonView(
-                                        leftRunID: job.leftRunID,
-                                        rightRunID: job.rightRunID
-                                    )
-                                }
-                            } label: {
+                            NavigationLink(value: job.communityComparisonID.map {
+                                ResearchLibraryRoute.communityComparison(id: $0)
+                            } ?? ResearchLibraryRoute.comparison(
+                                leftRunID: job.leftRunID,
+                                rightRunID: job.rightRunID
+                            )) {
                                 VStack(alignment: .leading, spacing: 7) {
                                     HStack {
                                         ProgressView()
@@ -85,9 +102,7 @@ struct ResearchLibraryView: View {
                 if !communityComparisons.isEmpty {
                     Section("Community comparisons") {
                         ForEach(communityComparisons) { comparison in
-                            NavigationLink {
-                                ResearchCommunityComparisonView(comparisonID: comparison.id)
-                            } label: {
+                            NavigationLink(value: ResearchLibraryRoute.communityComparison(id: comparison.id)) {
                                 VStack(alignment: .leading, spacing: 5) {
                                     Text(comparison.subject)
                                         .font(.headline)
@@ -139,9 +154,7 @@ struct ResearchLibraryView: View {
                         )
                     } else {
                         ForEach(store.items) { item in
-                            NavigationLink {
-                                ResearchItemDetailView(itemID: item.id)
-                            } label: {
+                            NavigationLink(value: ResearchLibraryRoute.item(id: item.id)) {
                                 ResearchLibraryRow(item: item)
                             }
                             .contextMenu {
@@ -171,10 +184,29 @@ struct ResearchLibraryView: View {
             )
             .navigationDestination(for: ResearchLibraryRoute.self) { route in
                 switch route {
+                case .item(let id):
+                    ResearchItemDetailView(itemID: id)
+                case .run(let id):
+                    ResearchRunDetailView(runID: id)
                 case .comparison(let leftRunID, let rightRunID):
                     ResearchComparisonView(leftRunID: leftRunID, rightRunID: rightRunID)
+                case .crossFilterPicker(let baseRunID):
+                    ResearchCrossFilterComparisonPickerView(baseRunID: baseRunID)
+                case .communityPicker(let baseRunID):
+                    ResearchCommunityComparisonPickerView(baseRunID: baseRunID)
+                case .communitySetup(let firstRunID, let secondRunID):
+                    ResearchCommunityComparisonSetupView(
+                        firstRunID: firstRunID,
+                        secondRunID: secondRunID
+                    )
                 case .communityComparison(let id):
                     ResearchCommunityComparisonView(comparisonID: id)
+                case .conversation(let runID, let conversationID):
+                    ResearchConversationView(runID: runID, conversationID: conversationID)
+                case .sources(let runID):
+                    ResearchSourcesListView(runID: runID)
+                case .source(let runID, let sourceID):
+                    ResearchSavedSourceRouteView(runID: runID, sourceID: sourceID)
                 }
             }
             .task(id: ResearchSearchRequest(query: searchText, tags: selectedTags)) {
@@ -213,6 +245,9 @@ struct ResearchLibraryView: View {
             }
         }
         .environment(\.researchLibraryMinimizeAction, minimize)
+        .environment(\.researchLibraryNavigate, { route in
+            navigationPath.append(route)
+        })
         .task(id: initialComparison?.id) {
             guard let initialComparison, navigationPath.isEmpty else { return }
             if let comparisonID = initialComparison.communityComparisonID {
@@ -326,17 +361,16 @@ struct ResearchItemDetailView: View {
                 if let latestRun = runs.first {
                     Section("Compare") {
                         if runs.count >= 2 {
-                            NavigationLink {
-                                ResearchComparisonView(leftRunID: runs[1].id, rightRunID: runs[0].id)
-                            } label: {
+                            NavigationLink(value: ResearchLibraryRoute.comparison(
+                                leftRunID: runs[1].id,
+                                rightRunID: runs[0].id
+                            )) {
                                 Label("Compare latest two revisions", systemImage: "rectangle.split.2x1")
                             }
                         }
 
                         if !crossFilterRuns.isEmpty {
-                            NavigationLink {
-                                ResearchCrossFilterComparisonPickerView(baseRunID: latestRun.id)
-                            } label: {
+                            NavigationLink(value: ResearchLibraryRoute.crossFilterPicker(baseRunID: latestRun.id)) {
                                 VStack(alignment: .leading, spacing: 4) {
                                     Label("Compare New, Hot, or Top", systemImage: "slider.horizontal.3")
                                     Text("Choose another saved r/\(item.subreddit) feed")
@@ -346,9 +380,7 @@ struct ResearchItemDetailView: View {
                             }
                         }
 
-                        NavigationLink {
-                            ResearchCommunityComparisonPickerView(baseRunID: latestRun.id)
-                        } label: {
+                        NavigationLink(value: ResearchLibraryRoute.communityPicker(baseRunID: latestRun.id)) {
                             VStack(alignment: .leading, spacing: 4) {
                                 Label("Compare with another subreddit", systemImage: "person.2.wave.2")
                                 Text("Choose a saved community and a subject")
@@ -361,9 +393,7 @@ struct ResearchItemDetailView: View {
 
                 Section("History") {
                     ForEach(runs) { run in
-                        NavigationLink {
-                            ResearchRunDetailView(runID: run.id)
-                        } label: {
+                        NavigationLink(value: ResearchLibraryRoute.run(id: run.id)) {
                             VStack(alignment: .leading, spacing: 5) {
                                 HStack {
                                     Text("Revision \(run.revision)")
@@ -377,6 +407,12 @@ struct ResearchItemDetailView: View {
                                 Text("\(run.coverage.postsAnalyzed) posts · \(run.coverage.commentsAnalyzed) comments analyzed")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
+                                if run.state == .partial {
+                                    Text(run.state.explanation)
+                                        .font(.caption)
+                                        .foregroundStyle(.orange)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
                             }
                             .padding(.vertical, 3)
                         }
@@ -491,13 +527,11 @@ private struct ResearchCrossFilterComparisonPickerView: View {
                         )
                     } else {
                         ForEach(candidates) { candidate in
-                            NavigationLink {
-                                let orderedIDs = orderedRunIDs(baseRun, candidate)
-                                ResearchComparisonView(
-                                    leftRunID: orderedIDs.earlier,
-                                    rightRunID: orderedIDs.later
-                                )
-                            } label: {
+                            let orderedIDs = orderedRunIDs(baseRun, candidate)
+                            NavigationLink(value: ResearchLibraryRoute.comparison(
+                                leftRunID: orderedIDs.earlier,
+                                rightRunID: orderedIDs.later
+                            )) {
                                 snapshotRow(candidate)
                             }
                         }
@@ -590,9 +624,7 @@ struct ResearchRunDetailView: View {
                 followUpQuestionsSection(detail)
 
                 Section("Sources") {
-                    NavigationLink {
-                        ResearchSourcesListView(sources: detail.sources)
-                    } label: {
+                    NavigationLink(value: ResearchLibraryRoute.sources(runID: runID)) {
                         VStack(alignment: .leading, spacing: 4) {
                             Label(
                                 "\(detail.sources.count) saved source\(detail.sources.count == 1 ? "" : "s")",
@@ -836,15 +868,14 @@ struct ResearchRunDetailView: View {
 
     private func followUpQuestionsSection(_ detail: ResearchRunDetail) -> some View {
         Section("Follow-up questions") {
-            NavigationLink {
-                ResearchConversationView(runID: runID)
-            } label: {
+            NavigationLink(value: ResearchLibraryRoute.conversation(runID: runID, conversationID: nil)) {
                 Label("Ask about this saved batch", systemImage: "plus.bubble")
             }
             ForEach(detail.conversations) { conversation in
-                NavigationLink {
-                    ResearchConversationView(runID: runID, conversationID: conversation.id)
-                } label: {
+                NavigationLink(value: ResearchLibraryRoute.conversation(
+                    runID: runID,
+                    conversationID: conversation.id
+                )) {
                     VStack(alignment: .leading, spacing: 3) {
                         Text(conversation.title)
                         Text("Updated \(conversation.updatedAt.formatted(date: .abbreviated, time: .shortened))")
@@ -1125,13 +1156,17 @@ struct ResearchRunDetailView: View {
 
 @MainActor
 private struct ResearchSourcesListView: View {
-    let sources: [ResearchSourceRecord]
+    let runID: UUID
+    @ObservedObject private var store = ResearchLibraryStore.shared
+    @State private var sources: [ResearchSourceRecord] = []
+    @State private var errorMessage: String?
 
     var body: some View {
         List(sources) { source in
-            NavigationLink {
-                ResearchSourceDetailView(source: source)
-            } label: {
+            NavigationLink(value: ResearchLibraryRoute.source(
+                runID: runID,
+                sourceID: source.sourceID
+            )) {
                 HStack(alignment: .top, spacing: 12) {
                     Image(systemName: source.kind == .post ? "doc.text" : "text.bubble")
                         .foregroundStyle(.tint)
@@ -1150,6 +1185,58 @@ private struct ResearchSourcesListView: View {
             }
         }
         .navigationTitle("Saved Sources")
+        .task {
+            do {
+                sources = try store.sources(runID: runID)
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+        .alert("Sources unavailable", isPresented: Binding(
+            get: { errorMessage != nil },
+            set: { if !$0 { errorMessage = nil } }
+        )) {
+            Button("OK", role: .cancel) { errorMessage = nil }
+        } message: {
+            Text(errorMessage ?? "Unknown error")
+        }
+    }
+}
+
+@MainActor
+private struct ResearchSavedSourceRouteView: View {
+    let runID: UUID
+    let sourceID: String
+    @ObservedObject private var store = ResearchLibraryStore.shared
+    @State private var source: ResearchSourceRecord?
+    @State private var errorMessage: String?
+
+    var body: some View {
+        Group {
+            if let source {
+                ResearchSourceDetailView(source: source, showsDoneButton: false)
+            } else {
+                ProgressView()
+            }
+        }
+        .task {
+            do {
+                source = try store.source(runID: runID, sourceID: sourceID)
+                if source == nil {
+                    errorMessage = "The saved source is no longer available."
+                }
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+        .alert("Source unavailable", isPresented: Binding(
+            get: { errorMessage != nil },
+            set: { if !$0 { errorMessage = nil } }
+        )) {
+            Button("OK", role: .cancel) { errorMessage = nil }
+        } message: {
+            Text(errorMessage ?? "Unknown error")
+        }
     }
 }
 
@@ -1599,6 +1686,7 @@ private struct ResearchArtifactView: View {
 @MainActor
 struct ResearchSourceDetailView: View {
     let source: ResearchSourceRecord
+    var showsDoneButton = true
     @Environment(\.dismiss) private var dismiss
 
     private var redditURL: URL? {
@@ -1626,8 +1714,10 @@ struct ResearchSourceDetailView: View {
         }
         .navigationTitle(source.kind == .post ? "Supporting Post" : "Supporting Comment")
         .toolbar {
-            ToolbarItem(placement: .confirmationAction) {
-                Button("Done") { dismiss() }
+            if showsDoneButton {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
             }
         }
     }
@@ -2429,10 +2519,11 @@ struct ResearchComparisonView: View {
                     progress: 0.42
                 )
 #endif
+                let comparisonCoverage = left.run.coverage.combined(with: right.run.coverage)
                 let result = try await GroundedResearchService.shared.generateReport(
                     instruction: instruction,
                     sources: comparisonSources,
-                    coverage: right.run.coverage,
+                    coverage: comparisonCoverage,
                     guidingOverview: guidingOverview,
                     balanceAcrossPosts: true,
                     maximumSourceCharacters: 18_000,
@@ -2470,7 +2561,7 @@ struct ResearchComparisonView: View {
                     ),
                     body: artifactBody,
                     generationReceipt: result.receipt,
-                    coverage: right.run.coverage,
+                    coverage: comparisonCoverage,
                     conflicts: result.response.conflicts,
                     missingData: result.response.missingData,
                     claims: result.response.claims,
@@ -2723,12 +2814,13 @@ private struct ResearchRunStateBadge: View {
     let state: ResearchRunState
 
     var body: some View {
-        Text(state.rawValue.capitalized)
+        Text(state.displayName)
             .font(.caption2.weight(.semibold))
             .padding(.horizontal, 7)
             .padding(.vertical, 3)
             .background(state == .ready ? Color.green.opacity(0.15) : Color.orange.opacity(0.15))
             .clipShape(Capsule())
+            .accessibilityHint(state.explanation)
     }
 }
 

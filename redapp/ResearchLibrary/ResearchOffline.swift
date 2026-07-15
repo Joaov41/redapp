@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(CryptoKit)
+import CryptoKit
+#endif
 
 struct ResearchOfflinePackResult: Sendable {
     let downloadedAssets: Int
@@ -10,11 +13,17 @@ struct ResearchOfflinePackResult: Sendable {
 
 enum ResearchOfflineError: LocalizedError {
     case invalidResponse(URL)
+    case assetTooLarge(URL, maximumBytes: Int64)
+    case packSizeLimitReached(maximumBytes: Int64)
     case unavailable
 
     var errorDescription: String? {
         switch self {
         case .invalidResponse(let url): return "Could not download \(url.absoluteString)."
+        case .assetTooLarge(let url, let maximumBytes):
+            return "\(url.lastPathComponent.isEmpty ? "A media file" : url.lastPathComponent) exceeds the \(ByteCountFormatter.string(fromByteCount: maximumBytes, countStyle: .file)) offline limit."
+        case .packSizeLimitReached(let maximumBytes):
+            return "The offline pack reached its \(ByteCountFormatter.string(fromByteCount: maximumBytes, countStyle: .file)) media limit."
         case .unavailable: return "The offline research pack is unavailable."
         }
     }
@@ -38,10 +47,18 @@ private struct ResearchOfflineAssetInput: Sendable {
     let failureMessage: String?
 }
 
+private struct ResearchOfflineMediaDownload: Sendable {
+    let response: HTTPURLResponse
+    let byteCount: Int64
+    let checksum: String
+}
+
 actor ResearchOfflinePackManager {
     static let shared = ResearchOfflinePackManager()
 
     private let fileManager = FileManager.default
+    private let maximumMediaAssetBytes: Int64 = 25 * 1_024 * 1_024
+    private let maximumPackBytes: Int64 = 250 * 1_024 * 1_024
 
     func makeOffline(runID: UUID) async throws -> ResearchOfflinePackResult {
         let snapshot = try await MainActor.run {
@@ -134,31 +151,46 @@ actor ResearchOfflinePackManager {
             let mediaDirectory = staging.appendingPathComponent("media", isDirectory: true)
             try fileManager.createDirectory(at: mediaDirectory, withIntermediateDirectories: true)
             for (index, remoteURL) in mediaURLs.enumerated() {
+                let temporaryURL = mediaDirectory.appendingPathComponent(".download-\(UUID().uuidString)")
                 do {
-                    let (data, response) = try await URLSession.shared.data(from: remoteURL)
-                    guard let http = response as? HTTPURLResponse,
-                          (200...299).contains(http.statusCode),
-                          !data.isEmpty else {
-                        throw ResearchOfflineError.invalidResponse(remoteURL)
+                    let remainingPackBytes = maximumPackBytes - totalBytes
+                    guard remainingPackBytes > 0 else {
+                        throw ResearchOfflineError.packSizeLimitReached(maximumBytes: maximumPackBytes)
                     }
-                    let mimeType = http.mimeType ?? "application/octet-stream"
+                    let downloadLimit = min(maximumMediaAssetBytes, remainingPackBytes)
+                    let download = try await downloadMedia(
+                        from: remoteURL,
+                        to: temporaryURL,
+                        maximumBytes: downloadLimit
+                    )
+                    let mimeType = download.response.mimeType ?? "application/octet-stream"
                     let fileExtension = Self.fileExtension(mimeType: mimeType, remoteURL: remoteURL)
                     let digestPrefix = String(ResearchDigest.sha256Hex(remoteURL.absoluteString).prefix(12))
                     let filename = "\(String(format: "%04d", index))-\(digestPrefix).\(fileExtension)"
                     let destination = mediaDirectory.appendingPathComponent(filename)
-                    try data.write(to: destination, options: .atomic)
-                    totalBytes += Int64(data.count)
+                    try fileManager.moveItem(at: temporaryURL, to: destination)
+                    totalBytes += download.byteCount
                     pendingRecords.append(
-                        record(
+                        ResearchOfflineAssetInput(
                             runID: runID,
+                            artifactID: nil,
                             kind: .thumbnail,
                             remoteURL: remoteURL.absoluteString,
                             relativePath: relativePath(runID: runID, filename: "media/\(filename)"),
                             mimeType: mimeType,
-                            data: data
+                            checksum: download.checksum,
+                            byteCount: download.byteCount,
+                            state: .ready,
+                            sourceTextDigest: nil,
+                            ttsEngine: nil,
+                            ttsVoice: nil,
+                            ttsSpeed: nil,
+                            duration: nil,
+                            failureMessage: nil
                         )
                     )
                 } catch {
+                    try? fileManager.removeItem(at: temporaryURL)
                     failures += 1
                     pendingRecords.append(
                         ResearchOfflineAssetInput(
@@ -225,6 +257,80 @@ actor ResearchOfflinePackManager {
             try? fileManager.removeItem(at: staging)
             throw error
         }
+    }
+
+    private func downloadMedia(
+        from remoteURL: URL,
+        to destinationURL: URL,
+        maximumBytes: Int64
+    ) async throws -> ResearchOfflineMediaDownload {
+        guard let scheme = remoteURL.scheme?.lowercased(),
+              scheme == "https" || scheme == "http" else {
+            throw ResearchOfflineError.invalidResponse(remoteURL)
+        }
+
+        let (bytes, response) = try await URLSession.shared.bytes(from: remoteURL)
+        guard let http = response as? HTTPURLResponse,
+              (200...299).contains(http.statusCode) else {
+            throw ResearchOfflineError.invalidResponse(remoteURL)
+        }
+        if response.expectedContentLength > maximumBytes {
+            throw ResearchOfflineError.assetTooLarge(remoteURL, maximumBytes: maximumBytes)
+        }
+
+        guard fileManager.createFile(atPath: destinationURL.path, contents: nil),
+              let handle = try? FileHandle(forWritingTo: destinationURL) else {
+            throw ResearchOfflineError.unavailable
+        }
+        var buffer = Data()
+        buffer.reserveCapacity(64 * 1_024)
+        var byteCount: Int64 = 0
+#if canImport(CryptoKit)
+        var hasher = SHA256()
+#endif
+        do {
+            for try await byte in bytes {
+                guard byteCount < maximumBytes else {
+                    throw ResearchOfflineError.assetTooLarge(remoteURL, maximumBytes: maximumBytes)
+                }
+                buffer.append(byte)
+                byteCount += 1
+                if buffer.count >= 64 * 1_024 {
+                    try handle.write(contentsOf: buffer)
+#if canImport(CryptoKit)
+                    hasher.update(data: buffer)
+#endif
+                    buffer.removeAll(keepingCapacity: true)
+                }
+            }
+            if !buffer.isEmpty {
+                try handle.write(contentsOf: buffer)
+#if canImport(CryptoKit)
+                hasher.update(data: buffer)
+#endif
+            }
+            try handle.close()
+        } catch {
+            try? handle.close()
+            try? fileManager.removeItem(at: destinationURL)
+            throw error
+        }
+        guard byteCount > 0 else {
+            try? fileManager.removeItem(at: destinationURL)
+            throw ResearchOfflineError.invalidResponse(remoteURL)
+        }
+#if canImport(CryptoKit)
+        let checksum = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+#else
+        let checksum = ResearchDigest.sha256Hex(
+            try Data(contentsOf: destinationURL, options: .mappedIfSafe)
+        )
+#endif
+        return ResearchOfflineMediaDownload(
+            response: http,
+            byteCount: byteCount,
+            checksum: checksum
+        )
     }
 
     func saveSpeech(

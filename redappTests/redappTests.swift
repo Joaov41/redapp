@@ -23,6 +23,42 @@ final class redappTests: XCTestCase {
             ResearchCaptureLabel.displayName(scope: "subreddit|OpenAI|new|all"),
             "New"
         )
+        XCTAssertEqual(ResearchRunState.partial.displayName, "Incomplete")
+        XCTAssertTrue(ResearchRunState.partial.explanation.contains("posts or comments"))
+    }
+
+    func testCombinesCoverageFromBothComparedRevisions() {
+        let first = ResearchCoverageInput(
+            postsRequested: 50,
+            postsFetched: 45,
+            postsAnalyzed: 40,
+            commentsReported: 500,
+            commentsFetched: 450,
+            commentsAnalyzed: 400,
+            commentsOmitted: 50,
+            failureMessages: ["First batch failed"],
+            truncationMessages: ["Shared limit"]
+        )
+        let second = ResearchCoverageInput(
+            postsRequested: 20,
+            postsFetched: 20,
+            postsAnalyzed: 18,
+            commentsReported: 100,
+            commentsFetched: 90,
+            commentsAnalyzed: 80,
+            commentsOmitted: 10,
+            failureMessages: ["Second batch failed"],
+            truncationMessages: ["Shared limit"]
+        )
+
+        let combined = first.combined(with: second)
+        XCTAssertEqual(combined.postsRequested, 70)
+        XCTAssertEqual(combined.postsAnalyzed, 58)
+        XCTAssertEqual(combined.commentsReported, 600)
+        XCTAssertEqual(combined.commentsAnalyzed, 480)
+        XCTAssertEqual(combined.commentsOmitted, 60)
+        XCTAssertEqual(combined.failureMessages, ["First batch failed", "Second batch failed"])
+        XCTAssertEqual(combined.truncationMessages, ["Shared limit"])
     }
 
     @MainActor
@@ -160,6 +196,11 @@ final class redappTests: XCTestCase {
         XCTAssertFalse(result.feedTypesMatch)
         XCTAssertFalse(result.timeRangesMatch)
         XCTAssertGreaterThanOrEqual(result.warnings.count, 4)
+        let warnings = result.warnings.joined(separator: " ")
+        XCTAssertTrue(warnings.contains("\(result.captureDistanceDays) days apart"))
+        XCTAssertTrue(warnings.contains("\(result.postCountDifference) more analyzed posts"))
+        XCTAssertFalse(warnings.contains("(distance)"))
+        XCTAssertFalse(warnings.contains("(postDifference)"))
     }
 
     func testCommunitySourceReferencesKeepBothSidesDistinct() throws {
@@ -438,6 +479,12 @@ final class redappTests: XCTestCase {
         XCTAssertEqual(store.items.first?.tags.contains("battery"), true)
         try store.setPinned(false, itemID: first.itemID)
         XCTAssertEqual(store.items.count, 1, "Pinning should preserve the active search and tag filters")
+
+        try store.setTags(["battery"], itemID: first.itemID)
+        store.reload(searchText: "important")
+        XCTAssertTrue(store.items.isEmpty, "A removed tag must also be removed from full-text search")
+        store.reload(searchText: "battery")
+        XCTAssertEqual(store.items.count, 1)
 
         let searchableArtifact = try store.addArtifact(
             runID: second.id,

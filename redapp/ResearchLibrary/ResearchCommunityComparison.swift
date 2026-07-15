@@ -31,11 +31,11 @@ struct ResearchCommunityCompatibility: Codable, Hashable, Sendable {
         }
         if distance > 7 {
             value -= min(24, distance / 3)
-            warnings.append("The batches were saved (distance) days apart, so timing may affect the comparison.")
+            warnings.append("The batches were saved \(distance) days apart, so timing may affect the comparison.")
         }
         if postDifference > 10 {
             value -= min(18, postDifference / 2)
-            warnings.append("One batch contains (postDifference) more analyzed posts than the other.")
+            warnings.append("One batch contains \(postDifference) more analyzed posts than the other.")
         }
         let largerComments = max(base.coverage.commentsAnalyzed, candidate.coverage.commentsAnalyzed)
         if largerComments > 0, commentDifference * 2 > largerComments {
@@ -251,17 +251,7 @@ actor ResearchCommunityComparisonService {
         _ first: ResearchCoverageInput,
         _ second: ResearchCoverageInput
     ) -> ResearchCoverageInput {
-        ResearchCoverageInput(
-            postsRequested: first.postsRequested + second.postsRequested,
-            postsFetched: first.postsFetched + second.postsFetched,
-            postsAnalyzed: first.postsAnalyzed + second.postsAnalyzed,
-            commentsReported: first.commentsReported + second.commentsReported,
-            commentsFetched: first.commentsFetched + second.commentsFetched,
-            commentsAnalyzed: first.commentsAnalyzed + second.commentsAnalyzed,
-            commentsOmitted: first.commentsOmitted + second.commentsOmitted,
-            failureMessages: first.failureMessages + second.failureMessages,
-            truncationMessages: first.truncationMessages + second.truncationMessages
-        )
+        first.combined(with: second)
     }
 }
 
@@ -286,12 +276,10 @@ struct ResearchCommunityComparisonPickerView: View {
                         )
                     } else {
                         ForEach(candidates) { candidate in
-                            NavigationLink {
-                                ResearchCommunityComparisonSetupView(
-                                    firstRunID: baseRun.id,
-                                    secondRunID: candidate.id
-                                )
-                            } label: {
+                            NavigationLink(value: ResearchLibraryRoute.communitySetup(
+                                firstRunID: baseRun.id,
+                                secondRunID: candidate.id
+                            )) {
                                 snapshotRow(
                                     candidate,
                                     compatibility: ResearchCommunityCompatibility.evaluate(
@@ -351,15 +339,15 @@ struct ResearchCommunityComparisonPickerView: View {
 }
 
 @MainActor
-private struct ResearchCommunityComparisonSetupView: View {
+struct ResearchCommunityComparisonSetupView: View {
     let firstRunID: UUID
     let secondRunID: UUID
     @ObservedObject private var store = ResearchLibraryStore.shared
     @State private var first: ResearchRunRecord?
     @State private var second: ResearchRunRecord?
     @State private var subject = ""
-    @State private var createdComparisonID: UUID?
     @State private var errorMessage: String?
+    @Environment(\.researchLibraryNavigate) private var navigate
 
     private var trimmedSubject: String {
         subject.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -403,14 +391,6 @@ private struct ResearchCommunityComparisonSetupView: View {
             } else { ProgressView() }
         }
         .navigationTitle("Choose a Subject")
-        .navigationDestination(isPresented: Binding(
-            get: { createdComparisonID != nil },
-            set: { if !$0 { createdComparisonID = nil } }
-        )) {
-            if let createdComparisonID {
-                ResearchCommunityComparisonView(comparisonID: createdComparisonID)
-            }
-        }
         .task { load() }
         .alert("Comparison unavailable", isPresented: Binding(
             get: { errorMessage != nil },
@@ -439,7 +419,7 @@ private struct ResearchCommunityComparisonSetupView: View {
                 subject: trimmedSubject,
                 compatibilityJSON: ResearchJSON.encode(compatibility)
             )
-            createdComparisonID = record.id
+            navigate(.communityComparison(id: record.id))
         } catch { errorMessage = error.localizedDescription }
     }
 }

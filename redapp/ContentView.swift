@@ -24778,6 +24778,7 @@ struct ContentView: View {
     @State private var isResearchLibraryExplicitlyClosing = false
     @State private var hiddenResearchComparisonStatusIDs = Set<String>()
     @State private var comparisonToResume: ResearchComparisonGenerationState?
+    @State private var researchLibraryNavigationPath = NavigationPath()
     @State private var sidebarOverlayHeight: CGFloat = 180
     @State private var isSidebarScrolling = false
     @State private var sidebarScrollRevealTask: Task<Void, Never>? = nil
@@ -24863,6 +24864,7 @@ struct ContentView: View {
                             HStack(spacing: 9) {
                                 Spacer()
                                 Button {
+                                    researchLibraryNavigationPath = NavigationPath()
                                     comparisonToResume = job
                                     isResearchLibraryMinimized = false
                                     showResearchLibrary = true
@@ -24898,6 +24900,7 @@ struct ContentView: View {
                                 Button {
                                     hiddenResearchComparisonStatusIDs.insert(job.id)
                                     isResearchLibraryMinimized = false
+                                    researchLibraryNavigationPath = NavigationPath()
                                     if job.phase != .running {
                                         comparisonJobs.dismissStatus(key: job.id)
                                     }
@@ -24958,6 +24961,7 @@ struct ContentView: View {
                                 .accessibilityHint("Returns to the minimized Research Library")
                                 Button {
                                     isResearchLibraryMinimized = false
+                                    researchLibraryNavigationPath = NavigationPath()
                                 } label: {
                                     Image(systemName: "xmark")
                                         .font(.caption.weight(.bold))
@@ -25049,6 +25053,7 @@ struct ContentView: View {
                 isResearchLibraryExplicitlyClosing = false
             }) {
                 ResearchLibraryView(
+                    navigationPath: $researchLibraryNavigationPath,
                     initialComparison: comparisonToResume,
                     onMinimize: {
                         isResearchLibraryExplicitlyClosing = false
@@ -25057,6 +25062,7 @@ struct ContentView: View {
                     onClose: {
                         isResearchLibraryExplicitlyClosing = true
                         isResearchLibraryMinimized = false
+                        researchLibraryNavigationPath = NavigationPath()
                     }
                 )
             }
@@ -25285,6 +25291,7 @@ struct ContentView: View {
         ToolbarItemGroup(placement: .navigationBarTrailing) {
             Button(action: {
                 comparisonToResume = nil
+                researchLibraryNavigationPath = NavigationPath()
                 isResearchLibraryExplicitlyClosing = false
                 isResearchLibraryMinimized = false
                 showResearchLibrary = true
@@ -25315,6 +25322,7 @@ struct ContentView: View {
             HStack(spacing: 16) {
                 Button(action: {
                     comparisonToResume = nil
+                    researchLibraryNavigationPath = NavigationPath()
                     isResearchLibraryExplicitlyClosing = false
                     isResearchLibraryMinimized = false
                     showResearchLibrary = true

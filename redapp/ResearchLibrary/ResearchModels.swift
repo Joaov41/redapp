@@ -46,6 +46,28 @@ enum ResearchRunState: String, Codable, Sendable {
     case ready
     case partial
     case failed
+
+    var displayName: String {
+        switch self {
+        case .capturing: return "Saving"
+        case .ready: return "Complete"
+        case .partial: return "Incomplete"
+        case .failed: return "Failed"
+        }
+    }
+
+    var explanation: String {
+        switch self {
+        case .capturing:
+            return "This saved revision is still being prepared."
+        case .ready:
+            return "All requested material that was fetched was included."
+        case .partial:
+            return "Some requested posts or comments could not be fetched, were omitted by the analysis limit, or failed during processing."
+        case .failed:
+            return "The revision could not be completed."
+        }
+    }
 }
 
 enum ResearchEvidenceConfidence: String, Codable, CaseIterable, Sendable {
@@ -132,6 +154,20 @@ struct ResearchCoverageInput: Codable, Hashable, Sendable {
         failureMessages: [],
         truncationMessages: []
     )
+
+    func combined(with other: ResearchCoverageInput) -> ResearchCoverageInput {
+        ResearchCoverageInput(
+            postsRequested: postsRequested + other.postsRequested,
+            postsFetched: postsFetched + other.postsFetched,
+            postsAnalyzed: postsAnalyzed + other.postsAnalyzed,
+            commentsReported: commentsReported + other.commentsReported,
+            commentsFetched: commentsFetched + other.commentsFetched,
+            commentsAnalyzed: commentsAnalyzed + other.commentsAnalyzed,
+            commentsOmitted: commentsOmitted + other.commentsOmitted,
+            failureMessages: Array(Set(failureMessages + other.failureMessages)).sorted(),
+            truncationMessages: Array(Set(truncationMessages + other.truncationMessages)).sorted()
+        )
+    }
 }
 
 struct ResearchGenerationReceiptInput: Codable, Hashable, Sendable {

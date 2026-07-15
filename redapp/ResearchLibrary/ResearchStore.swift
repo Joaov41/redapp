@@ -463,7 +463,7 @@ final class ResearchLibraryStore: ObservableObject {
         ).sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
         item.tags = normalizedTags
         item.updatedAt = Date()
-        item.normalizedSearchText += " " + normalizedTags.map(Self.normalized).joined(separator: " ")
+        try rebuildSearchIndex(itemID: itemID)
         try context.save()
         reloadCurrentQuery()
     }
@@ -1057,6 +1057,35 @@ final class ResearchLibraryStore: ObservableObject {
         guard let run = try run(id: runID),
               let item = try item(id: run.itemID) else { throw ResearchStoreError.runNotFound }
         item.normalizedSearchText = Self.normalized(item.normalizedSearchText + " " + text)
+        item.updatedAt = Date()
+    }
+
+    private func rebuildSearchIndex(itemID: UUID) throws {
+        guard let item = try item(id: itemID) else { throw ResearchStoreError.itemNotFound }
+        var searchableText = [item.title, item.subreddit] + item.tags
+
+        for run in try runs(itemID: itemID) {
+            searchableText.append(contentsOf: [run.feedMode, run.sortMode, run.timeRange])
+            for source in try sources(runID: run.id) {
+                searchableText.append(contentsOf: [
+                    source.title ?? "",
+                    source.author ?? "",
+                    source.rawMarkdown
+                ])
+            }
+            for artifact in try artifacts(runID: run.id) {
+                searchableText.append(contentsOf: [artifact.title, artifact.body])
+                searchableText.append(contentsOf: artifact.conflicts)
+                searchableText.append(contentsOf: artifact.missingData)
+                searchableText.append(contentsOf: try claims(artifactID: artifact.id).map(\.text))
+            }
+            for conversation in try conversations(runID: run.id) {
+                searchableText.append(conversation.title)
+                searchableText.append(contentsOf: try turns(conversationID: conversation.id).map(\.text))
+            }
+        }
+
+        item.normalizedSearchText = Self.normalized(searchableText.joined(separator: " "))
         item.updatedAt = Date()
     }
 
