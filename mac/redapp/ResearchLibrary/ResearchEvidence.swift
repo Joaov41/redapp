@@ -5,6 +5,7 @@ enum GroundedResearchError: LocalizedError {
     case noPostSummaries
     case invalidResponse
     case noSupportedClaims
+    case remoteProviderRequired(String)
 
     var errorDescription: String? {
         switch self {
@@ -16,6 +17,8 @@ enum GroundedResearchError: LocalizedError {
             return "The model did not return the required grounded-response format."
         case .noSupportedClaims:
             return "No claims could be verified against the saved posts and comments."
+        case .remoteProviderRequired(let provider):
+            return "This comparison requires a remote summary provider. \(provider) is local."
         }
     }
 }
@@ -200,6 +203,7 @@ actor GroundedResearchService {
         maximumSourceCharacters: Int? = nil,
         maximumGuidanceCharacters: Int = 8_000,
         usePreselectedSources: Bool = false,
+        requireRemoteSummaryProvider: Bool = false,
         promptVersion: Int = 1
     ) async throws -> (response: ValidatedGroundedResponse, receipt: ResearchGenerationReceiptInput) {
         guard !sources.isEmpty else { throw GroundedResearchError.noSources }
@@ -246,8 +250,17 @@ actor GroundedResearchService {
         )
         let startedAt = Date()
         let service = SummaryService.shared
+        let selectedProvider = service.settings.selectedSummaryProvider
+        if requireRemoteSummaryProvider {
+            switch selectedProvider {
+            case .appleLocal, .mlxLocal, .coreAIMLXLocal:
+                throw GroundedResearchError.remoteProviderRequired(selectedProvider.displayName)
+            case .gemini, .appleCloud, .webAI, .summarizeDaemon, .applePCCGateway:
+                break
+            }
+        }
         let raw: String
-        if service.settings.selectedSummaryProvider == .webAI {
+        if selectedProvider == .webAI {
             raw = try await AppState.shared.performWebAIRequestAsync(
                 title: "Grounded Research",
                 prompt: prompt,

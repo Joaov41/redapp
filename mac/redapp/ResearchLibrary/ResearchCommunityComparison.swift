@@ -280,6 +280,7 @@ actor ResearchCommunityComparisonService {
             balanceAcrossPosts: false,
             maximumGuidanceCharacters: max(24_000, guidance.count),
             usePreselectedSources: true,
+            requireRemoteSummaryProvider: true,
             promptVersion: 5
         )
         let checked = Self.removingCitationSelectionLimitations(
