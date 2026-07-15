@@ -24752,12 +24752,14 @@ private struct BatchResultsOverlay: View {
 struct ContentView: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var comparisonJobs = ResearchComparisonGenerationCoordinator.shared
     @State private var subreddit: String = "SwiftUI"
     @State private var selectedPost: SubredditPostData?
     @StateObject private var viewModel = RedditSubredditViewModel()
     @State private var showSettings = false
     @State private var showCreatePost = false
     @State private var showResearchLibrary = false
+    @State private var comparisonToResume: ResearchComparisonGenerationState?
     @State private var sidebarOverlayHeight: CGFloat = 180
     @State private var isSidebarScrolling = false
     @State private var sidebarScrollRevealTask: Task<Void, Never>? = nil
@@ -24799,6 +24801,52 @@ struct ContentView: View {
                     )
                     .frame(width: geometry.size.width, height: geometry.size.height + geometry.safeAreaInsets.top + geometry.safeAreaInsets.bottom)
                     .ignoresSafeArea()
+                }
+
+                if !showResearchLibrary, let job = comparisonJobs.activeJobs.first {
+                    VStack {
+                        Spacer()
+                        HStack {
+                            Spacer()
+                            Button {
+                                comparisonToResume = job
+                                showResearchLibrary = true
+                            } label: {
+                                HStack(spacing: 12) {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(job.title)
+                                            .font(.subheadline.weight(.semibold))
+                                            .lineLimit(1)
+                                        Text(job.status)
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(1)
+                                    }
+                                    Image(systemName: "chevron.up")
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(.secondary)
+                                }
+                                .padding(.horizontal, 16)
+                                .padding(.vertical, 11)
+                                .frame(maxWidth: 340, alignment: .leading)
+                                .background(.regularMaterial, in: Capsule())
+                                .overlay {
+                                    Capsule()
+                                        .stroke(.primary.opacity(0.12), lineWidth: 0.75)
+                                }
+                                .shadow(color: .black.opacity(0.18), radius: 14, y: 7)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("Return to \(job.title)")
+                            .accessibilityHint(job.status)
+                        }
+                    }
+                    .padding(.trailing, 24)
+                    .padding(.bottom, 96)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .zIndex(30)
                 }
 
                 if appState.showFallbackNotification {
@@ -24865,8 +24913,10 @@ struct ContentView: View {
             .sheet(isPresented: $showCreatePost) {
                 PostComposer(isPresented: $showCreatePost, subreddit: subreddit)
             }
-            .sheet(isPresented: $showResearchLibrary) {
-                ResearchLibraryView()
+            .sheet(isPresented: $showResearchLibrary, onDismiss: {
+                comparisonToResume = nil
+            }) {
+                ResearchLibraryView(initialComparison: comparisonToResume)
             }
             .confirmationDialog(
                 "Local batch is too large",
@@ -25092,6 +25142,7 @@ struct ContentView: View {
         #if os(iOS)
         ToolbarItemGroup(placement: .navigationBarTrailing) {
             Button(action: {
+                comparisonToResume = nil
                 showResearchLibrary = true
             }) {
                 Image(systemName: "books.vertical")
@@ -25119,6 +25170,7 @@ struct ContentView: View {
         ToolbarItem(placement: .automatic) {
             HStack(spacing: 16) {
                 Button(action: {
+                    comparisonToResume = nil
                     showResearchLibrary = true
                 }) {
                     Image(systemName: "books.vertical")

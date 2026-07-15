@@ -1,15 +1,36 @@
 import AVFoundation
 import SwiftUI
 
+private struct ResearchLibraryMinimizeActionKey: EnvironmentKey {
+    static let defaultValue: () -> Void = {}
+}
+
+private extension EnvironmentValues {
+    var researchLibraryMinimizeAction: () -> Void {
+        get { self[ResearchLibraryMinimizeActionKey.self] }
+        set { self[ResearchLibraryMinimizeActionKey.self] = newValue }
+    }
+}
+
+private enum ResearchLibraryRoute: Hashable {
+    case comparison(leftRunID: UUID, rightRunID: UUID)
+}
+
 @MainActor
 struct ResearchLibraryView: View {
+    let initialComparison: ResearchComparisonGenerationState?
     @ObservedObject private var store = ResearchLibraryStore.shared
     @ObservedObject private var comparisonJobs = ResearchComparisonGenerationCoordinator.shared
     @Environment(\.dismiss) private var dismiss
+    @State private var navigationPath = NavigationPath()
     @State private var searchText = ""
     @State private var selectedTags = Set<String>()
     @State private var presentedExport: ResearchExportDocument?
     @State private var errorMessage: String?
+
+    init(initialComparison: ResearchComparisonGenerationState? = nil) {
+        self.initialComparison = initialComparison
+    }
 
     private var availableTags: [String] {
         Array(Set(store.items.flatMap(\.tags))).sorted {
@@ -18,7 +39,7 @@ struct ResearchLibraryView: View {
     }
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $navigationPath) {
             List {
                 if !comparisonJobs.activeJobs.isEmpty {
                     Section("Comparison in progress") {
@@ -118,7 +139,12 @@ struct ResearchLibraryView: View {
                             .accessibilityLabel("Comparison in progress")
                     }
                     Button("Done") { dismiss() }
-                        .disabled(comparisonJobs.hasActiveJobs)
+                }
+            }
+            .navigationDestination(for: ResearchLibraryRoute.self) { route in
+                switch route {
+                case .comparison(let leftRunID, let rightRunID):
+                    ResearchComparisonView(leftRunID: leftRunID, rightRunID: rightRunID)
                 }
             }
             .task(id: ResearchSearchRequest(query: searchText, tags: selectedTags)) {
@@ -138,7 +164,16 @@ struct ResearchLibraryView: View {
                 Text(errorMessage ?? store.lastError ?? "Unknown error")
             }
         }
-        .interactiveDismissDisabled(comparisonJobs.hasActiveJobs)
+        .environment(\.researchLibraryMinimizeAction, { dismiss() })
+        .task(id: initialComparison?.id) {
+            guard let initialComparison, navigationPath.isEmpty else { return }
+            navigationPath.append(
+                ResearchLibraryRoute.comparison(
+                    leftRunID: initialComparison.leftRunID,
+                    rightRunID: initialComparison.rightRunID
+                )
+            )
+        }
     }
 
     private func perform(_ operation: () throws -> Void) {
@@ -1512,7 +1547,7 @@ struct ResearchSourceDetailView: View {
     }
 }
 
-private struct ResearchComparisonGenerationState: Equatable, Identifiable {
+struct ResearchComparisonGenerationState: Equatable, Identifiable {
     enum Phase: Equatable {
         case running
         case completed
@@ -1529,7 +1564,7 @@ private struct ResearchComparisonGenerationState: Equatable, Identifiable {
 }
 
 @MainActor
-private final class ResearchComparisonGenerationCoordinator: ObservableObject {
+final class ResearchComparisonGenerationCoordinator: ObservableObject {
     static let shared = ResearchComparisonGenerationCoordinator()
 
     @Published private(set) var states: [String: ResearchComparisonGenerationState] = [:]
@@ -1617,6 +1652,7 @@ struct ResearchComparisonView: View {
     let rightRunID: UUID
     @ObservedObject private var store = ResearchLibraryStore.shared
     @ObservedObject private var comparisonJobs = ResearchComparisonGenerationCoordinator.shared
+    @Environment(\.researchLibraryMinimizeAction) private var minimizeResearchLibrary
     @State private var left: ResearchRunDetail?
     @State private var right: ResearchRunDetail?
     @State private var difference: ResearchRevisionDiff?
@@ -1624,6 +1660,7 @@ struct ResearchComparisonView: View {
     @State private var changeClaims: [ResearchClaimRecord] = []
     @State private var changeCitations: [UUID: [ResearchCitationRecord]] = [:]
     @State private var selectedSource: ResearchSourceRecord?
+    @State private var areAddedSourcesExpanded = false
     @State private var errorMessage: String?
 
     private var generationKey: String {
@@ -1656,15 +1693,29 @@ struct ResearchComparisonView: View {
                 exactChangesSection(difference)
 
                 if !difference.added.isEmpty {
-                    Section("Added sources") {
-                        ForEach(difference.added) { delta in
-                            sourceChangeRow(
-                                delta,
-                                snapshotLabel: snapshotName(right),
-                                runID: difference.newRunID,
-                                systemImage: "plus.circle.fill",
-                                tint: .green
-                            )
+                    Section {
+                        DisclosureGroup(isExpanded: $areAddedSourcesExpanded) {
+                            ForEach(difference.added) { delta in
+                                sourceChangeRow(
+                                    delta,
+                                    snapshotLabel: snapshotName(right),
+                                    runID: difference.newRunID,
+                                    systemImage: "plus.circle.fill",
+                                    tint: .green
+                                )
+                            }
+                        } label: {
+                            HStack {
+                                Label("Added sources", systemImage: "plus.circle.fill")
+                                    .foregroundStyle(.primary)
+                                Spacer()
+                                Text("\(difference.added.count)")
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    } footer: {
+                        if !areAddedSourcesExpanded {
+                            Text("Collapsed to keep large comparisons easy to scan.")
                         }
                     }
                 }
@@ -1763,6 +1814,18 @@ struct ResearchComparisonView: View {
             }
         }
         .navigationTitle(comparesDifferentFilters ? "Compare Feeds" : "Compare Revisions")
+        .toolbar {
+            if isGeneratingReport {
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        minimizeResearchLibrary()
+                    } label: {
+                        Label("Minimize", systemImage: "chevron.down")
+                    }
+                    .accessibilityHint("Continues the comparison in the background")
+                }
+            }
+        }
         .task {
             loadComparison()
         }
@@ -1944,14 +2007,21 @@ struct ResearchComparisonView: View {
                 Text(ResearchChangeNarrative.noChangeText)
                     .foregroundStyle(.secondary)
             }
+
+            if isGeneratingReport {
+                Button {
+                    minimizeResearchLibrary()
+                } label: {
+                    Label("Minimize and continue browsing", systemImage: "chevron.down")
+                }
+            }
         } header: {
             Text(subredditProgressTitle)
         } footer: {
-            Text(
-                comparesDifferentFilters
-                    ? "This compares two differently sorted saved samples. A difference may come from Reddit’s feed selection rather than a change in the community."
-                    : "This describes the saved sample, not every person or discussion in the subreddit."
-            )
+            let explanation = comparesDifferentFilters
+                ? "This compares two differently sorted saved samples. A difference may come from Reddit’s feed selection rather than a change in the community."
+                : "This describes the saved sample, not every person or discussion in the subreddit."
+            Text(explanation + (isGeneratingReport ? " You can minimize while it works." : ""))
         }
     }
 
