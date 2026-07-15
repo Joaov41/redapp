@@ -4,6 +4,7 @@ import SwiftUI
 @MainActor
 struct ResearchLibraryView: View {
     @ObservedObject private var store = ResearchLibraryStore.shared
+    @ObservedObject private var comparisonJobs = ResearchComparisonGenerationCoordinator.shared
     @Environment(\.dismiss) private var dismiss
     @State private var searchText = ""
     @State private var selectedTags = Set<String>()
@@ -19,6 +20,33 @@ struct ResearchLibraryView: View {
     var body: some View {
         NavigationStack {
             List {
+                if !comparisonJobs.activeJobs.isEmpty {
+                    Section("Comparison in progress") {
+                        ForEach(comparisonJobs.activeJobs) { job in
+                            NavigationLink {
+                                ResearchComparisonView(
+                                    leftRunID: job.leftRunID,
+                                    rightRunID: job.rightRunID
+                                )
+                            } label: {
+                                VStack(alignment: .leading, spacing: 7) {
+                                    HStack {
+                                        ProgressView()
+                                            .controlSize(.small)
+                                        Text(job.title)
+                                            .font(.headline)
+                                    }
+                                    ProgressView(value: job.progress)
+                                    Text(job.status)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                .padding(.vertical, 3)
+                            }
+                        }
+                    }
+                }
+
                 if !availableTags.isEmpty {
                     Section("Tags") {
                         ScrollView(.horizontal, showsIndicators: false) {
@@ -84,7 +112,13 @@ struct ResearchLibraryView: View {
             )
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
+                    if comparisonJobs.hasActiveJobs {
+                        ProgressView()
+                            .controlSize(.small)
+                            .accessibilityLabel("Comparison in progress")
+                    }
                     Button("Done") { dismiss() }
+                        .disabled(comparisonJobs.hasActiveJobs)
                 }
             }
             .task(id: ResearchSearchRequest(query: searchText, tags: selectedTags)) {
@@ -104,6 +138,7 @@ struct ResearchLibraryView: View {
                 Text(errorMessage ?? store.lastError ?? "Unknown error")
             }
         }
+        .interactiveDismissDisabled(comparisonJobs.hasActiveJobs)
     }
 
     private func perform(_ operation: () throws -> Void) {
@@ -1477,6 +1512,94 @@ struct ResearchSourceDetailView: View {
     }
 }
 
+private struct ResearchComparisonGenerationState: Equatable, Identifiable {
+    enum Phase: Equatable {
+        case running
+        case completed
+        case failed
+    }
+
+    var id: String
+    var leftRunID: UUID
+    var rightRunID: UUID
+    var title: String
+    var phase: Phase
+    var status: String
+    var progress: Double
+}
+
+@MainActor
+private final class ResearchComparisonGenerationCoordinator: ObservableObject {
+    static let shared = ResearchComparisonGenerationCoordinator()
+
+    @Published private(set) var states: [String: ResearchComparisonGenerationState] = [:]
+    private var tasks: [String: Task<Void, Never>] = [:]
+
+    var hasActiveJobs: Bool {
+        states.values.contains { $0.phase == .running }
+    }
+
+    var activeJobs: [ResearchComparisonGenerationState] {
+        states.values
+            .filter { $0.phase == .running }
+            .sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+    }
+
+    func state(for key: String) -> ResearchComparisonGenerationState? {
+        states[key]
+    }
+
+    func begin(
+        key: String,
+        leftRunID: UUID,
+        rightRunID: UUID,
+        title: String,
+        status: String,
+        progress: Double
+    ) -> Bool {
+        guard states[key]?.phase != .running else { return false }
+        states[key] = ResearchComparisonGenerationState(
+            id: key,
+            leftRunID: leftRunID,
+            rightRunID: rightRunID,
+            title: title,
+            phase: .running,
+            status: status,
+            progress: progress
+        )
+        return true
+    }
+
+    func attach(_ task: Task<Void, Never>, to key: String) {
+        tasks[key] = task
+    }
+
+    func update(key: String, status: String, progress: Double) {
+        guard var state = states[key], state.phase == .running else { return }
+        state.status = status
+        state.progress = max(0, min(1, progress))
+        states[key] = state
+    }
+
+    func complete(key: String, status: String) {
+        tasks.removeValue(forKey: key)
+        guard var state = states[key] else { return }
+        state.phase = .completed
+        state.status = status
+        state.progress = 1
+        states[key] = state
+    }
+
+    func fail(key: String, message: String) {
+        tasks.removeValue(forKey: key)
+        guard var state = states[key] else { return }
+        state.phase = .failed
+        state.status = message
+        state.progress = 0
+        states[key] = state
+    }
+}
+
 private enum ResearchComparisonGenerationError: LocalizedError {
     case summarizeBridgeUnavailable
 
@@ -1493,6 +1616,7 @@ struct ResearchComparisonView: View {
     let leftRunID: UUID
     let rightRunID: UUID
     @ObservedObject private var store = ResearchLibraryStore.shared
+    @ObservedObject private var comparisonJobs = ResearchComparisonGenerationCoordinator.shared
     @State private var left: ResearchRunDetail?
     @State private var right: ResearchRunDetail?
     @State private var difference: ResearchRevisionDiff?
@@ -1500,11 +1624,27 @@ struct ResearchComparisonView: View {
     @State private var changeClaims: [ResearchClaimRecord] = []
     @State private var changeCitations: [UUID: [ResearchCitationRecord]] = [:]
     @State private var selectedSource: ResearchSourceRecord?
-    @State private var isGeneratingReport = false
-    @State private var generationTask: Task<Void, Never>?
-    @State private var generationStatus = ""
-    @State private var generationProgress = 0.0
     @State private var errorMessage: String?
+
+    private var generationKey: String {
+        [leftRunID.uuidString, rightRunID.uuidString].sorted().joined(separator: ":")
+    }
+
+    private var generationState: ResearchComparisonGenerationState? {
+        comparisonJobs.state(for: generationKey)
+    }
+
+    private var isGeneratingReport: Bool {
+        generationState?.phase == .running
+    }
+
+    private var generationStatus: String {
+        generationState?.status ?? "Preparing a balanced comparison…"
+    }
+
+    private var generationProgress: Double {
+        generationState?.progress ?? 0
+    }
 
     var body: some View {
         List {
@@ -1625,6 +1765,16 @@ struct ResearchComparisonView: View {
         .navigationTitle(comparesDifferentFilters ? "Compare Feeds" : "Compare Revisions")
         .task {
             loadComparison()
+        }
+        .onChange(of: generationState?.phase) { _, phase in
+            switch phase {
+            case .completed:
+                loadComparison()
+            case .failed:
+                errorMessage = generationState?.status
+            case .running, .none:
+                break
+            }
         }
         .sheet(item: $selectedSource) { source in
             NavigationStack { ResearchSourceDetailView(source: source) }
@@ -1922,14 +2072,19 @@ struct ResearchComparisonView: View {
         guard let left, let right, difference.hasSourceChanges else { return }
         let comparisonSources = difference.promptSources()
         guard !comparisonSources.isEmpty else { return }
-        isGeneratingReport = true
-        generationStatus = "Preparing a balanced comparison…"
-        generationProgress = 0.05
-        errorMessage = nil
         let subreddit = right.sources
             .map(\.subreddit)
             .first(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
             .map { "r/\($0)" } ?? "the saved subreddit"
+        guard comparisonJobs.begin(
+            key: generationKey,
+            leftRunID: leftRunID,
+            rightRunID: rightRunID,
+            title: "Comparing \(subreddit)",
+            status: "Preparing a balanced comparison…",
+            progress: 0.05
+        ) else { return }
+        errorMessage = nil
         let isCrossFilter = comparesDifferentFilters
         let comparisonTask = isCrossFilter
             ? "Compare, in plain everyday language, what the two differently sorted saved subreddit feeds surfaced."
@@ -1977,8 +2132,6 @@ struct ResearchComparisonView: View {
         let task = Task {
             var succeeded = false
             defer {
-                isGeneratingReport = false
-                generationTask = nil
 #if os(iOS)
                 backgroundHandle.finish(success: succeeded)
                 if succeeded {
@@ -1996,12 +2149,15 @@ struct ResearchComparisonView: View {
 #endif
                 try Task.checkCancellation()
                 if selectedProvider == .summarizeDaemon {
-                    generationStatus = "Checking the Mac connection…"
-                    generationProgress = 0.12
+                    comparisonJobs.update(
+                        key: generationKey,
+                        status: "Checking the configured connection…",
+                        progress: 0.12
+                    )
 #if os(iOS)
                     backgroundHandle.reportProgress(fractionCompleted: 0.12)
                     BatchSummaryLiveActivityController.shared.update(
-                        status: "Checking the Mac connection…",
+                        status: "Checking the configured connection…",
                         processedPosts: 0,
                         totalPosts: 4,
                         progress: 0.12
@@ -2014,8 +2170,11 @@ struct ResearchComparisonView: View {
                     }
                 }
 
-                generationStatus = "Selecting the most representative evidence…"
-                generationProgress = 0.25
+                comparisonJobs.update(
+                    key: generationKey,
+                    status: "Selecting the most representative evidence…",
+                    progress: 0.25
+                )
 #if os(iOS)
                 backgroundHandle.reportProgress(fractionCompleted: 0.25)
                 BatchSummaryLiveActivityController.shared.update(
@@ -2026,8 +2185,11 @@ struct ResearchComparisonView: View {
                 )
 #endif
 
-                generationStatus = "Writing the plain-language comparison…"
-                generationProgress = 0.42
+                comparisonJobs.update(
+                    key: generationKey,
+                    status: "Writing the plain-language comparison…",
+                    progress: 0.42
+                )
 #if os(iOS)
                 backgroundHandle.reportProgress(fractionCompleted: 0.42)
                 BatchSummaryLiveActivityController.shared.update(
@@ -2047,8 +2209,11 @@ struct ResearchComparisonView: View {
                     promptVersion: 3
                 )
                 try Task.checkCancellation()
-                generationStatus = "Checking links and saving…"
-                generationProgress = 0.88
+                comparisonJobs.update(
+                    key: generationKey,
+                    status: "Checking links and saving…",
+                    progress: 0.88
+                )
 #if os(iOS)
                 backgroundHandle.reportProgress(fractionCompleted: 0.88)
                 BatchSummaryLiveActivityController.shared.update(
@@ -2081,12 +2246,12 @@ struct ResearchComparisonView: View {
                     claims: result.response.claims,
                     validationSources: comparisonSources
                 )
-                loadComparison()
-                generationProgress = 1.0
-                generationStatus = "Feed comparison ready"
                 succeeded = true
+                comparisonJobs.complete(key: generationKey, status: "Feed comparison ready")
             } catch is CancellationError {
-                errorMessage = "The comparison was stopped before it finished."
+                let message = "The comparison was stopped before it finished."
+                comparisonJobs.fail(key: generationKey, message: message)
+                errorMessage = message
 #if os(iOS)
                 BatchSummaryLiveActivityController.shared.cancel(
                     reason: "Feed comparison stopped",
@@ -2095,7 +2260,9 @@ struct ResearchComparisonView: View {
                 )
 #endif
             } catch {
-                errorMessage = error.localizedDescription
+                let message = error.localizedDescription
+                comparisonJobs.fail(key: generationKey, message: message)
+                errorMessage = message
 #if os(iOS)
                 BatchSummaryLiveActivityController.shared.cancel(
                     reason: "Feed comparison needs attention",
@@ -2105,7 +2272,7 @@ struct ResearchComparisonView: View {
 #endif
             }
         }
-        generationTask = task
+        comparisonJobs.attach(task, to: generationKey)
 #if os(iOS)
         backgroundHandle.registerCancellationHandler { task.cancel() }
 #endif
