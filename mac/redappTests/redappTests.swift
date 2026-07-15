@@ -10,6 +10,25 @@ import XCTest
 @testable import redapp
 
 final class redappTests: XCTestCase {
+
+    func testExplainsLegacyLoadedFeedPostShortfall() {
+        let coverage = ResearchCoverageInput(
+            postsRequested: 5,
+            postsFetched: 3,
+            postsAnalyzed: 3,
+            commentsReported: 195,
+            commentsFetched: 194,
+            commentsAnalyzed: 194,
+            commentsOmitted: 0,
+            failureMessages: [],
+            truncationMessages: []
+        )
+
+        XCTAssertEqual(
+            coverage.missingPostsNotice,
+            "Only 3 posts were loaded when the batch started, although 5 were requested. The remaining 2 were never sent for analysis."
+        )
+    }
     func testResearchCaptureLabelsDescribeFeedTypeAndTopRange() {
         XCTAssertEqual(
             ResearchCaptureLabel.displayName(sortMode: "top", timeRange: "day"),

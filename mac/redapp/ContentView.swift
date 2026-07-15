@@ -9248,6 +9248,33 @@ class RedditSubredditViewModel: ObservableObject {
     }
     
     // MARK: - Batch Processing
+
+    private func initialResearchBatchCoverage() -> ResearchCoverageInput {
+        let loadedCount = posts.count
+        let requestedCount = max(
+            loadedCount,
+            Int(postLimit.trimmingCharacters(in: .whitespacesAndNewlines)) ?? loadedCount
+        )
+        var failures: [String] = []
+        if loadedCount < requestedCount {
+            let missingCount = requestedCount - loadedCount
+            failures.append(
+                "Only \(loadedCount) posts were loaded when the batch started, although \(requestedCount) were requested. The remaining \(missingCount) were not sent for analysis. Reload the feed after changing the post count before starting the next batch."
+            )
+        }
+
+        return ResearchCoverageInput(
+            postsRequested: requestedCount,
+            postsFetched: 0,
+            postsAnalyzed: 0,
+            commentsReported: 0,
+            commentsFetched: 0,
+            commentsAnalyzed: 0,
+            commentsOmitted: 0,
+            failureMessages: failures,
+            truncationMessages: []
+        )
+    }
     
     func startBatchProcessing(subreddit: String) {
         // Cancel any existing batch processing
@@ -9269,20 +9296,7 @@ class RedditSubredditViewModel: ObservableObject {
         batchRawComments = ""
         batchExtractedPosts = []
         batchCapturedSources = []
-        batchCoverage = ResearchCoverageInput(
-            postsRequested: max(
-                posts.count,
-                Int(postLimit.trimmingCharacters(in: .whitespacesAndNewlines)) ?? posts.count
-            ),
-            postsFetched: 0,
-            postsAnalyzed: 0,
-            commentsReported: 0,
-            commentsFetched: 0,
-            commentsAnalyzed: 0,
-            commentsOmitted: 0,
-            failureMessages: [],
-            truncationMessages: []
-        )
+        batchCoverage = initialResearchBatchCoverage()
         savedResearchRunID = nil
         researchLibraryError = nil
         requiresImmediateWidgetRefresh = false
@@ -9741,20 +9755,7 @@ class RedditSubredditViewModel: ObservableObject {
         batchRawComments = ""
         batchExtractedPosts = []
         batchCapturedSources = []
-        batchCoverage = ResearchCoverageInput(
-            postsRequested: max(
-                posts.count,
-                Int(postLimit.trimmingCharacters(in: .whitespacesAndNewlines)) ?? posts.count
-            ),
-            postsFetched: 0,
-            postsAnalyzed: 0,
-            commentsReported: 0,
-            commentsFetched: 0,
-            commentsAnalyzed: 0,
-            commentsOmitted: 0,
-            failureMessages: [],
-            truncationMessages: []
-        )
+        batchCoverage = initialResearchBatchCoverage()
         savedResearchRunID = nil
         researchLibraryError = nil
         requiresImmediateWidgetRefresh = false

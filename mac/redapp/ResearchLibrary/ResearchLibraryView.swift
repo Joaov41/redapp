@@ -971,6 +971,10 @@ struct ResearchRunDetailView: View {
     private func coverageSection(_ coverage: ResearchCoverageInput) -> some View {
         Section("Coverage") {
             LabeledContent("Posts analyzed", value: "\(coverage.postsAnalyzed) of \(coverage.postsRequested)")
+            if let missingPostsNotice = coverage.missingPostsNotice {
+                Label(missingPostsNotice, systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.orange)
+            }
             LabeledContent("Comments analyzed", value: "\(coverage.commentsAnalyzed)")
             LabeledContent("Comments fetched", value: "\(coverage.commentsFetched)")
             LabeledContent("Comments reported", value: "\(coverage.commentsReported)")

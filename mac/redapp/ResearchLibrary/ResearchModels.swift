@@ -155,6 +155,20 @@ struct ResearchCoverageInput: Codable, Hashable, Sendable {
         truncationMessages: []
     )
 
+    var missingPostsNotice: String? {
+        let missingCount = max(0, postsRequested - postsAnalyzed)
+        guard missingCount > 0 else { return nil }
+
+        if failureMessages.isEmpty {
+            if postsFetched == postsAnalyzed {
+                return "Only \(postsAnalyzed) posts were loaded when the batch started, although \(postsRequested) were requested. The remaining \(missingCount) were never sent for analysis."
+            }
+            return "\(missingCount) requested post\(missingCount == 1 ? " was" : "s were") not analyzed, but this older revision did not capture a detailed reason."
+        }
+
+        return "\(missingCount) requested post\(missingCount == 1 ? " was" : "s were") not analyzed. The recorded reason\(failureMessages.count == 1 ? " is" : "s are") listed below."
+    }
+
     func combined(with other: ResearchCoverageInput) -> ResearchCoverageInput {
         ResearchCoverageInput(
             postsRequested: postsRequested + other.postsRequested,
