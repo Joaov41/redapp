@@ -24775,6 +24775,7 @@ struct ContentView: View {
     @State private var showCreatePost = false
     @State private var showResearchLibrary = false
     @State private var isResearchLibraryMinimized = false
+    @State private var isResearchLibraryExplicitlyClosing = false
     @State private var comparisonToResume: ResearchComparisonGenerationState?
     @State private var sidebarOverlayHeight: CGFloat = 180
     @State private var isSidebarScrolling = false
@@ -25021,11 +25022,22 @@ struct ContentView: View {
             }
             .sheet(isPresented: $showResearchLibrary, onDismiss: {
                 comparisonToResume = nil
+                if isResearchLibraryExplicitlyClosing {
+                    isResearchLibraryMinimized = false
+                } else {
+                    isResearchLibraryMinimized = true
+                }
+                isResearchLibraryExplicitlyClosing = false
             }) {
                 ResearchLibraryView(
                     initialComparison: comparisonToResume,
                     onMinimize: {
+                        isResearchLibraryExplicitlyClosing = false
                         isResearchLibraryMinimized = true
+                    },
+                    onClose: {
+                        isResearchLibraryExplicitlyClosing = true
+                        isResearchLibraryMinimized = false
                     }
                 )
             }
@@ -25254,6 +25266,7 @@ struct ContentView: View {
         ToolbarItemGroup(placement: .navigationBarTrailing) {
             Button(action: {
                 comparisonToResume = nil
+                isResearchLibraryExplicitlyClosing = false
                 isResearchLibraryMinimized = false
                 showResearchLibrary = true
             }) {
@@ -25283,6 +25296,7 @@ struct ContentView: View {
             HStack(spacing: 16) {
                 Button(action: {
                     comparisonToResume = nil
+                    isResearchLibraryExplicitlyClosing = false
                     isResearchLibraryMinimized = false
                     showResearchLibrary = true
                 }) {

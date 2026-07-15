@@ -21,6 +21,7 @@ private enum ResearchLibraryRoute: Hashable {
 struct ResearchLibraryView: View {
     let initialComparison: ResearchComparisonGenerationState?
     let onMinimize: () -> Void
+    let onClose: () -> Void
     @ObservedObject private var store = ResearchLibraryStore.shared
     @ObservedObject private var comparisonJobs = ResearchComparisonGenerationCoordinator.shared
     @Environment(\.dismiss) private var dismiss
@@ -33,10 +34,12 @@ struct ResearchLibraryView: View {
 
     init(
         initialComparison: ResearchComparisonGenerationState? = nil,
-        onMinimize: @escaping () -> Void = {}
+        onMinimize: @escaping () -> Void = {},
+        onClose: @escaping () -> Void = {}
     ) {
         self.initialComparison = initialComparison
         self.onMinimize = onMinimize
+        self.onClose = onClose
     }
 
     private var availableTags: [String] {
@@ -206,7 +209,7 @@ struct ResearchLibraryView: View {
                         .controlSize(.small)
                         .accessibilityLabel("Comparison in progress")
                 }
-                Button("Done") { dismiss() }
+                Button("Done", action: close)
             }
         }
         .environment(\.researchLibraryMinimizeAction, minimize)
@@ -227,6 +230,11 @@ struct ResearchLibraryView: View {
 
     private func minimize() {
         onMinimize()
+        dismiss()
+    }
+
+    private func close() {
+        onClose()
         dismiss()
     }
 
