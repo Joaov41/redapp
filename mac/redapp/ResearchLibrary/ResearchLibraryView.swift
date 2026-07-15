@@ -181,7 +181,7 @@ struct ResearchLibraryView: View {
             .searchable(
                 text: $searchText,
                 placement: .toolbar,
-                prompt: "Search reports, posts, comments, authors"
+                prompt: "Search saved research"
             )
 #else
             .listStyle(.insetGrouped)
@@ -239,6 +239,22 @@ struct ResearchLibraryView: View {
             }
         }
         .toolbar {
+#if os(macOS)
+            ToolbarItem(placement: .navigation) {
+                Button(action: minimize) {
+                    Label("Minimize", systemImage: "chevron.down")
+                }
+                .accessibilityHint("Keeps the Research Library available while you browse")
+            }
+            ToolbarItemGroup(placement: .primaryAction) {
+                if comparisonJobs.hasActiveJobs {
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityLabel("Comparison in progress")
+                }
+                Button("Close", action: close)
+            }
+#else
             ToolbarItem(placement: .cancellationAction) {
                 Button(action: minimize) {
                     Label("Minimize", systemImage: "chevron.down")
@@ -253,6 +269,7 @@ struct ResearchLibraryView: View {
                 }
                 Button("Close", action: close)
             }
+#endif
         }
         .environment(\.researchLibraryMinimizeAction, minimize)
         .environment(\.researchLibraryNavigate, { route in

@@ -26395,7 +26395,7 @@ struct ContentView: View {
                     }
                 )
 #if os(macOS)
-                .frame(minWidth: 980, idealWidth: 1100, minHeight: 700, idealHeight: 820)
+                .frame(minWidth: 700, idealWidth: 880, minHeight: 480, idealHeight: 620)
 #endif
             }
             .confirmationDialog(
