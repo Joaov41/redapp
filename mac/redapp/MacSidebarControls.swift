@@ -183,6 +183,20 @@ struct MacSidebarControls: View {
                 .onSubmit(onLoadSubreddit)
                 .accessibilityLabel("Subreddit")
                 .accessibilityHint("Press Return to load this subreddit")
+
+            if !subreddit.isEmpty {
+                Button {
+                    subreddit = ""
+                    focusedField.wrappedValue = .subreddit
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Clear subreddit")
+                .accessibilityLabel("Clear subreddit search")
+                .accessibilityHint("Removes the current subreddit so you can enter another one")
+            }
         }
         .frame(maxWidth: .infinity)
     }

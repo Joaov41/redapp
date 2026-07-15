@@ -69,11 +69,14 @@ enum KokoroVoice: String, CaseIterable, Codable, Identifiable {
 
 enum KokoroTTSServiceError: LocalizedError {
     case notAvailable
+    case emptyText
 
     var errorDescription: String? {
         switch self {
         case .notAvailable:
             return "Local MLX TTS is not available in this build."
+        case .emptyText:
+            return "There is no text available to read."
         }
     }
 }
@@ -123,6 +126,45 @@ final class KokoroTTSService {
         #endif
     }
 
+    func speechChunks(
+        from text: String,
+        firstChunkCharacters: Int = 140,
+        maximumChunkCharacters: Int = 220
+    ) -> [String] {
+        let firstLimit = max(40, min(firstChunkCharacters, maximumChunkCharacters))
+        let laterLimit = max(firstLimit, maximumChunkCharacters)
+        let words = text.split(whereSeparator: \Character.isWhitespace).map(String.init)
+        guard !words.isEmpty else { return [] }
+        var chunks: [String] = []
+        var current = ""
+        func activeLimit() -> Int { chunks.isEmpty ? firstLimit : laterLimit }
+        func flushCurrent() {
+            let trimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return }
+            chunks.append(trimmed)
+            current = ""
+        }
+        for originalWord in words {
+            var word = originalWord
+            while !word.isEmpty {
+                let limit = activeLimit()
+                let separatorCount = current.isEmpty ? 0 : 1
+                if current.count + separatorCount + word.count <= limit {
+                    current += current.isEmpty ? word : " \(word)"
+                    word = ""
+                } else if !current.isEmpty {
+                    flushCurrent()
+                } else {
+                    let splitIndex = word.index(word.startIndex, offsetBy: min(limit, word.count))
+                    chunks.append(String(word[..<splitIndex]))
+                    word = String(word[splitIndex...])
+                }
+            }
+        }
+        flushCurrent()
+        return chunks
+    }
+
     func synthesize(text: String, voice: String, speed: Float, allowCaching: Bool = true) async throws -> Data {
         #if canImport(MLXAudioCore) && canImport(MLXAudioTTS)
         if allowCaching {
@@ -155,6 +197,51 @@ final class KokoroTTSService {
         return try Data(contentsOf: tempURL)
         #else
         _ = (text, voice, speed, allowCaching)
+        throw KokoroTTSServiceError.notAvailable
+        #endif
+    }
+
+    func synthesizeChunked(
+        text: String,
+        voice: String,
+        speed: Float,
+        allowCaching: Bool = true,
+        progress: (@MainActor @Sendable (_ completedChunks: Int, _ totalChunks: Int) -> Void)? = nil
+    ) async throws -> Data {
+        #if canImport(MLXAudioCore) && canImport(MLXAudioTTS)
+        let chunks = speechChunks(from: text)
+        guard !chunks.isEmpty else { throw KokoroTTSServiceError.emptyText }
+        if allowCaching { recordVoiceForWarmup(voice) }
+        configureMemoryIfNeeded()
+        let model = try await ensureInitialized(preloadVoice: allowCaching ? voice : nil)
+        let selectedVoice = normalizedVoice(voice)
+        let generationParams = generationParameters(for: speed)
+        let sampleRate = Double(model.sampleRate)
+        let pauseSamples = Array(repeating: Float.zero, count: max(1, Int(sampleRate * 0.12)))
+        var combinedSamples: [Float] = []
+        for (index, chunk) in chunks.enumerated() {
+            try Task.checkCancellation()
+            let audio = try await model.generate(
+                text: chunk,
+                voice: selectedVoice,
+                refAudio: nil,
+                refText: nil,
+                language: nil,
+                generationParameters: generationParams
+            )
+            combinedSamples.append(contentsOf: audio.asArray(Float.self))
+            if index < chunks.count - 1 { combinedSamples.append(contentsOf: pauseSamples) }
+            Memory.clearCache()
+            await progress?(index + 1, chunks.count)
+        }
+        try Task.checkCancellation()
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mlx_tts_report_\(UUID().uuidString).wav")
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+        try writeWavFile(samples: combinedSamples, sampleRate: sampleRate, to: tempURL)
+        return try Data(contentsOf: tempURL)
+        #else
+        _ = (text, voice, speed, allowCaching, progress)
         throw KokoroTTSServiceError.notAvailable
         #endif
     }

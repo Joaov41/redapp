@@ -29,6 +29,28 @@
       selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB"
       shouldUseLaunchSchemeArgsEnv = "YES"
       shouldAutocreateTestPlan = "YES">
+      <Testables>
+         <TestableReference
+            skipped = "NO"
+            parallelizable = "YES">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "C151676D2D1F469B00B9B23E"
+               BuildableName = "redappTests.xctest"
+               BlueprintName = "redappTests"
+               ReferencedContainer = "container:redapp2.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
+      </Testables>
+      <MacroExpansion>
+         <BuildableReference
+            BuildableIdentifier = "primary"
+            BlueprintIdentifier = "891A16DF507443C9939EB532"
+            BuildableName = "redapp.app"
+            BlueprintName = "redapp-macOS"
+            ReferencedContainer = "container:redapp2.xcodeproj">
+         </BuildableReference>
+      </MacroExpansion>
    </TestAction>
    <LaunchAction
       buildConfiguration = "Release"

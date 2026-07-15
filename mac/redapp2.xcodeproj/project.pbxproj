@@ -43,8 +43,8 @@
 			isa = PBXContainerItemProxy;
 			containerPortal = C15167552D1F469A00B9B23E /* Project object */;
 			proxyType = 1;
-			remoteGlobalIDString = C151675C2D1F469A00B9B23E;
-			remoteInfo = redapp;
+			remoteGlobalIDString = 891A16DF507443C9939EB532;
+			remoteInfo = "redapp-macOS";
 		};
 		C15167792D1F469B00B9B23E /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -509,7 +509,7 @@
 		};
 		C15167702D1F469B00B9B23E /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
-			target = C151675C2D1F469A00B9B23E /* redapp */;
+			target = 891A16DF507443C9939EB532 /* redapp-macOS */;
 			targetProxy = C151676F2D1F469B00B9B23E /* PBXContainerItemProxy */;
 		};
 		C151677A2D1F469B00B9B23E /* PBXTargetDependency */ = {
@@ -849,18 +849,16 @@
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = HNG8WV554B;
-				GENERATE_INFOPLIST_FILE = NO;
-				INFOPLIST_FILE = Info.plist;
-				IPHONEOS_DEPLOYMENT_TARGET = 18.2;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = red.redappTests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
-				SDKROOT = auto;
-				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SDKROOT = macosx;
+				SUPPORTED_PLATFORMS = macosx;
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_ENABLE_EXPLICIT_MODULES = NO;
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2";
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/redapp.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/redapp";
 			};
 			name = Debug;
@@ -872,18 +870,16 @@
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = HNG8WV554B;
-				GENERATE_INFOPLIST_FILE = NO;
-				INFOPLIST_FILE = Info.plist;
-				IPHONEOS_DEPLOYMENT_TARGET = 18.2;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = red.redappTests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
-				SDKROOT = auto;
-				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SDKROOT = macosx;
+				SUPPORTED_PLATFORMS = macosx;
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_ENABLE_EXPLICIT_MODULES = NO;
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2";
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/redapp.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/redapp";
 			};
 			name = Release;
