@@ -1678,6 +1678,7 @@ struct ResearchComparisonView: View {
     @State private var selectedSource: ResearchSourceRecord?
     @State private var areAddedSourcesExpanded = false
     @State private var areEarlierOnlySourcesExpanded = false
+    @State private var areScoreChangesExpanded = false
     @State private var errorMessage: String?
 
     private var generationKey: String {
@@ -1794,32 +1795,40 @@ struct ResearchComparisonView: View {
 
                 if !difference.scoreChanges.isEmpty {
                     Section {
-                        ForEach(difference.scoreChanges) { delta in
-                            Button {
-                                openSource(runID: difference.newRunID, sourceID: delta.sourceID)
-                            } label: {
-                                HStack {
-                                    VStack(alignment: .leading, spacing: 3) {
-                                        Text(delta.displayTitle)
-                                            .foregroundStyle(.primary)
-                                        Text(delta.sourceID)
-                                            .font(.caption.monospaced())
+                        DisclosureGroup(isExpanded: $areScoreChangesExpanded) {
+                            ForEach(difference.scoreChanges) { delta in
+                                Button {
+                                    openSource(runID: difference.newRunID, sourceID: delta.sourceID)
+                                } label: {
+                                    HStack {
+                                        VStack(alignment: .leading, spacing: 3) {
+                                            Text(delta.displayTitle)
+                                                .foregroundStyle(.primary)
+                                            Text(delta.sourceID)
+                                                .font(.caption.monospaced())
+                                                .foregroundStyle(.secondary)
+                                        }
+                                        Spacer()
+                                        Text(scoreLabel(delta.oldScore))
                                             .foregroundStyle(.secondary)
+                                        Image(systemName: "arrow.right")
+                                            .foregroundStyle(.tertiary)
+                                        Text(scoreLabel(delta.newScore))
+                                            .fontWeight(.semibold)
                                     }
-                                    Spacer()
-                                    Text(scoreLabel(delta.oldScore))
-                                        .foregroundStyle(.secondary)
-                                    Image(systemName: "arrow.right")
-                                        .foregroundStyle(.tertiary)
-                                    Text(scoreLabel(delta.newScore))
-                                        .fontWeight(.semibold)
                                 }
                             }
+                        } label: {
+                            HStack {
+                                Label("Score changes", systemImage: "chart.line.uptrend.xyaxis")
+                                    .foregroundStyle(.primary)
+                                Spacer()
+                                Text("\(difference.scoreChanges.count)")
+                                    .foregroundStyle(.secondary)
+                            }
                         }
-                    } header: {
-                        Text("Score changes")
                     } footer: {
-                        Text("Score changes measure engagement, not whether a claim is true.")
+                        Text("Scores show engagement, not whether a claim is true. Expand to inspect individual changes.")
                     }
                 }
 
