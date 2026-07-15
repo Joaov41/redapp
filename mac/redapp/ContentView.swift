@@ -26398,6 +26398,8 @@ struct ContentView: View {
                 )
 #if os(macOS)
                 .frame(minWidth: 700, idealWidth: 880, minHeight: 480, idealHeight: 620)
+                .background(Color.black)
+                .preferredColorScheme(.dark)
 #endif
             }
             .confirmationDialog(

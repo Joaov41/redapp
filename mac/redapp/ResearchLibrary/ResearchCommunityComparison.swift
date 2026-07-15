@@ -297,6 +297,7 @@ struct ResearchCommunityComparisonPickerView: View {
                 }
             } else { ProgressView() }
         }
+        .researchLibraryBlackSurface()
         .navigationTitle("Compare Communities")
         .task { load() }
         .alert("Comparison unavailable", isPresented: Binding(
@@ -390,6 +391,7 @@ struct ResearchCommunityComparisonSetupView: View {
                 }
             } else { ProgressView() }
         }
+        .researchLibraryBlackSurface()
         .navigationTitle("Choose a Subject")
         .task { load() }
         .alert("Comparison unavailable", isPresented: Binding(
@@ -498,6 +500,7 @@ struct ResearchCommunityComparisonView: View {
                 }
             } else { ProgressView() }
         }
+        .researchLibraryBlackSurface()
         .navigationTitle(record.map { "\($0.subject)" } ?? "Community Comparison")
         .sheet(item: $selectedSource) { source in
             NavigationStack { ResearchSourceDetailView(source: source) }

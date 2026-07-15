@@ -12,6 +12,13 @@ extension EnvironmentValues {
     }
 }
 
+extension View {
+    func researchLibraryBlackSurface() -> some View {
+        scrollContentBackground(.hidden)
+            .background(Color.black)
+    }
+}
+
 enum ResearchLibraryRoute: Hashable {
     case item(id: UUID)
     case run(id: UUID)
@@ -175,6 +182,7 @@ struct ResearchLibraryView: View {
                     Text("Saved batches")
                 }
             }
+            .researchLibraryBlackSurface()
 #if os(macOS)
             .listStyle(.inset)
             .navigationTitle("Research Library")
@@ -449,6 +457,7 @@ struct ResearchItemDetailView: View {
                 ProgressView()
             }
         }
+        .researchLibraryBlackSurface()
         .navigationTitle(item?.title ?? "Saved Research")
         .toolbar {
             if let item {
@@ -484,6 +493,7 @@ struct ResearchItemDetailView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+                .researchLibraryBlackSurface()
                 .navigationTitle("Tags")
                 .toolbar {
                     ToolbarItem(placement: .cancellationAction) {
@@ -577,6 +587,7 @@ private struct ResearchCrossFilterComparisonPickerView: View {
                 ProgressView()
             }
         }
+        .researchLibraryBlackSurface()
         .navigationTitle("Compare Feed Types")
         .task { load() }
         .alert("Comparison unavailable", isPresented: Binding(
@@ -708,6 +719,7 @@ struct ResearchRunDetailView: View {
                 ProgressView()
             }
         }
+        .researchLibraryBlackSurface()
         .navigationTitle(detail.map { "Revision \($0.run.revision)" } ?? "Research Run")
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
@@ -1220,6 +1232,7 @@ private struct ResearchSourcesListView: View {
                 .padding(.vertical, 4)
             }
         }
+        .researchLibraryBlackSurface()
         .navigationTitle("Saved Sources")
         .task {
             do {
@@ -1748,6 +1761,7 @@ struct ResearchSourceDetailView: View {
                     .textSelection(.enabled)
             }
         }
+        .researchLibraryBlackSurface()
         .navigationTitle(source.kind == .post ? "Supporting Post" : "Supporting Comment")
         .toolbar {
             if showsDoneButton {
@@ -2068,6 +2082,7 @@ struct ResearchComparisonView: View {
                 ProgressView()
             }
         }
+        .researchLibraryBlackSurface()
         .navigationTitle(comparesDifferentFilters ? "Compare Feeds" : "Compare Revisions")
         .toolbar {
             if isGeneratingReport {
