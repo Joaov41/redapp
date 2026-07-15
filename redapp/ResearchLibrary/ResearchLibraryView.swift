@@ -1561,6 +1561,7 @@ struct ResearchComparisonGenerationState: Equatable, Identifiable {
     var phase: Phase
     var status: String
     var progress: Double
+    var updatedAt: Date
 }
 
 @MainActor
@@ -1578,6 +1579,12 @@ final class ResearchComparisonGenerationCoordinator: ObservableObject {
         states.values
             .filter { $0.phase == .running }
             .sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+    }
+
+    var latestStatusJob: ResearchComparisonGenerationState? {
+        let running = states.values.filter { $0.phase == .running }
+        return (running.isEmpty ? Array(states.values) : running)
+            .max { $0.updatedAt < $1.updatedAt }
     }
 
     func state(for key: String) -> ResearchComparisonGenerationState? {
@@ -1600,7 +1607,8 @@ final class ResearchComparisonGenerationCoordinator: ObservableObject {
             title: title,
             phase: .running,
             status: status,
-            progress: progress
+            progress: progress,
+            updatedAt: Date()
         )
         return true
     }
@@ -1613,6 +1621,7 @@ final class ResearchComparisonGenerationCoordinator: ObservableObject {
         guard var state = states[key], state.phase == .running else { return }
         state.status = status
         state.progress = max(0, min(1, progress))
+        state.updatedAt = Date()
         states[key] = state
     }
 
@@ -1622,6 +1631,7 @@ final class ResearchComparisonGenerationCoordinator: ObservableObject {
         state.phase = .completed
         state.status = status
         state.progress = 1
+        state.updatedAt = Date()
         states[key] = state
     }
 
@@ -1631,7 +1641,13 @@ final class ResearchComparisonGenerationCoordinator: ObservableObject {
         state.phase = .failed
         state.status = message
         state.progress = 0
+        state.updatedAt = Date()
         states[key] = state
+    }
+
+    func dismissStatus(key: String) {
+        guard states[key]?.phase != .running else { return }
+        states.removeValue(forKey: key)
     }
 }
 
@@ -1661,6 +1677,7 @@ struct ResearchComparisonView: View {
     @State private var changeCitations: [UUID: [ResearchCitationRecord]] = [:]
     @State private var selectedSource: ResearchSourceRecord?
     @State private var areAddedSourcesExpanded = false
+    @State private var areEarlierOnlySourcesExpanded = false
     @State private var errorMessage: String?
 
     private var generationKey: String {
@@ -1700,13 +1717,13 @@ struct ResearchComparisonView: View {
                                     delta,
                                     snapshotLabel: snapshotName(right),
                                     runID: difference.newRunID,
-                                    systemImage: "plus.circle.fill",
-                                    tint: .green
+                                    systemImage: "doc.text",
+                                    tint: .blue
                                 )
                             }
                         } label: {
                             HStack {
-                                Label("Added sources", systemImage: "plus.circle.fill")
+                                Label(laterOnlySourcesTitle, systemImage: "rectangle.stack")
                                     .foregroundStyle(.primary)
                                 Spacer()
                                 Text("\(difference.added.count)")
@@ -1721,15 +1738,29 @@ struct ResearchComparisonView: View {
                 }
 
                 if !difference.removed.isEmpty {
-                    Section("Removed sources") {
-                        ForEach(difference.removed) { delta in
-                            sourceChangeRow(
-                                delta,
-                                snapshotLabel: snapshotName(left),
-                                runID: difference.oldRunID,
-                                systemImage: "minus.circle.fill",
-                                tint: .red
-                            )
+                    Section {
+                        DisclosureGroup(isExpanded: $areEarlierOnlySourcesExpanded) {
+                            ForEach(difference.removed) { delta in
+                                sourceChangeRow(
+                                    delta,
+                                    snapshotLabel: snapshotName(left),
+                                    runID: difference.oldRunID,
+                                    systemImage: "doc.text",
+                                    tint: .blue
+                                )
+                            }
+                        } label: {
+                            HStack {
+                                Label(earlierOnlySourcesTitle, systemImage: "rectangle.stack")
+                                    .foregroundStyle(.primary)
+                                Spacer()
+                                Text("\(difference.removed.count)")
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    } footer: {
+                        if !areEarlierOnlySourcesExpanded {
+                            Text("Collapsed to keep large comparisons easy to scan.")
                         }
                     }
                 }
@@ -1828,11 +1859,20 @@ struct ResearchComparisonView: View {
         }
         .task {
             loadComparison()
+            switch generationState?.phase {
+            case .completed:
+                comparisonJobs.dismissStatus(key: generationKey)
+            case .failed:
+                errorMessage = generationState?.status
+            case .running, .none:
+                break
+            }
         }
         .onChange(of: generationState?.phase) { _, phase in
             switch phase {
             case .completed:
                 loadComparison()
+                comparisonJobs.dismissStatus(key: generationKey)
             case .failed:
                 errorMessage = generationState?.status
             case .running, .none:
@@ -1844,9 +1884,21 @@ struct ResearchComparisonView: View {
         }
         .alert("Comparison unavailable", isPresented: Binding(
             get: { errorMessage != nil },
-            set: { if !$0 { errorMessage = nil } }
+            set: {
+                if !$0 {
+                    errorMessage = nil
+                    if generationState?.phase == .failed {
+                        comparisonJobs.dismissStatus(key: generationKey)
+                    }
+                }
+            }
         )) {
-            Button("OK", role: .cancel) { errorMessage = nil }
+            Button("OK", role: .cancel) {
+                errorMessage = nil
+                if generationState?.phase == .failed {
+                    comparisonJobs.dismissStatus(key: generationKey)
+                }
+            }
         } message: {
             Text(errorMessage ?? "Unknown error")
         }
@@ -2032,13 +2084,23 @@ struct ResearchComparisonView: View {
                 Label("No saved source or coverage changes detected.", systemImage: "equal.circle")
                     .foregroundStyle(.secondary)
             } else {
-                LabeledContent("Added", value: "\(difference.added.count)")
-                LabeledContent("Removed", value: "\(difference.removed.count)")
+                LabeledContent(laterOnlySourcesTitle, value: "\(difference.added.count)")
+                LabeledContent(earlierOnlySourcesTitle, value: "\(difference.removed.count)")
                 LabeledContent("Edited", value: "\(difference.edited.count)")
                 LabeledContent("Score changes", value: "\(difference.scoreChanges.count)")
                 LabeledContent("Unchanged sources", value: "\(difference.unchangedSourceCount)")
             }
         }
+    }
+
+    private var earlierOnlySourcesTitle: String {
+        guard comparesDifferentFilters, let left else { return "Only in earlier snapshot" }
+        return "Only in \(captureName(left.run))"
+    }
+
+    private var laterOnlySourcesTitle: String {
+        guard comparesDifferentFilters, let right else { return "Only in later snapshot" }
+        return "Only in \(captureName(right.run))"
     }
 
     private var subredditProgressTitle: String {

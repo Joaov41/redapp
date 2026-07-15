@@ -24783,6 +24783,40 @@ struct ContentView: View {
         colorScheme == .dark
     }
 
+    @ViewBuilder
+    private func comparisonStatusIndicator(for job: ResearchComparisonGenerationState) -> some View {
+        switch job.phase {
+        case .running:
+            ProgressView()
+                .controlSize(.small)
+                .tint(.blue)
+        case .completed:
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+        case .failed:
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+        }
+    }
+
+    private func comparisonStatusColor(
+        for phase: ResearchComparisonGenerationState.Phase
+    ) -> Color {
+        switch phase {
+        case .running: return .blue
+        case .completed: return .green
+        case .failed: return .orange
+        }
+    }
+
+    private func comparisonStatusSubtitle(for job: ResearchComparisonGenerationState) -> String {
+        switch job.phase {
+        case .running: return job.status
+        case .completed: return "Ready — tap to open"
+        case .failed: return "Needs attention — tap to review"
+        }
+    }
+
     var body: some View {
         GeometryReader { geometry in
             let useCompactLayout = shouldUseCompactLayout(for: geometry.size.width)
@@ -24803,23 +24837,22 @@ struct ContentView: View {
                     .ignoresSafeArea()
                 }
 
-                if !showResearchLibrary, let job = comparisonJobs.activeJobs.first {
+                if !showResearchLibrary, let job = comparisonJobs.latestStatusJob {
                     VStack {
                         Spacer()
-                        HStack {
+                        HStack(spacing: 9) {
                             Spacer()
                             Button {
                                 comparisonToResume = job
                                 showResearchLibrary = true
                             } label: {
                                 HStack(spacing: 12) {
-                                    ProgressView()
-                                        .controlSize(.small)
+                                    comparisonStatusIndicator(for: job)
                                     VStack(alignment: .leading, spacing: 2) {
                                         Text(job.title)
                                             .font(.subheadline.weight(.semibold))
                                             .lineLimit(1)
-                                        Text(job.status)
+                                        Text(comparisonStatusSubtitle(for: job))
                                             .font(.caption)
                                             .foregroundStyle(.secondary)
                                             .lineLimit(1)
@@ -24834,13 +24867,25 @@ struct ContentView: View {
                                 .background(.regularMaterial, in: Capsule())
                                 .overlay {
                                     Capsule()
-                                        .stroke(.primary.opacity(0.12), lineWidth: 0.75)
+                                        .stroke(comparisonStatusColor(for: job.phase).opacity(0.8), lineWidth: 1.5)
                                 }
                                 .shadow(color: .black.opacity(0.18), radius: 14, y: 7)
                             }
                             .buttonStyle(.plain)
                             .accessibilityLabel("Return to \(job.title)")
                             .accessibilityHint(job.status)
+                            if job.phase != .running {
+                                Button {
+                                    comparisonJobs.dismissStatus(key: job.id)
+                                } label: {
+                                    Image(systemName: "xmark")
+                                        .font(.caption.weight(.bold))
+                                        .frame(width: 32, height: 32)
+                                        .background(.regularMaterial, in: Circle())
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel("Dismiss comparison status")
+                            }
                         }
                     }
                     .padding(.trailing, 24)
@@ -25497,9 +25542,9 @@ struct RedditCommentsView: View {
     @State private var cloudTTSTask: Task<Void, Never>? = nil
     @State private var localTTSTask: Task<Void, Never>? = nil
 
-        private var isDarkMode: Bool {
-            colorScheme == .dark
-        }
+    private var isDarkMode: Bool {
+        colorScheme == .dark
+    }
 
         private var postReplyContextText: String {
             let trimmedContent = postContent.trimmingCharacters(in: .whitespacesAndNewlines)
