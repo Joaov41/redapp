@@ -17645,7 +17645,7 @@ struct SidebarControls: View {
             summaryProviderName: summaryService.settings.selectedSummaryProvider.displayName,
             summaryProviderIsWebAI: summaryService.settings.selectedSummaryProvider == .webAI,
             webProviderName: summaryService.settings.selectedWebAIProvider.displayName,
-            isOpenAIConfigured: !summaryService.settings.openaiApiKey.isEmpty,
+            speechEngineName: summaryService.settings.localTTSEngine.displayName,
             throughputText: macThroughputText,
             focusedField: focusedField,
             shareItems: batchCommentsExportItems,

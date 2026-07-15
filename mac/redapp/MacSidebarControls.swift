@@ -79,7 +79,7 @@ struct MacSidebarControls: View {
     let summaryProviderName: String
     let summaryProviderIsWebAI: Bool
     let webProviderName: String
-    let isOpenAIConfigured: Bool
+    let speechEngineName: String
     let throughputText: String?
     let focusedField: FocusState<SidebarControls.Field?>.Binding
     let shareItems: [Any]
@@ -454,17 +454,10 @@ struct MacSidebarControls: View {
     }
 
     private var speechStatus: some View {
-        Group {
-            if isOpenAIConfigured {
-                Label("Speech: OpenAI configured", systemImage: "waveform")
-                    .foregroundStyle(.secondary)
-            } else {
-                Label("Speech: OpenAI setup needed", systemImage: "exclamationmark.triangle.fill")
-                    .foregroundStyle(.orange)
-            }
-        }
-        .lineLimit(1)
-        .help(isOpenAIConfigured ? "OpenAI speech API key is configured" : "OpenAI speech API key is missing")
+        Label("Speech: \(speechEngineName)", systemImage: "waveform")
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .help("Active local speech engine: \(speechEngineName)")
     }
 }
 
