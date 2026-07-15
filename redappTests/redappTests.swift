@@ -10,6 +10,27 @@ import XCTest
 @testable import redapp
 
 final class redappTests: XCTestCase {
+    func testMLXReportSpeechChunkingKeepsEveryChunkWithinModelLimit() {
+        let report = Array(repeating: "A meaningful sentence about the subreddit and its discussion.", count: 40)
+            .joined(separator: " ")
+        let chunks = KokoroTTSService.shared.speechChunks(from: report)
+
+        XCTAssertGreaterThan(chunks.count, 1)
+        XCTAssertLessThanOrEqual(chunks.first?.count ?? .max, 140)
+        XCTAssertTrue(chunks.dropFirst().allSatisfy { $0.count <= 220 })
+        XCTAssertTrue(chunks.allSatisfy { !$0.isEmpty })
+        XCTAssertEqual(chunks.joined(separator: " "), report)
+    }
+
+    func testMLXReportSpeechChunkingSplitsAnOversizedToken() {
+        let chunks = KokoroTTSService.shared.speechChunks(
+            from: String(repeating: "a", count: 500)
+        )
+
+        XCTAssertEqual(chunks.map(\.count), [140, 220, 140])
+        XCTAssertEqual(chunks.joined(), String(repeating: "a", count: 500))
+    }
+
     private func source(
         id: String = "t1_comment",
         postID: String = "t3_post",
