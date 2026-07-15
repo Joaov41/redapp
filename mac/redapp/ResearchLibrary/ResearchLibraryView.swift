@@ -51,11 +51,15 @@ struct ResearchLibraryView: View {
     @ObservedObject private var store = ResearchLibraryStore.shared
     @ObservedObject private var comparisonJobs = ResearchComparisonGenerationCoordinator.shared
     @Environment(\.dismiss) private var dismiss
+#if os(macOS)
+    @Environment(\.openWindow) private var openWindow
+#endif
     @Binding private var navigationPath: NavigationPath
     @State private var searchText = ""
     @State private var selectedTags = Set<String>()
     @State private var presentedExport: ResearchExportDocument?
     @State private var communityComparisons: [ResearchCommunityComparisonRecord] = []
+    @State private var communityComparisonPendingDeletion: ResearchCommunityComparisonRecord?
     @State private var errorMessage: String?
 
     init(
@@ -109,21 +113,32 @@ struct ResearchLibraryView: View {
                 if !communityComparisons.isEmpty {
                     Section("Community comparisons") {
                         ForEach(communityComparisons) { comparison in
-                            NavigationLink(value: ResearchLibraryRoute.communityComparison(id: comparison.id)) {
-                                VStack(alignment: .leading, spacing: 5) {
-                                    Text(comparison.subject)
-                                        .font(.headline)
-                                    if let names = communityNames(for: comparison) {
-                                        Text(names)
-                                            .font(.subheadline)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                    Text(comparisonStatus(comparison))
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
+#if os(macOS)
+                            HStack(spacing: 8) {
+                                NavigationLink(value: ResearchLibraryRoute.communityComparison(id: comparison.id)) {
+                                    communityComparisonLabel(comparison)
                                 }
-                                .padding(.vertical, 3)
+                                Button(role: .destructive) {
+                                    communityComparisonPendingDeletion = comparison
+                                } label: {
+                                    Image(systemName: "trash")
+                                }
+                                .buttonStyle(.borderless)
+                                .help("Delete this community comparison")
+                                .accessibilityLabel("Delete \(comparison.subject) comparison")
                             }
+                            .contextMenu {
+                                Button(role: .destructive) {
+                                    communityComparisonPendingDeletion = comparison
+                                } label: {
+                                    Label("Delete Comparison…", systemImage: "trash")
+                                }
+                            }
+#else
+                            NavigationLink(value: ResearchLibraryRoute.communityComparison(id: comparison.id)) {
+                                communityComparisonLabel(comparison)
+                            }
+#endif
                         }
                     }
                 }
@@ -191,6 +206,16 @@ struct ResearchLibraryView: View {
                 placement: .toolbar,
                 prompt: "Search saved research"
             )
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        openWindow(id: ScheduledSummaryManager.windowID)
+                    } label: {
+                        Label("Scheduled Summaries", systemImage: "calendar.badge.clock")
+                    }
+                    .help("Open Scheduled Summaries")
+                }
+            }
 #else
             .listStyle(.insetGrouped)
             .navigationTitle("Research Library")
@@ -245,6 +270,21 @@ struct ResearchLibraryView: View {
             } message: {
                 Text(errorMessage ?? store.lastError ?? "Unknown error")
             }
+#if os(macOS)
+            .alert("Delete community comparison?", isPresented: Binding(
+                get: { communityComparisonPendingDeletion != nil },
+                set: { if !$0 { communityComparisonPendingDeletion = nil } }
+            )) {
+                Button("Cancel", role: .cancel) {
+                    communityComparisonPendingDeletion = nil
+                }
+                Button("Delete", role: .destructive) {
+                    deletePendingCommunityComparison()
+                }
+            } message: {
+                Text("This removes the comparison and its generated answers. The two saved subreddit batches will remain in the Research Library.")
+            }
+#endif
         }
         .toolbar {
 #if os(macOS)
@@ -314,6 +354,22 @@ struct ResearchLibraryView: View {
         return "r/\(first.subreddit) and r/\(second.subreddit)"
     }
 
+    private func communityComparisonLabel(_ comparison: ResearchCommunityComparisonRecord) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(comparison.subject)
+                .font(.headline)
+            if let names = communityNames(for: comparison) {
+                Text(names)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+            Text(comparisonStatus(comparison))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 3)
+    }
+
     private func comparisonStatus(_ comparison: ResearchCommunityComparisonRecord) -> String {
         switch comparison.state {
         case .preparing, .running: return "Comparison in progress"
@@ -321,6 +377,21 @@ struct ResearchLibraryView: View {
         case .failed: return "Needs attention"
         }
     }
+
+#if os(macOS)
+    private func deletePendingCommunityComparison() {
+        guard let comparison = communityComparisonPendingDeletion else { return }
+        communityComparisonPendingDeletion = nil
+        let jobKey = "community:\(comparison.id.uuidString)"
+        comparisonJobs.cancelAndDismiss(key: jobKey)
+        do {
+            try store.deleteCommunityComparison(id: comparison.id)
+            communityComparisons.removeAll { $0.id == comparison.id }
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+#endif
 
     private func perform(_ operation: () throws -> Void) {
         do { try operation() } catch { errorMessage = error.localizedDescription }
@@ -1763,6 +1834,9 @@ struct ResearchSourceDetailView: View {
         }
         .researchLibraryBlackSurface()
         .navigationTitle(source.kind == .post ? "Supporting Post" : "Supporting Comment")
+#if os(macOS)
+        .frame(minWidth: 720, idealWidth: 820, minHeight: 560, idealHeight: 680)
+#endif
         .toolbar {
             if showsDoneButton {
                 ToolbarItem(placement: .confirmationAction) {
@@ -1876,6 +1950,11 @@ final class ResearchComparisonGenerationCoordinator: ObservableObject {
 
     func dismissStatus(key: String) {
         guard states[key]?.phase != .running else { return }
+        states.removeValue(forKey: key)
+    }
+
+    func cancelAndDismiss(key: String) {
+        tasks.removeValue(forKey: key)?.cancel()
         states.removeValue(forKey: key)
     }
 }

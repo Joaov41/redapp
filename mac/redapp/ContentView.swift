@@ -21496,8 +21496,19 @@ struct BatchResultsView: View {
         let iconSpacing: CGFloat = isBatchResultsCompactLayout ? 2 : 10
         let horizontalPadding: CGFloat = isBatchResultsCompactLayout ? 4 : 8
         let verticalPadding: CGFloat = isBatchResultsCompactLayout ? 4 : 6
-        let tint = Color.white
 
+#if os(macOS)
+        HStack(spacing: iconSpacing) {
+            content()
+        }
+        .padding(.horizontal, horizontalPadding)
+        .padding(.vertical, verticalPadding)
+        .glassEffect(
+            .regular,
+            in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        )
+#else
+        let tint = Color.white
         HStack(spacing: iconSpacing) {
             content()
         }
@@ -21512,6 +21523,7 @@ struct BatchResultsView: View {
                         .strokeBorder(Color.white.opacity(0.16), lineWidth: 1)
                 }
         }
+#endif
     }
 
     @ViewBuilder
@@ -26676,6 +26688,28 @@ struct ContentView: View {
             .shadow(color: Color.black.opacity(isDarkMode ? 0.28 : 0.12), radius: 18, y: 10)
     }
 
+#if os(macOS)
+    private func presentResearchLibraryFromToolbar() {
+        comparisonToResume = nil
+        researchLibraryNavigationPath = NavigationPath()
+        isResearchLibraryExplicitlyClosing = false
+        isResearchLibraryMinimized = false
+
+        // A macOS sheet can leave its binding true when its parent window is
+        // restored after another app window was active. Force a fresh
+        // presentation cycle so the toolbar button always reopens the library.
+        if showResearchLibrary {
+            showResearchLibrary = false
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(150))
+                showResearchLibrary = true
+            }
+        } else {
+            showResearchLibrary = true
+        }
+    }
+#endif
+
     @ToolbarContentBuilder
     private var primaryToolbarContent: some ToolbarContent {
         #if os(iOS)
@@ -26712,11 +26746,7 @@ struct ContentView: View {
         ToolbarItem(placement: .automatic) {
             HStack(spacing: 16) {
                 Button(action: {
-                    comparisonToResume = nil
-                    researchLibraryNavigationPath = NavigationPath()
-                    isResearchLibraryExplicitlyClosing = false
-                    isResearchLibraryMinimized = false
-                    showResearchLibrary = true
+                    presentResearchLibraryFromToolbar()
                 }) {
                     Image(systemName: "books.vertical")
                 }
@@ -30263,6 +30293,9 @@ struct RedditCommentsView: View {
             RedappSummarizeBridgeServer.shared.reconfigure(settings: SummaryService.shared.settings)
             SummaryService.shared.warmUpKokoroIfNeeded()
             SummaryService.shared.warmUpMLXIfNeeded()
+            Task { @MainActor in
+                ScheduledSummaryManager.shared.start()
+            }
         }
         #endif
         var body: some Scene {
@@ -30288,12 +30321,32 @@ struct RedditCommentsView: View {
             .windowToolbarStyle(.unified(showsTitle: false))
             .commands {
                 MacSidebarCommands()
+                ScheduledSummaryCommands()
             }
+            #endif
+
+            #if os(macOS)
+            Window("Scheduled Summaries", id: ScheduledSummaryManager.windowID) {
+                ScheduledSummariesView()
+                    .frame(minWidth: 940, minHeight: 680)
+                    .onOpenURL { url in
+                        _ = ScheduledSummaryManager.shared.handle(url: url)
+                    }
+            }
+            .defaultSize(width: 1080, height: 780)
+            .windowResizability(.contentMinSize)
+            .handlesExternalEvents(matching: ["scheduled-summaries"])
             #endif
         }
 
         private func handleURLCallback(_ url: URL) {
             print("🔗 [RedditApp] Received URL callback: \(url.absoluteString)")
+
+            #if os(macOS)
+            if ScheduledSummaryManager.shared.handle(url: url) {
+                return
+            }
+            #endif
 
             // Handle success callback from x-callback-url
             if url.scheme == "redapp" && url.host == "shortcut-success" {

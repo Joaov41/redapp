@@ -16674,10 +16674,10 @@ struct SidebarHeader: View {
             // TTS indicator
             HStack(spacing: 4) {
                 Circle()
-                    .fill(!summaryService.settings.openaiApiKey.isEmpty ? .green : .orange)
+                    .fill(.green)
                     .frame(width: 8, height: 8)
 
-                Text("TTS: OpenAI")
+                Text("Speech: \(summaryService.settings.localTTSEngine.displayName)")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }

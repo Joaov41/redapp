@@ -362,10 +362,20 @@ struct ResearchCommunityComparisonSetupView: View {
                     LabeledContent("Second", value: "r/\(second.subreddit)")
                 }
                 Section("Subject to compare") {
-                    TextField("For example: pricing, moderation, or model quality", text: $subject, axis: .vertical)
+                    TextField(
+                        "Subject",
+                        text: $subject,
+                        prompt: Text("For example: pricing, moderation, or model quality"),
+                        axis: .vertical
+                    )
+                    .labelsHidden()
+                    .lineLimit(1...3)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     Text("The comparison will stay focused on this subject instead of trying to compare everything in both subreddits.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 let compatibility = ResearchCommunityCompatibility.evaluate(base: first, candidate: second)
                 Section("Comparison quality") {
@@ -431,6 +441,7 @@ struct ResearchCommunityComparisonView: View {
     let comparisonID: UUID
     @ObservedObject private var store = ResearchLibraryStore.shared
     @ObservedObject private var jobs = ResearchComparisonGenerationCoordinator.shared
+    @Environment(\.dismiss) private var dismiss
     @Environment(\.researchLibraryMinimizeAction) private var minimizeResearchLibrary
     @State private var record: ResearchCommunityComparisonRecord?
     @State private var first: ResearchRunDetail?
@@ -444,6 +455,7 @@ struct ResearchCommunityComparisonView: View {
     @State private var isAskingQuestion = false
     @State private var selectedSource: ResearchSourceRecord?
     @State private var showCompatibility = false
+    @State private var showDeleteConfirmation = false
     @State private var errorMessage: String?
 
     private var jobKey: String { "community:\(comparisonID.uuidString)" }
@@ -502,6 +514,19 @@ struct ResearchCommunityComparisonView: View {
         }
         .researchLibraryBlackSurface()
         .navigationTitle(record.map { "\($0.subject)" } ?? "Community Comparison")
+#if os(macOS)
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button(role: .destructive) {
+                    showDeleteConfirmation = true
+                } label: {
+                    Label("Delete Comparison", systemImage: "trash")
+                }
+                .disabled(isAskingQuestion)
+                .help(isAskingQuestion ? "Wait for the current answer to finish" : "Delete this comparison")
+            }
+        }
+#endif
         .sheet(item: $selectedSource) { source in
             NavigationStack { ResearchSourceDetailView(source: source) }
         }
@@ -515,6 +540,14 @@ struct ResearchCommunityComparisonView: View {
         )) { Button("OK", role: .cancel) {} } message: {
             Text(errorMessage ?? "Unknown error")
         }
+#if os(macOS)
+        .alert("Delete community comparison?", isPresented: $showDeleteConfirmation) {
+            Button("Cancel", role: .cancel) {}
+            Button("Delete", role: .destructive) { deleteComparison() }
+        } message: {
+            Text("This removes the comparison and its generated answers. The two saved subreddit batches will remain in the Research Library.")
+        }
+#endif
     }
 
     private func communityRow(_ detail: ResearchRunDetail) -> some View {
@@ -694,6 +727,18 @@ struct ResearchCommunityComparisonView: View {
         guard needsStart else { return }
         startGeneration(record: record, first: first, second: second)
     }
+
+#if os(macOS)
+    private func deleteComparison() {
+        jobs.cancelAndDismiss(key: jobKey)
+        do {
+            try store.deleteCommunityComparison(id: comparisonID)
+            dismiss()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+#endif
 
     private func load() {
         do {
