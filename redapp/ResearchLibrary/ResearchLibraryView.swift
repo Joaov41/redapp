@@ -1,11 +1,11 @@
 import AVFoundation
 import SwiftUI
 
-private struct ResearchLibraryMinimizeActionKey: EnvironmentKey {
+struct ResearchLibraryMinimizeActionKey: EnvironmentKey {
     static let defaultValue: () -> Void = {}
 }
 
-private extension EnvironmentValues {
+extension EnvironmentValues {
     var researchLibraryMinimizeAction: () -> Void {
         get { self[ResearchLibraryMinimizeActionKey.self] }
         set { self[ResearchLibraryMinimizeActionKey.self] = newValue }
@@ -14,6 +14,7 @@ private extension EnvironmentValues {
 
 private enum ResearchLibraryRoute: Hashable {
     case comparison(leftRunID: UUID, rightRunID: UUID)
+    case communityComparison(id: UUID)
 }
 
 @MainActor
@@ -26,6 +27,7 @@ struct ResearchLibraryView: View {
     @State private var searchText = ""
     @State private var selectedTags = Set<String>()
     @State private var presentedExport: ResearchExportDocument?
+    @State private var communityComparisons: [ResearchCommunityComparisonRecord] = []
     @State private var errorMessage: String?
 
     init(initialComparison: ResearchComparisonGenerationState? = nil) {
@@ -45,10 +47,14 @@ struct ResearchLibraryView: View {
                     Section("Comparison in progress") {
                         ForEach(comparisonJobs.activeJobs) { job in
                             NavigationLink {
-                                ResearchComparisonView(
-                                    leftRunID: job.leftRunID,
-                                    rightRunID: job.rightRunID
-                                )
+                                if let comparisonID = job.communityComparisonID {
+                                    ResearchCommunityComparisonView(comparisonID: comparisonID)
+                                } else {
+                                    ResearchComparisonView(
+                                        leftRunID: job.leftRunID,
+                                        rightRunID: job.rightRunID
+                                    )
+                                }
                             } label: {
                                 VStack(alignment: .leading, spacing: 7) {
                                     HStack {
@@ -59,6 +65,30 @@ struct ResearchLibraryView: View {
                                     }
                                     ProgressView(value: job.progress)
                                     Text(job.status)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                .padding(.vertical, 3)
+                            }
+                        }
+                    }
+                }
+
+                if !communityComparisons.isEmpty {
+                    Section("Community comparisons") {
+                        ForEach(communityComparisons) { comparison in
+                            NavigationLink {
+                                ResearchCommunityComparisonView(comparisonID: comparison.id)
+                            } label: {
+                                VStack(alignment: .leading, spacing: 5) {
+                                    Text(comparison.subject)
+                                        .font(.headline)
+                                    if let names = communityNames(for: comparison) {
+                                        Text(names)
+                                            .font(.subheadline)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Text(comparisonStatus(comparison))
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
@@ -145,15 +175,19 @@ struct ResearchLibraryView: View {
                 switch route {
                 case .comparison(let leftRunID, let rightRunID):
                     ResearchComparisonView(leftRunID: leftRunID, rightRunID: rightRunID)
+                case .communityComparison(let id):
+                    ResearchCommunityComparisonView(comparisonID: id)
                 }
             }
             .task(id: ResearchSearchRequest(query: searchText, tags: selectedTags)) {
                 try? await Task.sleep(for: .milliseconds(220))
                 guard !Task.isCancelled else { return }
                 store.reload(searchText: searchText, tags: selectedTags)
+                communityComparisons = (try? store.communityComparisons()) ?? []
             }
             .refreshable {
                 store.reload(searchText: searchText, tags: selectedTags)
+                communityComparisons = (try? store.communityComparisons()) ?? []
             }
             .alert("Research Library", isPresented: Binding(
                 get: { errorMessage != nil || store.lastError != nil },
@@ -167,12 +201,30 @@ struct ResearchLibraryView: View {
         .environment(\.researchLibraryMinimizeAction, { dismiss() })
         .task(id: initialComparison?.id) {
             guard let initialComparison, navigationPath.isEmpty else { return }
-            navigationPath.append(
-                ResearchLibraryRoute.comparison(
-                    leftRunID: initialComparison.leftRunID,
-                    rightRunID: initialComparison.rightRunID
+            if let comparisonID = initialComparison.communityComparisonID {
+                navigationPath.append(ResearchLibraryRoute.communityComparison(id: comparisonID))
+            } else {
+                navigationPath.append(
+                    ResearchLibraryRoute.comparison(
+                        leftRunID: initialComparison.leftRunID,
+                        rightRunID: initialComparison.rightRunID
+                    )
                 )
-            )
+            }
+        }
+    }
+
+    private func communityNames(for comparison: ResearchCommunityComparisonRecord) -> String? {
+        guard let first = try? store.run(id: comparison.leftRunID),
+              let second = try? store.run(id: comparison.rightRunID) else { return nil }
+        return "r/\(first.subreddit) and r/\(second.subreddit)"
+    }
+
+    private func comparisonStatus(_ comparison: ResearchCommunityComparisonRecord) -> String {
+        switch comparison.state {
+        case .preparing, .running: return "Comparison in progress"
+        case .ready: return "Ready · \(comparison.updatedAt.formatted(date: .abbreviated, time: .shortened))"
+        case .failed: return "Needs attention"
         }
     }
 
@@ -247,8 +299,7 @@ struct ResearchItemDetailView: View {
                     }
                 }
 
-                if let latestRun = runs.first,
-                   runs.count >= 2 || !crossFilterRuns.isEmpty {
+                if let latestRun = runs.first {
                     Section("Compare") {
                         if runs.count >= 2 {
                             NavigationLink {
@@ -268,6 +319,17 @@ struct ResearchItemDetailView: View {
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
+                            }
+                        }
+
+                        NavigationLink {
+                            ResearchCommunityComparisonPickerView(baseRunID: latestRun.id)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Label("Compare with another subreddit", systemImage: "person.2.wave.2")
+                                Text("Choose a saved community and a subject")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
                             }
                         }
                     }
@@ -1557,6 +1619,7 @@ struct ResearchComparisonGenerationState: Equatable, Identifiable {
     var id: String
     var leftRunID: UUID
     var rightRunID: UUID
+    var communityComparisonID: UUID?
     var title: String
     var phase: Phase
     var status: String
@@ -1595,6 +1658,7 @@ final class ResearchComparisonGenerationCoordinator: ObservableObject {
         key: String,
         leftRunID: UUID,
         rightRunID: UUID,
+        communityComparisonID: UUID? = nil,
         title: String,
         status: String,
         progress: Double
@@ -1604,6 +1668,7 @@ final class ResearchComparisonGenerationCoordinator: ObservableObject {
             id: key,
             leftRunID: leftRunID,
             rightRunID: rightRunID,
+            communityComparisonID: communityComparisonID,
             title: title,
             phase: .running,
             status: status,

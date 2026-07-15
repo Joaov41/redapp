@@ -16,6 +16,7 @@ enum ResearchArtifactKind: String, Codable, CaseIterable, Sendable {
     case questionAnswer
     case conversationAnswer
     case changeReport
+    case communityComparison
 
     var displayName: String {
         switch self {
@@ -30,6 +31,7 @@ enum ResearchArtifactKind: String, Codable, CaseIterable, Sendable {
         case .questionAnswer: return "Q&A"
         case .conversationAnswer: return "Conversation Answer"
         case .changeReport: return "What Changed"
+        case .communityComparison: return "Community Comparison"
         }
     }
 }
@@ -702,6 +704,59 @@ final class ResearchDraftRecord {
     }
 }
 
+enum ResearchCommunityComparisonState: String, Codable, Sendable {
+    case preparing
+    case running
+    case ready
+    case failed
+}
+
+@Model
+final class ResearchCommunityComparisonRecord {
+    @Attribute(.unique) var id: UUID
+    var leftRunID: UUID
+    var rightRunID: UUID
+    var subject: String
+    var stateRawValue: String
+    var artifactID: UUID?
+    var createdAt: Date
+    var updatedAt: Date
+    var completedAt: Date?
+    var compatibilityJSON: String
+    var failureMessage: String?
+
+    init(
+        id: UUID = UUID(),
+        leftRunID: UUID,
+        rightRunID: UUID,
+        subject: String,
+        state: ResearchCommunityComparisonState = .preparing,
+        artifactID: UUID? = nil,
+        createdAt: Date = Date(),
+        updatedAt: Date = Date(),
+        completedAt: Date? = nil,
+        compatibilityJSON: String = "",
+        failureMessage: String? = nil
+    ) {
+        self.id = id
+        self.leftRunID = leftRunID
+        self.rightRunID = rightRunID
+        self.subject = subject
+        self.stateRawValue = state.rawValue
+        self.artifactID = artifactID
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.completedAt = completedAt
+        self.compatibilityJSON = compatibilityJSON
+        self.failureMessage = failureMessage
+    }
+
+    var state: ResearchCommunityComparisonState {
+        get { ResearchCommunityComparisonState(rawValue: stateRawValue) ?? .failed }
+        set { stateRawValue = newValue.rawValue }
+    }
+}
+
 enum ResearchSchemaV1: VersionedSchema {
     static var versionIdentifier = Schema.Version(1, 0, 0)
 
@@ -721,9 +776,31 @@ enum ResearchSchemaV1: VersionedSchema {
     }
 }
 
+enum ResearchSchemaV2: VersionedSchema {
+    static var versionIdentifier = Schema.Version(2, 0, 0)
+
+    static var models: [any PersistentModel.Type] {
+        [
+            ResearchItemRecord.self,
+            ResearchRunRecord.self,
+            ResearchSourceRecord.self,
+            ResearchArtifactRecord.self,
+            ResearchClaimRecord.self,
+            ResearchCitationRecord.self,
+            ResearchConversationRecord.self,
+            ResearchConversationTurnRecord.self,
+            ResearchOfflineAssetRecord.self,
+            ResearchDraftRecord.self,
+            ResearchCommunityComparisonRecord.self
+        ]
+    }
+}
+
 enum ResearchMigrationPlan: SchemaMigrationPlan {
-    static var schemas: [any VersionedSchema.Type] { [ResearchSchemaV1.self] }
-    static var stages: [MigrationStage] { [] }
+    static var schemas: [any VersionedSchema.Type] { [ResearchSchemaV1.self, ResearchSchemaV2.self] }
+    static var stages: [MigrationStage] {
+        [.lightweight(fromVersion: ResearchSchemaV1.self, toVersion: ResearchSchemaV2.self)]
+    }
 }
 
 enum ResearchJSON {

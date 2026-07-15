@@ -76,6 +76,153 @@ final class redappTests: XCTestCase {
         )
     }
 
+    @MainActor
+    func testFindsAndPersistsComparisonWithAnotherCommunity() throws {
+        let store = ResearchLibraryStore(inMemory: true)
+        var coverage = ResearchCoverageInput.empty
+        coverage.postsRequested = 1
+        coverage.postsFetched = 1
+        coverage.postsAnalyzed = 1
+
+        func save(_ subreddit: String, sort: String = "hot") throws -> ResearchRunRecord {
+            try store.saveBatch(
+                ResearchBatchSaveRequest(
+                    title: "r/\(subreddit) Research",
+                    scope: "subreddit|\(subreddit)|\(sort)|all",
+                    subreddit: subreddit,
+                    feedMode: "subreddit",
+                    sortMode: sort,
+                    timeRange: "all",
+                    sources: [source(id: "t3_\(subreddit)", postID: "t3_\(subreddit)")],
+                    coverage: coverage,
+                    perPostSummaries: [],
+                    overallSummary: nil,
+                    generationReceipt: nil
+                )
+            )
+        }
+
+        let openAI = try save("OpenAI")
+        let swiftUI = try save("SwiftUI")
+        _ = try save("OpenAI", sort: "new")
+
+        let candidates = try store.communityComparisonRuns(for: openAI.id)
+        XCTAssertEqual(candidates.map(\.id), [swiftUI.id])
+
+        let compatibility = ResearchCommunityCompatibility.evaluate(base: openAI, candidate: swiftUI)
+        let record = try store.createCommunityComparison(
+            leftRunID: openAI.id,
+            rightRunID: swiftUI.id,
+            subject: "AI-generated interfaces",
+            compatibilityJSON: ResearchJSON.encode(compatibility)
+        )
+        XCTAssertEqual(try store.communityComparison(id: record.id)?.subject, "AI-generated interfaces")
+        XCTAssertEqual(try store.communityComparisons(runID: swiftUI.id).map(\.id), [record.id])
+    }
+
+    func testCommunityCompatibilityExplainsSampleMismatches() {
+        let itemID = UUID()
+        var firstCoverage = ResearchCoverageInput.empty
+        firstCoverage.postsAnalyzed = 50
+        firstCoverage.commentsAnalyzed = 500
+        var secondCoverage = ResearchCoverageInput.empty
+        secondCoverage.postsAnalyzed = 20
+        secondCoverage.commentsAnalyzed = 40
+        let first = ResearchRunRecord(
+            itemID: itemID,
+            revision: 1,
+            state: .ready,
+            capturedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            feedMode: "subreddit",
+            subreddit: "OpenAI",
+            sortMode: "top",
+            timeRange: "day",
+            sourceDigest: "a",
+            coverage: firstCoverage,
+            appBuild: "test"
+        )
+        let second = ResearchRunRecord(
+            itemID: UUID(),
+            revision: 1,
+            state: .partial,
+            capturedAt: Date(timeIntervalSince1970: 1_702_000_000),
+            feedMode: "subreddit",
+            subreddit: "LocalLLaMA",
+            sortMode: "hot",
+            timeRange: "all",
+            sourceDigest: "b",
+            coverage: secondCoverage,
+            appBuild: "test"
+        )
+
+        let result = ResearchCommunityCompatibility.evaluate(base: first, candidate: second)
+        XCTAssertLessThan(result.score, 62)
+        XCTAssertFalse(result.feedTypesMatch)
+        XCTAssertFalse(result.timeRangesMatch)
+        XCTAssertGreaterThanOrEqual(result.warnings.count, 4)
+    }
+
+    func testCommunitySourceReferencesKeepBothSidesDistinct() throws {
+        let sourceID = "t1_same"
+        let first = ResearchCommunitySourceReference(
+            side: .first,
+            runID: UUID(),
+            subreddit: "OpenAI",
+            sourceID: sourceID
+        )
+        let second = ResearchCommunitySourceReference(
+            side: .second,
+            runID: UUID(),
+            subreddit: "LocalLLaMA",
+            sourceID: sourceID
+        )
+
+        XCTAssertNotEqual(first.encodedID, second.encodedID)
+        XCTAssertEqual(try XCTUnwrap(ResearchCommunitySourceReference.parse(first.encodedID)), first)
+        XCTAssertEqual(try XCTUnwrap(ResearchCommunitySourceReference.parse(second.encodedID)), second)
+    }
+
+    func testDirectCommunityComparisonRequiresEvidenceFromBothSides() {
+        let first = ResearchCommunitySourceReference(
+            side: .first,
+            runID: UUID(),
+            subreddit: "OpenAI",
+            sourceID: "t3_first"
+        )
+        let second = ResearchCommunitySourceReference(
+            side: .second,
+            runID: UUID(),
+            subreddit: "LocalLLaMA",
+            sourceID: "t3_second"
+        )
+        let response = ValidatedGroundedResponse(
+            title: "Comparison",
+            overview: nil,
+            claims: [
+                ResearchClaimInput(
+                    order: 0,
+                    text: "Both communities emphasize practical use.",
+                    claimType: "common_ground",
+                    citations: [.init(sourceID: first.encodedID), .init(sourceID: second.encodedID)],
+                    confidence: .medium
+                ),
+                ResearchClaimInput(
+                    order: 1,
+                    text: "The communities differ in tone.",
+                    claimType: "biggest_difference",
+                    citations: [.init(sourceID: first.encodedID)],
+                    confidence: .low
+                )
+            ],
+            conflicts: [],
+            missingData: []
+        )
+
+        let checked = ResearchCommunityComparisonService.enforceTwoSidedComparisons(response)
+        XCTAssertEqual(checked.claims.map(\.text), ["Both communities emphasize practical use."])
+        XCTAssertTrue(checked.missingData.contains { $0.contains("both communities") })
+    }
+
     func testMLXReportSpeechChunkingKeepsEveryChunkWithinModelLimit() {
         let report = Array(repeating: "A meaningful sentence about the subreddit and its discussion.", count: 40)
             .joined(separator: " ")

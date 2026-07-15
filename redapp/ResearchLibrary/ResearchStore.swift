@@ -213,7 +213,7 @@ final class ResearchLibraryStore: ObservableObject {
     init(inMemory: Bool = false) {
         var resolvedStorageURL: URL?
         do {
-            let schema = Schema(versionedSchema: ResearchSchemaV1.self)
+            let schema = Schema(versionedSchema: ResearchSchemaV2.self)
             let configuration: ModelConfiguration
 
             if inMemory {
@@ -246,7 +246,7 @@ final class ResearchLibraryStore: ObservableObject {
             isReady = true
             reload()
         } catch {
-            let schema = Schema(versionedSchema: ResearchSchemaV1.self)
+            let schema = Schema(versionedSchema: ResearchSchemaV2.self)
             let fallback = ModelConfiguration(
                 "ResearchLibraryFallback",
                 schema: schema,
@@ -559,6 +559,83 @@ final class ResearchLibraryStore: ObservableObject {
                 ) != baseFilter
             }
             .sorted { $0.capturedAt > $1.capturedAt }
+    }
+
+    func communityComparisonRuns(for baseRunID: UUID) throws -> [ResearchRunRecord] {
+        guard let baseRun = try run(id: baseRunID) else {
+            throw ResearchStoreError.runNotFound
+        }
+        let baseSubreddit = Self.normalized(baseRun.subreddit)
+        return try context.fetch(FetchDescriptor<ResearchRunRecord>())
+            .filter { candidate in
+                candidate.id != baseRun.id
+                    && Self.normalized(candidate.subreddit) != baseSubreddit
+                    && candidate.state != .capturing
+                    && candidate.state != .failed
+            }
+            .sorted { lhs, rhs in
+                let leftScore = ResearchCommunityCompatibility.score(base: baseRun, candidate: lhs)
+                let rightScore = ResearchCommunityCompatibility.score(base: baseRun, candidate: rhs)
+                return leftScore == rightScore ? lhs.capturedAt > rhs.capturedAt : leftScore > rightScore
+            }
+    }
+
+    @discardableResult
+    func createCommunityComparison(
+        leftRunID: UUID,
+        rightRunID: UUID,
+        subject: String,
+        compatibilityJSON: String
+    ) throws -> ResearchCommunityComparisonRecord {
+        guard try run(id: leftRunID) != nil, try run(id: rightRunID) != nil else {
+            throw ResearchStoreError.runNotFound
+        }
+        let record = ResearchCommunityComparisonRecord(
+            leftRunID: leftRunID,
+            rightRunID: rightRunID,
+            subject: subject,
+            compatibilityJSON: compatibilityJSON
+        )
+        context.insert(record)
+        try context.save()
+        return record
+    }
+
+    func communityComparison(id: UUID) throws -> ResearchCommunityComparisonRecord? {
+        var descriptor = FetchDescriptor<ResearchCommunityComparisonRecord>(
+            predicate: #Predicate { $0.id == id }
+        )
+        descriptor.fetchLimit = 1
+        return try context.fetch(descriptor).first
+    }
+
+    func communityComparisons(runID: UUID? = nil) throws -> [ResearchCommunityComparisonRecord] {
+        try context.fetch(
+            FetchDescriptor<ResearchCommunityComparisonRecord>(
+                sortBy: [SortDescriptor(\.updatedAt, order: .reverse)]
+            )
+        ).filter { record in
+            guard let runID else { return true }
+            return record.leftRunID == runID || record.rightRunID == runID
+        }
+    }
+
+    func updateCommunityComparison(
+        id: UUID,
+        state: ResearchCommunityComparisonState,
+        artifactID: UUID? = nil,
+        failureMessage: String? = nil
+    ) throws {
+        guard let record = try communityComparison(id: id) else {
+            throw ResearchStoreError.runNotFound
+        }
+        record.state = state
+        record.artifactID = artifactID ?? record.artifactID
+        record.failureMessage = failureMessage
+        record.updatedAt = Date()
+        if state == .ready { record.completedAt = Date() }
+        try context.save()
+        reloadCurrentQuery()
     }
 
     func run(id: UUID) throws -> ResearchRunRecord? {
@@ -988,6 +1065,9 @@ final class ResearchLibraryStore: ObservableObject {
     }
 
     private func deleteRun(id: UUID) throws {
+        for comparison in try communityComparisons(runID: id) {
+            context.delete(comparison)
+        }
         if let directory = try? Self.researchDirectory()
             .appendingPathComponent("Assets/\(id.uuidString)", isDirectory: true),
            FileManager.default.fileExists(atPath: directory.path) {
