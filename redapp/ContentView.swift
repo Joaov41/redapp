@@ -24774,6 +24774,7 @@ struct ContentView: View {
     @State private var showSettings = false
     @State private var showCreatePost = false
     @State private var showResearchLibrary = false
+    @State private var isResearchLibraryMinimized = false
     @State private var comparisonToResume: ResearchComparisonGenerationState?
     @State private var sidebarOverlayHeight: CGFloat = 180
     @State private var isSidebarScrolling = false
@@ -24852,61 +24853,106 @@ struct ContentView: View {
                     .ignoresSafeArea()
                 }
 
-                if !showResearchLibrary, let job = comparisonJobs.latestStatusJob {
-                    VStack {
-                        Spacer()
-                        HStack(spacing: 9) {
+                if !showResearchLibrary {
+                    if let job = comparisonJobs.latestStatusJob {
+                        VStack {
                             Spacer()
-                            Button {
-                                comparisonToResume = job
-                                showResearchLibrary = true
-                            } label: {
-                                HStack(spacing: 12) {
-                                    comparisonStatusIndicator(for: job)
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(job.title)
-                                            .font(.subheadline.weight(.semibold))
-                                            .lineLimit(1)
-                                        Text(comparisonStatusSubtitle(for: job))
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                            .lineLimit(1)
-                                    }
-                                    Image(systemName: "chevron.up")
-                                        .font(.caption.weight(.semibold))
-                                        .foregroundStyle(.secondary)
-                                }
-                                .padding(.horizontal, 16)
-                                .padding(.vertical, 11)
-                                .frame(maxWidth: 340, alignment: .leading)
-                                .background(.regularMaterial, in: Capsule())
-                                .overlay {
-                                    Capsule()
-                                        .stroke(comparisonStatusColor(for: job.phase).opacity(0.8), lineWidth: 1.5)
-                                }
-                                .shadow(color: .black.opacity(0.18), radius: 14, y: 7)
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityLabel("Return to \(job.title)")
-                            .accessibilityHint(job.status)
-                            if job.phase != .running {
+                            HStack(spacing: 9) {
+                                Spacer()
                                 Button {
-                                    comparisonJobs.dismissStatus(key: job.id)
+                                    comparisonToResume = job
+                                    isResearchLibraryMinimized = false
+                                    showResearchLibrary = true
                                 } label: {
-                                    Image(systemName: "xmark")
-                                        .font(.caption.weight(.bold))
-                                        .frame(width: 32, height: 32)
-                                        .background(.regularMaterial, in: Circle())
+                                    HStack(spacing: 12) {
+                                        comparisonStatusIndicator(for: job)
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(job.title)
+                                                .font(.subheadline.weight(.semibold))
+                                                .lineLimit(1)
+                                            Text(comparisonStatusSubtitle(for: job))
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                                .lineLimit(1)
+                                        }
+                                        Image(systemName: "chevron.up")
+                                            .font(.caption.weight(.semibold))
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    .padding(.horizontal, 16)
+                                    .padding(.vertical, 11)
+                                    .frame(maxWidth: 340, alignment: .leading)
+                                    .background(.regularMaterial, in: Capsule())
+                                    .overlay {
+                                        Capsule()
+                                            .stroke(comparisonStatusColor(for: job.phase).opacity(0.8), lineWidth: 1.5)
+                                    }
+                                    .shadow(color: .black.opacity(0.18), radius: 14, y: 7)
                                 }
                                 .buttonStyle(.plain)
-                                .accessibilityLabel("Dismiss comparison status")
+                                .accessibilityLabel("Return to \(job.title)")
+                                .accessibilityHint(job.status)
+                                if job.phase != .running {
+                                    Button {
+                                        comparisonJobs.dismissStatus(key: job.id)
+                                    } label: {
+                                        Image(systemName: "xmark")
+                                            .font(.caption.weight(.bold))
+                                            .frame(width: 32, height: 32)
+                                            .background(.regularMaterial, in: Circle())
+                                    }
+                                    .buttonStyle(.plain)
+                                    .accessibilityLabel("Dismiss comparison status")
+                                }
                             }
                         }
+                        .padding(.trailing, 24)
+                        .padding(.bottom, 96)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                        .zIndex(30)
+                    } else if isResearchLibraryMinimized {
+                        VStack {
+                            Spacer()
+                            HStack {
+                                Spacer()
+                                Button {
+                                    comparisonToResume = nil
+                                    isResearchLibraryMinimized = false
+                                    showResearchLibrary = true
+                                } label: {
+                                    HStack(spacing: 12) {
+                                        Image(systemName: "books.vertical.fill")
+                                            .foregroundStyle(.blue)
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text("Research Library")
+                                                .font(.subheadline.weight(.semibold))
+                                            Text("Minimized — tap to return")
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                        }
+                                        Image(systemName: "chevron.up")
+                                            .font(.caption.weight(.semibold))
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    .padding(.horizontal, 16)
+                                    .padding(.vertical, 11)
+                                    .background(.regularMaterial, in: Capsule())
+                                    .overlay {
+                                        Capsule()
+                                            .stroke(Color.blue.opacity(0.75), lineWidth: 1.5)
+                                    }
+                                    .shadow(color: .black.opacity(0.18), radius: 14, y: 7)
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel("Restore Research Library")
+                                .accessibilityHint("Returns to the minimized Research Library")
+                            }
+                        }
+                        .padding(.trailing, 24)
+                        .padding(.bottom, 96)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                        .zIndex(30)
                     }
-                    .padding(.trailing, 24)
-                    .padding(.bottom, 96)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-                    .zIndex(30)
                 }
 
                 if appState.showFallbackNotification {
@@ -24976,7 +25022,12 @@ struct ContentView: View {
             .sheet(isPresented: $showResearchLibrary, onDismiss: {
                 comparisonToResume = nil
             }) {
-                ResearchLibraryView(initialComparison: comparisonToResume)
+                ResearchLibraryView(
+                    initialComparison: comparisonToResume,
+                    onMinimize: {
+                        isResearchLibraryMinimized = true
+                    }
+                )
             }
             .confirmationDialog(
                 "Local batch is too large",
@@ -25203,6 +25254,7 @@ struct ContentView: View {
         ToolbarItemGroup(placement: .navigationBarTrailing) {
             Button(action: {
                 comparisonToResume = nil
+                isResearchLibraryMinimized = false
                 showResearchLibrary = true
             }) {
                 Image(systemName: "books.vertical")
@@ -25231,6 +25283,7 @@ struct ContentView: View {
             HStack(spacing: 16) {
                 Button(action: {
                     comparisonToResume = nil
+                    isResearchLibraryMinimized = false
                     showResearchLibrary = true
                 }) {
                     Image(systemName: "books.vertical")

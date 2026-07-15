@@ -20,6 +20,7 @@ private enum ResearchLibraryRoute: Hashable {
 @MainActor
 struct ResearchLibraryView: View {
     let initialComparison: ResearchComparisonGenerationState?
+    let onMinimize: () -> Void
     @ObservedObject private var store = ResearchLibraryStore.shared
     @ObservedObject private var comparisonJobs = ResearchComparisonGenerationCoordinator.shared
     @Environment(\.dismiss) private var dismiss
@@ -30,8 +31,12 @@ struct ResearchLibraryView: View {
     @State private var communityComparisons: [ResearchCommunityComparisonRecord] = []
     @State private var errorMessage: String?
 
-    init(initialComparison: ResearchComparisonGenerationState? = nil) {
+    init(
+        initialComparison: ResearchComparisonGenerationState? = nil,
+        onMinimize: @escaping () -> Void = {}
+    ) {
         self.initialComparison = initialComparison
+        self.onMinimize = onMinimize
     }
 
     private var availableTags: [String] {
@@ -161,16 +166,6 @@ struct ResearchLibraryView: View {
                 placement: .navigationBarDrawer(displayMode: .always),
                 prompt: "Search reports, posts, comments, authors"
             )
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    if comparisonJobs.hasActiveJobs {
-                        ProgressView()
-                            .controlSize(.small)
-                            .accessibilityLabel("Comparison in progress")
-                    }
-                    Button("Done") { dismiss() }
-                }
-            }
             .navigationDestination(for: ResearchLibraryRoute.self) { route in
                 switch route {
                 case .comparison(let leftRunID, let rightRunID):
@@ -198,7 +193,23 @@ struct ResearchLibraryView: View {
                 Text(errorMessage ?? store.lastError ?? "Unknown error")
             }
         }
-        .environment(\.researchLibraryMinimizeAction, { dismiss() })
+        .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
+                Button(action: minimize) {
+                    Label("Minimize", systemImage: "chevron.down")
+                }
+                .accessibilityHint("Keeps the Research Library available while you browse")
+            }
+            ToolbarItem(placement: .confirmationAction) {
+                if comparisonJobs.hasActiveJobs {
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityLabel("Comparison in progress")
+                }
+                Button("Done") { dismiss() }
+            }
+        }
+        .environment(\.researchLibraryMinimizeAction, minimize)
         .task(id: initialComparison?.id) {
             guard let initialComparison, navigationPath.isEmpty else { return }
             if let comparisonID = initialComparison.communityComparisonID {
@@ -212,6 +223,11 @@ struct ResearchLibraryView: View {
                 )
             }
         }
+    }
+
+    private func minimize() {
+        onMinimize()
+        dismiss()
     }
 
     private func communityNames(for comparison: ResearchCommunityComparisonRecord) -> String? {
