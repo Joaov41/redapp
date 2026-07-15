@@ -30254,7 +30254,11 @@ struct RedditCommentsView: View {
     }
     
     private func makeAttributedText(from text: String) -> AttributedString? {
-        makeRedditAttributedText(from: text)
+        let textWithMarkdownLinks = redditTextWithMarkdownLinks(from: text)
+        let options = AttributedString.MarkdownParsingOptions(
+            interpretedSyntax: .inlineOnlyPreservingWhitespace
+        )
+        return try? AttributedString(markdown: textWithMarkdownLinks, options: options)
     }
 
 // MARK: - App Entry Point
