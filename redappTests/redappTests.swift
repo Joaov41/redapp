@@ -154,6 +154,24 @@ final class redappTests: XCTestCase {
         )
         XCTAssertEqual(try store.communityComparison(id: record.id)?.subject, "AI-generated interfaces")
         XCTAssertEqual(try store.communityComparisons(runID: swiftUI.id).map(\.id), [record.id])
+
+        let cache = ResearchCommunityDigestCache(
+            subject: record.subject,
+            firstRunID: openAI.id,
+            secondRunID: swiftUI.id,
+            firstSummaryFingerprint: "first-fingerprint",
+            secondSummaryFingerprint: "second-fingerprint",
+            firstPostSummaryCount: 1,
+            secondPostSummaryCount: 1,
+            firstDigest: "Complete OpenAI digest",
+            secondDigest: "Complete SwiftUI digest",
+            createdAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        try store.saveCommunityComparisonDigestCache(id: record.id, digestCache: cache)
+        let stored = try XCTUnwrap(try store.communityComparison(id: record.id))
+        let state = ResearchCommunityComparisonStoredState.decode(stored.compatibilityJSON)
+        XCTAssertEqual(state.compatibility, compatibility)
+        XCTAssertEqual(state.digestCache, cache)
     }
 
     func testCommunityCompatibilityExplainsSampleMismatches() {
@@ -319,6 +337,89 @@ final class redappTests: XCTestCase {
         for index in 0..<100 {
             XCTAssertTrue(prompts.contains("sentinel-\(index)"), "Summary \(index) was omitted")
         }
+    }
+
+    func testCommunityDigestCacheReusesOnlyMatchingSavedSummaries() {
+        let firstRunID = UUID()
+        let secondRunID = UUID()
+        let first = [
+            ResearchCommunitySummaryDocument(
+                artifactID: UUID(),
+                kind: .postSummary,
+                title: "First post",
+                body: "Every saved first-community conclusion."
+            )
+        ]
+        let secondArtifactID = UUID()
+        let second = [
+            ResearchCommunitySummaryDocument(
+                artifactID: secondArtifactID,
+                kind: .postSummary,
+                title: "Second post",
+                body: "Every saved second-community conclusion."
+            )
+        ]
+        let cache = ResearchCommunityDigestCache(
+            subject: "Model quality",
+            firstRunID: firstRunID,
+            secondRunID: secondRunID,
+            firstSummaryFingerprint: ResearchCommunityComparisonService.summaryFingerprint(first),
+            secondSummaryFingerprint: ResearchCommunityComparisonService.summaryFingerprint(second),
+            firstPostSummaryCount: 1,
+            secondPostSummaryCount: 1,
+            firstDigest: "First complete digest",
+            secondDigest: "Second complete digest"
+        )
+
+        XCTAssertEqual(
+            ResearchCommunityComparisonService.reusableDigestCache(
+                cache,
+                subject: " model QUALITY ",
+                firstRunID: firstRunID,
+                firstDocuments: first,
+                secondRunID: secondRunID,
+                secondDocuments: second
+            ),
+            cache
+        )
+
+        let changedSecond = [
+            ResearchCommunitySummaryDocument(
+                artifactID: secondArtifactID,
+                kind: .postSummary,
+                title: "Second post",
+                body: "This saved conclusion changed."
+            )
+        ]
+        XCTAssertNil(
+            ResearchCommunityComparisonService.reusableDigestCache(
+                cache,
+                subject: "Model quality",
+                firstRunID: firstRunID,
+                firstDocuments: first,
+                secondRunID: secondRunID,
+                secondDocuments: changedSecond
+            )
+        )
+    }
+
+    func testCommunityCitationQueryPrioritizesTheFollowUpQuestion() {
+        let query = ResearchCommunityComparisonService.citationQuery(
+            subject: "Model quality",
+            question: "Which community reported more reliability problems?",
+            digest: "Complete cached themes"
+        )
+
+        XCTAssertTrue(query.hasPrefix("Which community reported more reliability problems?"))
+        XCTAssertTrue(query.contains("Model quality"))
+        XCTAssertFalse(query.contains("Complete cached themes"))
+
+        let initialQuery = ResearchCommunityComparisonService.citationQuery(
+            subject: "Model quality",
+            question: nil,
+            digest: "Complete cached themes"
+        )
+        XCTAssertTrue(initialQuery.contains("Complete cached themes"))
     }
 
     func testCommunityComparisonsRequireARemoteLanguageProvider() {

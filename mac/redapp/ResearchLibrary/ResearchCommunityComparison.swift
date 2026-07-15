@@ -70,6 +70,74 @@ struct ResearchCommunityCompatibility: Codable, Hashable, Sendable {
     }
 }
 
+struct ResearchCommunityDigestCache: Codable, Hashable, Sendable {
+    static let currentVersion = 1
+
+    let version: Int
+    let subject: String
+    let firstRunID: UUID
+    let secondRunID: UUID
+    let firstSummaryFingerprint: String
+    let secondSummaryFingerprint: String
+    let firstPostSummaryCount: Int
+    let secondPostSummaryCount: Int
+    let firstDigest: String
+    let secondDigest: String
+    let createdAt: Date
+
+    init(
+        version: Int = currentVersion,
+        subject: String,
+        firstRunID: UUID,
+        secondRunID: UUID,
+        firstSummaryFingerprint: String,
+        secondSummaryFingerprint: String,
+        firstPostSummaryCount: Int,
+        secondPostSummaryCount: Int,
+        firstDigest: String,
+        secondDigest: String,
+        createdAt: Date = Date()
+    ) {
+        self.version = version
+        self.subject = subject
+        self.firstRunID = firstRunID
+        self.secondRunID = secondRunID
+        self.firstSummaryFingerprint = firstSummaryFingerprint
+        self.secondSummaryFingerprint = secondSummaryFingerprint
+        self.firstPostSummaryCount = firstPostSummaryCount
+        self.secondPostSummaryCount = secondPostSummaryCount
+        self.firstDigest = firstDigest
+        self.secondDigest = secondDigest
+        self.createdAt = createdAt
+    }
+}
+
+struct ResearchCommunityComparisonStoredState: Codable, Hashable, Sendable {
+    let version: Int
+    let compatibility: ResearchCommunityCompatibility?
+    let digestCache: ResearchCommunityDigestCache?
+
+    init(
+        version: Int = 1,
+        compatibility: ResearchCommunityCompatibility?,
+        digestCache: ResearchCommunityDigestCache?
+    ) {
+        self.version = version
+        self.compatibility = compatibility
+        self.digestCache = digestCache
+    }
+
+    static func decode(_ json: String) -> ResearchCommunityComparisonStoredState {
+        if let state = ResearchJSON.decode(ResearchCommunityComparisonStoredState.self, from: json) {
+            return state
+        }
+        return ResearchCommunityComparisonStoredState(
+            compatibility: ResearchJSON.decode(ResearchCommunityCompatibility.self, from: json),
+            digestCache: nil
+        )
+    }
+}
+
 private enum ResearchStoreNormalization {
     static func key(_ value: String) -> String {
         value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -108,6 +176,7 @@ struct ResearchCommunityComparisonGenerationResult: Sendable {
     let receipt: ResearchGenerationReceiptInput
     let validationSources: [ResearchSourceInput]
     let coverage: ResearchCoverageInput
+    let digestCache: ResearchCommunityDigestCache
 }
 
 struct ResearchCommunitySummaryDocument: Hashable, Sendable {
@@ -166,6 +235,7 @@ actor ResearchCommunityComparisonService {
         first: ResearchRunDetail,
         second: ResearchRunDetail,
         question: String? = nil,
+        digestCache: ResearchCommunityDigestCache? = nil,
         progress: ProgressHandler? = nil
     ) async throws -> ResearchCommunityComparisonGenerationResult {
         let provider = SummaryService.shared.settings.selectedSummaryProvider
@@ -181,29 +251,60 @@ actor ResearchCommunityComparisonService {
             throw GroundedResearchError.noPostSummaries
         }
 
-        await progress?(
-            0.12,
-            "Reading all \(firstPostSummaryCount) saved post summaries from r/\(first.run.subreddit)…"
-        )
-        let firstDigest = try await communityDigest(
-            subject: subject,
-            question: question,
-            detail: first,
-            documents: firstDocuments
-        )
-        try Task.checkCancellation()
+        let cached = question?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank.flatMap { _ in
+            Self.reusableDigestCache(
+                digestCache,
+                subject: subject,
+                firstRunID: first.run.id,
+                firstDocuments: firstDocuments,
+                secondRunID: second.run.id,
+                secondDocuments: secondDocuments
+            )
+        }
+        let firstDigest: String
+        let secondDigest: String
+        let resolvedDigestCache: ResearchCommunityDigestCache
+        if let cached {
+            await progress?(0.38, "Using the saved complete context from both communities…")
+            firstDigest = cached.firstDigest
+            secondDigest = cached.secondDigest
+            resolvedDigestCache = cached
+        } else {
+            await progress?(
+                0.12,
+                "Reading all \(firstPostSummaryCount) saved post summaries from r/\(first.run.subreddit)…"
+            )
+            firstDigest = try await communityDigest(
+                subject: subject,
+                question: nil,
+                detail: first,
+                documents: firstDocuments
+            )
+            try Task.checkCancellation()
 
-        await progress?(
-            0.38,
-            "Reading all \(secondPostSummaryCount) saved post summaries from r/\(second.run.subreddit)…"
-        )
-        let secondDigest = try await communityDigest(
-            subject: subject,
-            question: question,
-            detail: second,
-            documents: secondDocuments
-        )
-        try Task.checkCancellation()
+            await progress?(
+                0.38,
+                "Reading all \(secondPostSummaryCount) saved post summaries from r/\(second.run.subreddit)…"
+            )
+            secondDigest = try await communityDigest(
+                subject: subject,
+                question: nil,
+                detail: second,
+                documents: secondDocuments
+            )
+            try Task.checkCancellation()
+            resolvedDigestCache = ResearchCommunityDigestCache(
+                subject: subject,
+                firstRunID: first.run.id,
+                secondRunID: second.run.id,
+                firstSummaryFingerprint: Self.summaryFingerprint(firstDocuments),
+                secondSummaryFingerprint: Self.summaryFingerprint(secondDocuments),
+                firstPostSummaryCount: firstPostSummaryCount,
+                secondPostSummaryCount: secondPostSummaryCount,
+                firstDigest: firstDigest,
+                secondDigest: secondDigest
+            )
+        }
 
         let guidance = Self.comparisonGuidance(
             first: first,
@@ -215,12 +316,12 @@ actor ResearchCommunityComparisonService {
         )
         await progress?(0.62, "Finding representative original posts and comments for verification…")
         let firstSources = Self.citationSources(
-            query: "\(subject)\n\(firstDigest)",
+            query: Self.citationQuery(subject: subject, question: question, digest: firstDigest),
             detail: first,
             side: .first
         )
         let secondSources = Self.citationSources(
-            query: "\(subject)\n\(secondDigest)",
+            query: Self.citationQuery(subject: subject, question: question, digest: secondDigest),
             detail: second,
             side: .second
         )
@@ -291,7 +392,8 @@ actor ResearchCommunityComparisonService {
             response: checked,
             receipt: generated.receipt,
             validationSources: sources,
-            coverage: coverage
+            coverage: coverage,
+            digestCache: resolvedDigestCache
         )
     }
 
@@ -341,6 +443,59 @@ actor ResearchCommunityComparisonService {
 
     static func postSummaryCount(in documents: [ResearchCommunitySummaryDocument]) -> Int {
         Set(documents.filter { $0.kind == .postSummary }.map(\.artifactID)).count
+    }
+
+    static func summaryFingerprint(_ documents: [ResearchCommunitySummaryDocument]) -> String {
+        let canonical = documents
+            .sorted { lhs, rhs in
+                if lhs.documentID != rhs.documentID { return lhs.documentID < rhs.documentID }
+                if lhs.partIndex != rhs.partIndex { return lhs.partIndex < rhs.partIndex }
+                return lhs.artifactID.uuidString < rhs.artifactID.uuidString
+            }
+            .map { document in
+                [
+                    document.documentID,
+                    document.artifactID.uuidString,
+                    document.kind.rawValue,
+                    "\(document.partIndex)/\(document.partCount)",
+                    document.title,
+                    document.body
+                ].joined(separator: "|")
+            }
+            .joined(separator: "\n\u{1e}\n")
+        return ResearchDigest.sha256Hex(canonical)
+    }
+
+    static func reusableDigestCache(
+        _ cache: ResearchCommunityDigestCache?,
+        subject: String,
+        firstRunID: UUID,
+        firstDocuments: [ResearchCommunitySummaryDocument],
+        secondRunID: UUID,
+        secondDocuments: [ResearchCommunitySummaryDocument]
+    ) -> ResearchCommunityDigestCache? {
+        guard let cache,
+              cache.version == ResearchCommunityDigestCache.currentVersion,
+              cache.firstRunID == firstRunID,
+              cache.secondRunID == secondRunID,
+              cache.subject.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                == subject.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              cache.firstPostSummaryCount == postSummaryCount(in: firstDocuments),
+              cache.secondPostSummaryCount == postSummaryCount(in: secondDocuments),
+              cache.firstSummaryFingerprint == summaryFingerprint(firstDocuments),
+              cache.secondSummaryFingerprint == summaryFingerprint(secondDocuments),
+              !cache.firstDigest.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !cache.secondDigest.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        return cache
+    }
+
+    static func citationQuery(subject: String, question: String?, digest: String) -> String {
+        if let question = question?.nilIfBlank {
+            return "\(question)\n\(subject)"
+        }
+        return "\(subject)\n\(digest)"
     }
 
     static func summaryChunks(
@@ -846,10 +1001,8 @@ struct ResearchCommunityComparisonView: View {
                 Section("Compared communities") {
                     communityRow(first)
                     communityRow(second)
-                    if let compatibility = ResearchJSON.decode(
-                        ResearchCommunityCompatibility.self,
-                        from: record.compatibilityJSON
-                    ) {
+                    if let compatibility = ResearchCommunityComparisonStoredState
+                        .decode(record.compatibilityJSON).compatibility {
                         DisclosureGroup(isExpanded: $showCompatibility) {
                             LabeledContent("Feed types", value: compatibility.feedTypesMatch ? "Same" : "Different")
                             LabeledContent("Saved", value: compatibility.captureDistanceDays == 0 ? "Same day" : "\(compatibility.captureDistanceDays) days apart")
@@ -994,7 +1147,11 @@ struct ResearchCommunityComparisonView: View {
                 if isAskingQuestion {
                     HStack {
                         ProgressView().controlSize(.small)
-                        Text("Checking both saved batches…")
+                        Text(
+                            ResearchCommunityComparisonStoredState.decode(record.compatibilityJSON).digestCache == nil
+                                ? "Preparing complete context from both batches…"
+                                : "Using the saved complete comparison context…"
+                        )
                     }
                 } else {
                     Label("Ask using the same saved evidence", systemImage: "bubble.left.and.text.bubble.right")
@@ -1008,7 +1165,7 @@ struct ResearchCommunityComparisonView: View {
         } header: {
             Text("Ask about both communities")
         } footer: {
-            Text("Answers stay limited to these two saved batches and retain their source links.")
+            Text("Answers reuse the complete saved comparison context, stay limited to these two batches, and select fresh supporting links for each question.")
         }
     }
 
@@ -1217,11 +1374,13 @@ struct ResearchCommunityComparisonView: View {
         isAskingQuestion = true
         Task {
             do {
+                let storedState = ResearchCommunityComparisonStoredState.decode(record.compatibilityJSON)
                 let generated = try await ResearchCommunityComparisonService.shared.generate(
                     subject: record.subject,
                     first: first,
                     second: second,
-                    question: askedQuestion
+                    question: askedQuestion,
+                    digestCache: storedState.digestCache
                 )
                 _ = try store.addArtifact(
                     runID: first.run.id,
@@ -1234,6 +1393,10 @@ struct ResearchCommunityComparisonView: View {
                     missingData: generated.response.missingData,
                     claims: generated.response.claims,
                     validationSources: generated.validationSources
+                )
+                try store.saveCommunityComparisonDigestCache(
+                    id: record.id,
+                    digestCache: generated.digestCache
                 )
                 question = ""
                 load()
@@ -1313,6 +1476,10 @@ struct ResearchCommunityComparisonView: View {
                     missingData: generated.response.missingData,
                     claims: generated.response.claims,
                     validationSources: generated.validationSources
+                )
+                try store.saveCommunityComparisonDigestCache(
+                    id: record.id,
+                    digestCache: generated.digestCache
                 )
                 try store.updateCommunityComparison(id: record.id, state: .ready, artifactID: saved.id)
                 succeeded = true

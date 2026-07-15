@@ -638,6 +638,25 @@ final class ResearchLibraryStore: ObservableObject {
         reloadCurrentQuery()
     }
 
+    func saveCommunityComparisonDigestCache(
+        id: UUID,
+        digestCache: ResearchCommunityDigestCache
+    ) throws {
+        guard let record = try communityComparison(id: id) else {
+            throw ResearchStoreError.runNotFound
+        }
+        let state = ResearchCommunityComparisonStoredState.decode(record.compatibilityJSON)
+        record.compatibilityJSON = ResearchJSON.encode(
+            ResearchCommunityComparisonStoredState(
+                compatibility: state.compatibility,
+                digestCache: digestCache
+            )
+        )
+        record.updatedAt = Date()
+        try context.save()
+        reloadCurrentQuery()
+    }
+
     func run(id: UUID) throws -> ResearchRunRecord? {
         var descriptor = FetchDescriptor<ResearchRunRecord>(
             predicate: #Predicate { $0.id == id }
