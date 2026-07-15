@@ -198,10 +198,15 @@ actor GroundedResearchService {
         guidingOverview: String? = nil,
         balanceAcrossPosts: Bool = false,
         maximumSourceCharacters: Int? = nil,
+        maximumGuidanceCharacters: Int = 8_000,
+        usePreselectedSources: Bool = false,
         promptVersion: Int = 1
     ) async throws -> (response: ValidatedGroundedResponse, receipt: ResearchGenerationReceiptInput) {
         guard !sources.isEmpty else { throw GroundedResearchError.noSources }
-        let boundedOverview = Self.boundedGuidance(guidingOverview, maximumCharacters: 8_000)
+        let boundedOverview = Self.boundedGuidance(
+            guidingOverview,
+            maximumCharacters: max(1_000, maximumGuidanceCharacters)
+        )
         let retrievalQuery = [boundedOverview, instruction]
             .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
@@ -216,7 +221,9 @@ actor GroundedResearchService {
             min(calculatedSourceCharacterBudget, max(4_000, $0))
         } ?? calculatedSourceCharacterBudget
         let selectedSources: [ResearchSourceInput]
-        if balanceAcrossPosts {
+        if usePreselectedSources {
+            selectedSources = sources
+        } else if balanceAcrossPosts {
             selectedSources = Self.representativeSources(
                 for: retrievalQuery,
                 from: sources,

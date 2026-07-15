@@ -264,6 +264,88 @@ final class redappTests: XCTestCase {
         XCTAssertTrue(checked.missingData.contains { $0.contains("both communities") })
     }
 
+    func testCommunitySummaryChunksIncludeEverySummaryAndFullOverview() {
+        let postDocuments = (0..<100).map { index in
+            ResearchCommunitySummaryDocument(
+                artifactID: UUID(),
+                kind: .postSummary,
+                title: "Post \(index)",
+                body: "Unique saved summary sentinel-\(index) with the discussion conclusions."
+            )
+        }
+        let overviewID = UUID()
+        let overview = ResearchCommunitySummaryDocument(
+            artifactID: overviewID,
+            kind: .overallSummary,
+            title: "Complete Overall Summary",
+            body: "OVERVIEW-START\n\n"
+                + String(repeating: "Complete middle context from the saved overall summary. ", count: 120)
+                + "\n\nOVERVIEW-MIDDLE\n\n"
+                + String(repeating: "Important later context that must not be prefix-truncated. ", count: 120)
+                + "\n\nOVERVIEW-END"
+        )
+        let documents = [overview] + postDocuments
+        let chunks = ResearchCommunityComparisonService.summaryChunks(
+            documents: documents,
+            characterLimit: 1_600
+        )
+        let flattened = chunks.flatMap { $0 }
+        let postIDs = flattened.filter { $0.kind == .postSummary }.map(\.artifactID)
+
+        XCTAssertGreaterThan(chunks.count, 1)
+        XCTAssertEqual(postIDs.count, 100)
+        XCTAssertEqual(Set(postIDs), Set(postDocuments.map(\.artifactID)))
+        XCTAssertEqual(ResearchCommunityComparisonService.postSummaryCount(in: flattened), 100)
+
+        let overviewText = flattened
+            .filter { $0.artifactID == overviewID }
+            .sorted { $0.partIndex < $1.partIndex }
+            .map(\.body)
+            .joined(separator: "\n")
+        XCTAssertTrue(overviewText.contains("OVERVIEW-START"))
+        XCTAssertTrue(overviewText.contains("OVERVIEW-MIDDLE"))
+        XCTAssertTrue(overviewText.contains("OVERVIEW-END"))
+
+        let prompts = chunks.enumerated().map { index, chunk in
+            ResearchCommunityComparisonService.digestPrompt(
+                subject: "model quality",
+                question: nil,
+                community: "Example",
+                chunk: chunk,
+                chunkIndex: index,
+                chunkCount: chunks.count
+            )
+        }.joined(separator: "\n")
+        for index in 0..<100 {
+            XCTAssertTrue(prompts.contains("sentinel-\(index)"), "Summary \(index) was omitted")
+        }
+    }
+
+    func testCommunityComparisonsRequireARemoteLanguageProvider() {
+        XCTAssertFalse(ResearchCommunityComparisonService.isCloudComparisonProvider(.appleLocal))
+        XCTAssertFalse(ResearchCommunityComparisonService.isCloudComparisonProvider(.mlxLocal))
+        XCTAssertFalse(ResearchCommunityComparisonService.isCloudComparisonProvider(.coreAIMLXLocal))
+        XCTAssertTrue(ResearchCommunityComparisonService.isCloudComparisonProvider(.gemini))
+        XCTAssertTrue(ResearchCommunityComparisonService.isCloudComparisonProvider(.summarizeDaemon))
+        XCTAssertTrue(ResearchCommunityComparisonService.isCloudComparisonProvider(.appleCloud))
+    }
+
+    func testCommunityComparisonRemovesCitationSelectionWarningsButKeepsRealGaps() {
+        let response = ValidatedGroundedResponse(
+            title: "Comparison",
+            overview: nil,
+            claims: [],
+            conflicts: [],
+            missingData: [
+                "The available snippets do not provide full post bodies.",
+                "Reddit returned only 48 of 50 requested posts."
+            ]
+        )
+
+        let cleaned = ResearchCommunityComparisonService.removingCitationSelectionLimitations(response)
+        XCTAssertEqual(cleaned.missingData, ["Reddit returned only 48 of 50 requested posts."])
+    }
+
     func testMLXReportSpeechChunkingKeepsEveryChunkWithinModelLimit() {
         let report = Array(repeating: "A meaningful sentence about the subreddit and its discussion.", count: 40)
             .joined(separator: " ")
