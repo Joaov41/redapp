@@ -132,7 +132,11 @@ private struct ResearchLibraryRow: View {
                         .accessibilityLabel("Pinned")
                 }
             }
-            Text(item.subreddit == "home" ? "Home feed" : "r/\(item.subreddit)")
+            Text(
+                (item.subreddit == "home" ? "Home feed" : "r/\(item.subreddit)")
+                    + " · "
+                    + ResearchCaptureLabel.displayName(scope: item.scope)
+            )
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
             if !item.tags.isEmpty {
@@ -156,6 +160,7 @@ struct ResearchItemDetailView: View {
     @ObservedObject private var store = ResearchLibraryStore.shared
     @State private var item: ResearchItemRecord?
     @State private var runs: [ResearchRunRecord] = []
+    @State private var crossFilterRuns: [ResearchRunRecord] = []
     @State private var showTagEditor = false
     @State private var tagText = ""
     @State private var errorMessage: String?
@@ -165,18 +170,35 @@ struct ResearchItemDetailView: View {
             if let item {
                 Section("Collection") {
                     LabeledContent("Scope", value: item.subreddit == "home" ? "Home feed" : "r/\(item.subreddit)")
+                    LabeledContent("Saved feed", value: ResearchCaptureLabel.displayName(scope: item.scope))
                     LabeledContent("Created", value: item.createdAt.formatted(date: .abbreviated, time: .shortened))
                     if !item.tags.isEmpty {
                         LabeledContent("Tags", value: item.tags.joined(separator: ", "))
                     }
                 }
 
-                if runs.count >= 2 {
+                if let latestRun = runs.first,
+                   runs.count >= 2 || !crossFilterRuns.isEmpty {
                     Section("Compare") {
-                        NavigationLink {
-                            ResearchComparisonView(leftRunID: runs[1].id, rightRunID: runs[0].id)
-                        } label: {
-                            Label("Compare latest two revisions", systemImage: "rectangle.split.2x1")
+                        if runs.count >= 2 {
+                            NavigationLink {
+                                ResearchComparisonView(leftRunID: runs[1].id, rightRunID: runs[0].id)
+                            } label: {
+                                Label("Compare latest two revisions", systemImage: "rectangle.split.2x1")
+                            }
+                        }
+
+                        if !crossFilterRuns.isEmpty {
+                            NavigationLink {
+                                ResearchCrossFilterComparisonPickerView(baseRunID: latestRun.id)
+                            } label: {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Label("Compare New, Hot, or Top", systemImage: "slider.horizontal.3")
+                                    Text("Choose another saved r/\(item.subreddit) feed")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
                         }
                     }
                 }
@@ -270,6 +292,14 @@ struct ResearchItemDetailView: View {
         do {
             item = try store.item(id: itemID)
             runs = try store.runs(itemID: itemID)
+            if let latestRun = runs.first {
+                crossFilterRuns = try store.comparisonRuns(
+                    for: latestRun.id,
+                    differentFiltersOnly: true
+                )
+            } else {
+                crossFilterRuns = []
+            }
             try store.markOpened(itemID: itemID)
         } catch {
             errorMessage = error.localizedDescription
@@ -278,6 +308,104 @@ struct ResearchItemDetailView: View {
 
     private func perform(_ operation: () throws -> Void) {
         do { try operation() } catch { errorMessage = error.localizedDescription }
+    }
+}
+
+@MainActor
+private struct ResearchCrossFilterComparisonPickerView: View {
+    let baseRunID: UUID
+    @ObservedObject private var store = ResearchLibraryStore.shared
+    @State private var baseRun: ResearchRunRecord?
+    @State private var candidates: [ResearchRunRecord] = []
+    @State private var errorMessage: String?
+
+    var body: some View {
+        List {
+            if let baseRun {
+                Section("Starting snapshot") {
+                    snapshotRow(baseRun)
+                }
+
+                Section {
+                    if candidates.isEmpty {
+                        ContentUnavailableView(
+                            "No Other Feed Types Saved",
+                            systemImage: "rectangle.stack.badge.plus",
+                            description: Text("Save a New, Hot, or Top batch from the same subreddit first.")
+                        )
+                    } else {
+                        ForEach(candidates) { candidate in
+                            NavigationLink {
+                                let orderedIDs = orderedRunIDs(baseRun, candidate)
+                                ResearchComparisonView(
+                                    leftRunID: orderedIDs.earlier,
+                                    rightRunID: orderedIDs.later
+                                )
+                            } label: {
+                                snapshotRow(candidate)
+                            }
+                        }
+                    }
+                } header: {
+                    Text("Choose another saved feed")
+                } footer: {
+                    Text("Different feed types can surface different posts. The comparison will label this clearly.")
+                }
+            } else {
+                ProgressView()
+            }
+        }
+        .navigationTitle("Compare Feed Types")
+        .task { load() }
+        .alert("Comparison unavailable", isPresented: Binding(
+            get: { errorMessage != nil },
+            set: { if !$0 { errorMessage = nil } }
+        )) {
+            Button("OK", role: .cancel) { errorMessage = nil }
+        } message: {
+            Text(errorMessage ?? "Unknown error")
+        }
+    }
+
+    private func snapshotRow(_ run: ResearchRunRecord) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(ResearchCaptureLabel.displayName(sortMode: run.sortMode, timeRange: run.timeRange))
+                .font(.headline)
+            Text(run.capturedAt.formatted(date: .abbreviated, time: .shortened))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text("\(run.coverage.postsAnalyzed) posts · \(run.coverage.commentsAnalyzed) comments analyzed")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 3)
+        .contentShape(Rectangle())
+    }
+
+    private func orderedRunIDs(
+        _ first: ResearchRunRecord,
+        _ second: ResearchRunRecord
+    ) -> (earlier: UUID, later: UUID) {
+        if first.capturedAt <= second.capturedAt {
+            return (first.id, second.id)
+        }
+        return (second.id, first.id)
+    }
+
+    private func load() {
+        do {
+            guard let loadedBase = try store.run(id: baseRunID) else {
+                throw ResearchStoreError.runNotFound
+            }
+            baseRun = loadedBase
+            candidates = try store.comparisonRuns(
+                for: baseRunID,
+                differentFiltersOnly: true
+            )
+            errorMessage = nil
+        } catch {
+            errorMessage = error.localizedDescription
+        }
     }
 }
 
@@ -1368,6 +1496,7 @@ struct ResearchComparisonView: View {
     var body: some View {
         List {
             if let left, let right, let difference {
+                comparisonContextSection(left: left, right: right)
                 subredditProgressSection(difference)
                 revisionOverallSummarySection(left)
                 revisionOverallSummarySection(right)
@@ -1378,7 +1507,7 @@ struct ResearchComparisonView: View {
                         ForEach(difference.added) { delta in
                             sourceChangeRow(
                                 delta,
-                                revision: difference.newRevision,
+                                snapshotLabel: snapshotName(right),
                                 runID: difference.newRunID,
                                 systemImage: "plus.circle.fill",
                                 tint: .green
@@ -1392,7 +1521,7 @@ struct ResearchComparisonView: View {
                         ForEach(difference.removed) { delta in
                             sourceChangeRow(
                                 delta,
-                                revision: difference.oldRevision,
+                                snapshotLabel: snapshotName(left),
                                 runID: difference.oldRunID,
                                 systemImage: "minus.circle.fill",
                                 tint: .red
@@ -1412,12 +1541,12 @@ struct ResearchComparisonView: View {
                                 .font(.headline)
                                 HStack {
                                     sourceButton(
-                                        title: "Revision \(difference.oldRevision)",
+                                        title: snapshotName(left),
                                         runID: difference.oldRunID,
                                         sourceID: delta.sourceID
                                     )
                                     sourceButton(
-                                        title: "Revision \(difference.newRevision)",
+                                        title: snapshotName(right),
                                         runID: difference.newRunID,
                                         sourceID: delta.sourceID
                                     )
@@ -1480,7 +1609,7 @@ struct ResearchComparisonView: View {
                 ProgressView()
             }
         }
-        .navigationTitle("Compare Revisions")
+        .navigationTitle(comparesDifferentFilters ? "Compare Feeds" : "Compare Revisions")
         .task {
             loadComparison()
         }
@@ -1502,7 +1631,7 @@ struct ResearchComparisonView: View {
 
     @ViewBuilder
     private func revisionOverallSummarySection(_ detail: ResearchRunDetail) -> some View {
-        Section("Revision \(detail.run.revision) — Overall summary") {
+        Section("\(snapshotName(detail)) — Overall summary") {
             if let summary = detail.revisionArtifacts.overallSummary {
                 VStack(alignment: .leading, spacing: 8) {
                     Text(summary.body)
@@ -1527,7 +1656,7 @@ struct ResearchComparisonView: View {
         let overallID = detail.revisionArtifacts.overallSummary?.id
         let remaining = detail.artifacts.filter { $0.id != overallID }
         if !remaining.isEmpty {
-            Section("Revision \(detail.run.revision) — Individual summaries and reports") {
+            Section("\(snapshotName(detail)) — Individual summaries and reports") {
                 ForEach(remaining) { artifact in
                     DisclosureGroup {
                         Text(artifact.body)
@@ -1550,6 +1679,51 @@ struct ResearchComparisonView: View {
     }
 
     @ViewBuilder
+    private func comparisonContextSection(
+        left: ResearchRunDetail,
+        right: ResearchRunDetail
+    ) -> some View {
+        Section {
+            comparisonSnapshotRow(title: "Earlier snapshot", detail: left)
+            comparisonSnapshotRow(title: "Later snapshot", detail: right)
+            if comparesDifferentFilters {
+                Label(
+                    "These snapshots use different Reddit feed types. Differences show what each feed surfaced and do not automatically mean the subreddit changed over time.",
+                    systemImage: "info.circle"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(nil)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+        } header: {
+            Text("Compared snapshots")
+        }
+    }
+
+    private func comparisonSnapshotRow(
+        title: String,
+        detail: ResearchRunDetail
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(title)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text(captureName(detail.run))
+                    .fontWeight(.semibold)
+            }
+            Text(detail.run.capturedAt.formatted(date: .abbreviated, time: .shortened))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text("\(detail.run.coverage.postsAnalyzed) posts · \(detail.run.coverage.commentsAnalyzed) comments analyzed")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 2)
+    }
+
+    @ViewBuilder
     private func subredditProgressSection(_ difference: ResearchRevisionDiff) -> some View {
         Section {
             if let changeReport {
@@ -1557,6 +1731,7 @@ struct ResearchComparisonView: View {
                     report: changeReport,
                     claims: changeClaims,
                     citationsByClaim: changeCitations,
+                    sourceLabel: comparisonSourceLabel,
                     openSource: openComparisonSource
                 )
                 Button {
@@ -1568,12 +1743,21 @@ struct ResearchComparisonView: View {
                             Text("Rewriting the plain-language update…")
                         }
                     } else {
-                        Label("Regenerate plain-language update", systemImage: "arrow.clockwise")
+                        Label(
+                            comparesDifferentFilters
+                                ? "Regenerate feed comparison"
+                                : "Regenerate plain-language update",
+                            systemImage: "arrow.clockwise"
+                        )
                     }
                 }
                 .disabled(isGeneratingReport || !difference.hasSourceChanges)
             } else if difference.hasSourceChanges {
-                Text("Create a short, everyday-language explanation of how the saved subreddit discussion moved from the earlier snapshot to the later one.")
+                Text(
+                    comparesDifferentFilters
+                        ? "Create a short, everyday-language explanation of how the topics surfaced by these saved feeds differ."
+                        : "Create a short, everyday-language explanation of how the saved subreddit discussion moved from the earlier snapshot to the later one."
+                )
                     .foregroundStyle(.secondary)
                 Button {
                     generateWhatChangedReport(difference)
@@ -1584,7 +1768,12 @@ struct ResearchComparisonView: View {
                             Text("Writing the plain-language update…")
                         }
                     } else {
-                        Label("Explain the progress in plain language", systemImage: "text.quote")
+                        Label(
+                            comparesDifferentFilters
+                                ? "Explain the feed differences"
+                                : "Explain the progress in plain language",
+                            systemImage: "text.quote"
+                        )
                     }
                 }
                 .disabled(isGeneratingReport)
@@ -1598,7 +1787,11 @@ struct ResearchComparisonView: View {
         } header: {
             Text(subredditProgressTitle)
         } footer: {
-            Text("This describes the saved sample, not every person or discussion in the subreddit.")
+            Text(
+                comparesDifferentFilters
+                    ? "This compares two differently sorted saved samples. A difference may come from Reddit’s feed selection rather than a change in the community."
+                    : "This describes the saved sample, not every person or discussion in the subreddit."
+            )
         }
     }
 
@@ -1622,9 +1815,50 @@ struct ResearchComparisonView: View {
         guard let subreddit = right?.sources
             .map(\.subreddit)
             .first(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else {
-            return "How the subreddit progressed"
+            return comparesDifferentFilters
+                ? "How the saved feeds differed"
+                : "How the subreddit progressed"
         }
-        return "How r/\(subreddit) progressed"
+        return comparesDifferentFilters
+            ? "How r/\(subreddit) differed across feeds"
+            : "How r/\(subreddit) progressed"
+    }
+
+    private var comparesDifferentFilters: Bool {
+        guard let left, let right else { return false }
+        return ResearchCaptureLabel.key(
+            sortMode: left.run.sortMode,
+            timeRange: left.run.timeRange
+        ) != ResearchCaptureLabel.key(
+            sortMode: right.run.sortMode,
+            timeRange: right.run.timeRange
+        )
+    }
+
+    private func captureName(_ run: ResearchRunRecord) -> String {
+        ResearchCaptureLabel.displayName(sortMode: run.sortMode, timeRange: run.timeRange)
+    }
+
+    private func snapshotName(_ detail: ResearchRunDetail) -> String {
+        comparesDifferentFilters ? captureName(detail.run) : "Revision \(detail.run.revision)"
+    }
+
+    private func comparisonReportTitle(
+        difference: ResearchRevisionDiff,
+        left: ResearchRunDetail,
+        right: ResearchRunDetail
+    ) -> String {
+        let usesDifferentFilters = ResearchCaptureLabel.key(
+            sortMode: left.run.sortMode,
+            timeRange: left.run.timeRange
+        ) != ResearchCaptureLabel.key(
+            sortMode: right.run.sortMode,
+            timeRange: right.run.timeRange
+        )
+        guard usesDifferentFilters else { return difference.reportTitle }
+        let leftDate = left.run.capturedAt.formatted(date: .abbreviated, time: .shortened)
+        let rightDate = right.run.capturedAt.formatted(date: .abbreviated, time: .shortened)
+        return "Feed Differences: \(captureName(left.run)) (\(leftDate)) → \(captureName(right.run)) (\(rightDate))"
     }
 
     private func loadComparison() {
@@ -1644,7 +1878,14 @@ struct ResearchComparisonView: View {
             left = loadedLeft
             right = loadedRight
             difference = loadedDifference
-            try loadSavedChangeReport(from: loadedRight, title: loadedDifference.reportTitle)
+            try loadSavedChangeReport(
+                from: loadedRight,
+                title: comparisonReportTitle(
+                    difference: loadedDifference,
+                    left: loadedLeft,
+                    right: loadedRight
+                )
+            )
             errorMessage = nil
         } catch {
             errorMessage = error.localizedDescription
@@ -1677,17 +1918,27 @@ struct ResearchComparisonView: View {
             .map(\.subreddit)
             .first(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
             .map { "r/\($0)" } ?? "the saved subreddit"
+        let isCrossFilter = comparesDifferentFilters
+        let comparisonTask = isCrossFilter
+            ? "Compare, in plain everyday language, what the two differently sorted saved subreddit feeds surfaced."
+            : "Explain, in plain everyday language, how the saved subreddit discussion progressed from revision \(difference.oldRevision) to revision \(difference.newRevision)."
+        let focusGuidance = isCrossFilter
+            ? "Focus on which topics, concerns, attitudes, or conflicts are more visible in one feed than the other. Do not describe a difference as subreddit progress or a change over time merely because one feed contains different posts. Explicitly distinguish likely feed-selection differences from evidence of a genuine time-based shift."
+            : "Focus on which topics or concerns appeared, faded, or changed; whether the saved discussion became more supportive, critical, uncertain, or divided; and what new consensus or conflict emerged. Only describe those shifts when the saved evidence supports them."
+        let comparisonCaution = isCrossFilter
+            ? "The snapshots use different Reddit sorting methods. Treat the deterministic source differences as differences between saved samples, not proof that the community changed."
+            : "If the material only establishes that something is new or absent in one snapshot, state that carefully without guessing why."
 
         let instruction = """
-        Explain, in plain everyday language, how the saved subreddit discussion progressed from revision \(difference.oldRevision) to revision \(difference.newRevision).
+        \(comparisonTask)
 
         Subreddit: \(subreddit)
-        Earlier snapshot: \(left.run.capturedAt.formatted(date: .abbreviated, time: .shortened))
-        Later snapshot: \(right.run.capturedAt.formatted(date: .abbreviated, time: .shortened))
+        Earlier snapshot: \(captureName(left.run)) · \(left.run.capturedAt.formatted(date: .abbreviated, time: .shortened))
+        Later snapshot: \(captureName(right.run)) · \(right.run.capturedAt.formatted(date: .abbreviated, time: .shortened))
 
-        Write for a reader who does not want a technical data-diff report. Return 3 to 6 short claims in a natural reading order so that, when read together, they form a clear update. Focus on which topics or concerns appeared, faded, or changed; whether the saved discussion became more supportive, critical, uncertain, or divided; and what new consensus or conflict emerged. Only describe those shifts when the saved evidence supports them.
+        Write for a reader who does not want a technical data-diff report. Return 3 to 6 short claims in a natural reading order so that, when read together, they form a clear comparison. \(focusGuidance)
 
-        In claim text, do not mention source IDs, manifests, digests, database terms, or raw added/removed counts. Say “the saved discussion” or “this saved sample” rather than claiming to represent every member of the subreddit. Comparative claims should cite evidence from both revisions when available. If the material only establishes that something is new or absent in one snapshot, state that carefully without guessing why.
+        In claim text, do not mention source IDs, manifests, digests, database terms, or raw added/removed counts. Say “the saved discussion,” “the saved feed,” or “this saved sample” rather than claiming to represent every member of the subreddit. Comparative claims should cite evidence from both snapshots when available. \(comparisonCaution)
 
         The deterministic manifest below is authoritative. Discuss only changes present in it. Treat score changes only as engagement changes, never as proof that a claim is true. Every factual claim must cite the revision-prefixed saved sources. If the evidence cannot establish why something changed, say so under missing data.
 
@@ -1715,12 +1966,19 @@ struct ResearchComparisonView: View {
                 try Task.checkCancellation()
                 let artifactBody = ResearchChangeNarrative.artifactBody(
                     claimTexts: result.response.claims.map(\.text),
-                    evidenceMarkdown: result.response.markdown
+                    evidenceMarkdown: result.response.markdown,
+                    heading: isCrossFilter
+                        ? "How the saved feeds differed"
+                        : "How the subreddit progressed"
                 )
                 _ = try store.addArtifact(
                     runID: right.run.id,
                     kind: .changeReport,
-                    title: difference.reportTitle,
+                    title: comparisonReportTitle(
+                        difference: difference,
+                        left: left,
+                        right: right
+                    ),
                     body: artifactBody,
                     generationReceipt: result.receipt,
                     coverage: right.run.coverage,
@@ -1752,7 +2010,7 @@ struct ResearchComparisonView: View {
     @ViewBuilder
     private func sourceChangeRow(
         _ delta: ResearchSourceDelta,
-        revision: Int,
+        snapshotLabel: String,
         runID: UUID,
         systemImage: String,
         tint: Color
@@ -1766,7 +2024,7 @@ struct ResearchComparisonView: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(delta.displayTitle)
                         .foregroundStyle(.primary)
-                    Text("R\(revision) · \(delta.sourceID)")
+                    Text("\(snapshotLabel) · \(delta.sourceID)")
                         .font(.caption.monospaced())
                         .foregroundStyle(.secondary)
                 }
@@ -1790,6 +2048,19 @@ struct ResearchComparisonView: View {
         } else {
             openSource(runID: rightRunID, sourceID: encodedID)
         }
+    }
+
+    private func comparisonSourceLabel(_ encodedID: String) -> String {
+        guard let reference = ResearchComparisonSourceReference.parse(encodedID) else {
+            return encodedID
+        }
+        if let left, reference.runID == left.run.id {
+            return "\(snapshotName(left)) · \(reference.sourceID)"
+        }
+        if let right, reference.runID == right.run.id {
+            return "\(snapshotName(right)) · \(reference.sourceID)"
+        }
+        return reference.displayName
     }
 
     private func openSource(runID: UUID, sourceID: String) {
@@ -1824,12 +2095,13 @@ private struct ResearchComparisonReportView: View {
     let report: ResearchArtifactRecord
     let claims: [ResearchClaimRecord]
     let citationsByClaim: [UUID: [ResearchCitationRecord]]
+    let sourceLabel: (String) -> String
     let openSource: (String) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             if plainLanguageNarrative.isEmpty {
-                Text("There wasn’t enough saved information to explain how the discussion changed.")
+                Text("There wasn’t enough saved information to produce a clear comparison.")
                     .foregroundStyle(.secondary)
                     .lineLimit(nil)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1874,7 +2146,7 @@ private struct ResearchComparisonReportView: View {
                             HStack {
                                 ResearchConfidenceBadge(confidence: claim.confidence)
                                 ForEach(citationsByClaim[claim.id] ?? []) { citation in
-                                    Button(ResearchComparisonSourceReference.displayName(for: citation.sourceID)) {
+                                    Button(sourceLabel(citation.sourceID)) {
                                         openSource(citation.sourceID)
                                     }
                                     .buttonStyle(.bordered)

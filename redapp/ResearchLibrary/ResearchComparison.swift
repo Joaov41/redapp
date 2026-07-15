@@ -12,12 +12,16 @@ enum ResearchChangeNarrative {
         return sentences.joined(separator: " ")
     }
 
-    static func artifactBody(claimTexts: [String], evidenceMarkdown: String) -> String {
+    static func artifactBody(
+        claimTexts: [String],
+        evidenceMarkdown: String,
+        heading: String = "How the subreddit progressed"
+    ) -> String {
         let narrative = plainText(from: claimTexts)
         let evidence = evidenceMarkdown.trimmingCharacters(in: .whitespacesAndNewlines)
         var sections: [String] = []
         if !narrative.isEmpty {
-            sections.append("### How the subreddit progressed\n\n\(narrative)")
+            sections.append("### \(heading)\n\n\(narrative)")
         }
         if !evidence.isEmpty {
             sections.append("### Supporting evidence\n\n\(evidence)")

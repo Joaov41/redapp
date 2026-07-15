@@ -292,6 +292,45 @@ final class ResearchRunRecord {
     }
 }
 
+enum ResearchCaptureLabel {
+    static func displayName(sortMode: String, timeRange: String) -> String {
+        let normalizedSort = sortMode.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let sortName: String
+        switch normalizedSort {
+        case "new": sortName = "New"
+        case "hot": sortName = "Hot"
+        case "top": sortName = "Top"
+        default: sortName = normalizedSort.isEmpty ? "Saved feed" : normalizedSort.capitalized
+        }
+
+        guard normalizedSort == "top" else { return sortName }
+        let normalizedTime = timeRange.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let timeName: String
+        switch normalizedTime {
+        case "hour": timeName = "Past hour"
+        case "day": timeName = "Today"
+        case "week": timeName = "This week"
+        case "month": timeName = "This month"
+        case "year": timeName = "This year"
+        case "all": timeName = "All time"
+        default: timeName = normalizedTime.isEmpty ? "All time" : normalizedTime.capitalized
+        }
+        return "\(sortName) · \(timeName)"
+    }
+
+    static func displayName(scope: String) -> String {
+        let components = scope.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
+        guard components.count >= 4 else { return "Saved feed" }
+        return displayName(sortMode: components[components.count - 2], timeRange: components.last ?? "all")
+    }
+
+    static func key(sortMode: String, timeRange: String) -> String {
+        let sort = sortMode.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let time = timeRange.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return "\(sort)|\(sort == "top" ? time : "all")"
+    }
+}
+
 @Model
 final class ResearchSourceRecord {
     @Attribute(.unique) var id: UUID

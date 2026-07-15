@@ -531,6 +531,36 @@ final class ResearchLibraryStore: ObservableObject {
         return try context.fetch(descriptor)
     }
 
+    func comparisonRuns(
+        for baseRunID: UUID,
+        differentFiltersOnly: Bool = false
+    ) throws -> [ResearchRunRecord] {
+        guard let baseRun = try run(id: baseRunID) else {
+            throw ResearchStoreError.runNotFound
+        }
+        let baseSubreddit = Self.normalized(baseRun.subreddit)
+        let baseFeedMode = Self.normalized(baseRun.feedMode)
+        let baseFilter = ResearchCaptureLabel.key(
+            sortMode: baseRun.sortMode,
+            timeRange: baseRun.timeRange
+        )
+
+        return try context.fetch(FetchDescriptor<ResearchRunRecord>())
+            .filter { candidate in
+                guard candidate.id != baseRun.id,
+                      Self.normalized(candidate.subreddit) == baseSubreddit,
+                      Self.normalized(candidate.feedMode) == baseFeedMode else {
+                    return false
+                }
+                guard differentFiltersOnly else { return true }
+                return ResearchCaptureLabel.key(
+                    sortMode: candidate.sortMode,
+                    timeRange: candidate.timeRange
+                ) != baseFilter
+            }
+            .sorted { $0.capturedAt > $1.capturedAt }
+    }
+
     func run(id: UUID) throws -> ResearchRunRecord? {
         var descriptor = FetchDescriptor<ResearchRunRecord>(
             predicate: #Predicate { $0.id == id }

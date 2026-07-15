@@ -10,6 +10,72 @@ import XCTest
 @testable import redapp
 
 final class redappTests: XCTestCase {
+    func testResearchCaptureLabelsDescribeFeedTypeAndTopRange() {
+        XCTAssertEqual(
+            ResearchCaptureLabel.displayName(sortMode: "top", timeRange: "day"),
+            "Top · Today"
+        )
+        XCTAssertEqual(
+            ResearchCaptureLabel.displayName(sortMode: "hot", timeRange: "all"),
+            "Hot"
+        )
+        XCTAssertEqual(
+            ResearchCaptureLabel.displayName(scope: "subreddit|OpenAI|new|all"),
+            "New"
+        )
+    }
+
+    @MainActor
+    func testFindsDifferentFeedTypesForTheSameSubreddit() throws {
+        let store = ResearchLibraryStore(inMemory: true)
+        let coverage = ResearchCoverageInput(
+            postsRequested: 1,
+            postsFetched: 1,
+            postsAnalyzed: 1,
+            commentsReported: 0,
+            commentsFetched: 0,
+            commentsAnalyzed: 0,
+            commentsOmitted: 0,
+            failureMessages: [],
+            truncationMessages: []
+        )
+
+        func request(
+            subreddit: String,
+            sort: String,
+            time: String
+        ) -> ResearchBatchSaveRequest {
+            ResearchBatchSaveRequest(
+                title: "r/\(subreddit) Research",
+                scope: "subreddit|\(subreddit)|\(sort)|\(time)",
+                subreddit: subreddit,
+                feedMode: "subreddit",
+                sortMode: sort,
+                timeRange: time,
+                sources: [source(id: "t3_\(sort)", postID: "t3_\(sort)")],
+                coverage: coverage,
+                perPostSummaries: [],
+                overallSummary: nil,
+                generationReceipt: nil
+            )
+        }
+
+        let top = try store.saveBatch(request(subreddit: "OpenAI", sort: "top", time: "day"))
+        let hot = try store.saveBatch(request(subreddit: "OpenAI", sort: "hot", time: "all"))
+        _ = try store.saveBatch(request(subreddit: "SwiftUI", sort: "new", time: "all"))
+        _ = try store.saveBatch(request(subreddit: "OpenAI", sort: "top", time: "day"))
+
+        let candidates = try store.comparisonRuns(for: top.id, differentFiltersOnly: true)
+        XCTAssertEqual(candidates.map(\.id), [hot.id])
+        XCTAssertEqual(
+            ResearchCaptureLabel.displayName(
+                sortMode: try XCTUnwrap(candidates.first).sortMode,
+                timeRange: try XCTUnwrap(candidates.first).timeRange
+            ),
+            "Hot"
+        )
+    }
+
     func testMLXReportSpeechChunkingKeepsEveryChunkWithinModelLimit() {
         let report = Array(repeating: "A meaningful sentence about the subreddit and its discussion.", count: 40)
             .joined(separator: " ")
