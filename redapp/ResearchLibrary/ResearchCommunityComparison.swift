@@ -226,7 +226,8 @@ enum ResearchCommunityComparisonError: LocalizedError {
 actor ResearchCommunityComparisonService {
     static let shared = ResearchCommunityComparisonService()
     static let summaryChunkCharacterLimit = 24_000
-    static let citationCharacterBudgetPerCommunity = 15_000
+    static let targetedCitationCharacterBudgetPerCommunity = 18_000
+    static let broadThemeCitationCharacterBudgetPerCommunity = 32_000
 
     typealias ProgressHandler = @MainActor @Sendable (_ fraction: Double, _ status: String) -> Void
 
@@ -314,14 +315,19 @@ actor ResearchCommunityComparisonService {
             secondDigest: secondDigest,
             secondPostSummaryCount: secondPostSummaryCount
         )
+        let broadThemeRequest = Self.isBroadThemeRequest(subject: subject, question: question)
         await progress?(0.62, "Finding representative original posts and comments for verification…")
         let firstSources = Self.citationSources(
             query: Self.citationQuery(subject: subject, question: question, digest: firstDigest),
+            guidingDigest: firstDigest,
+            broadThemeRequest: broadThemeRequest,
             detail: first,
             side: .first
         )
         let secondSources = Self.citationSources(
             query: Self.citationQuery(subject: subject, question: question, digest: secondDigest),
+            guidingDigest: secondDigest,
+            broadThemeRequest: broadThemeRequest,
             detail: second,
             side: .second
         )
@@ -342,7 +348,7 @@ actor ResearchCommunityComparisonService {
 
         The supplied original Reddit sources are representative supporting material selected only to verify claims and create links. Do not describe the saved batches as snippets or excerpts, and do not treat the number of supplied citation sources as the comparison's analysis coverage. Only report a limitation when the saved material cannot verify a proposed claim or the coverage ledger records a genuine collection gap.
 
-        Write in clear everyday language. Do not treat either saved sample as every member of its community. Do not use added/removed-post language or score-difference analysis. Return 5 to 9 concise claims, using these claimType values so the app can organize the answer:
+        Write in clear everyday language. Do not treat either saved sample as every member of its community. Do not use added/removed-post language or score-difference analysis. \(broadThemeRequest ? "Return 8 to 14 distinct findings. Cover at least three important themes from each community and at least two meaningful similarities or differences; preserve important internal disagreement instead of collapsing the batch into one or two headline topics." : "Return 5 to 9 concise claims.") Use these claimType values so the app can organize the answer:
         - common_ground: views or concerns supported in both communities; cite both sides.
         - first_community: how \(firstName) discusses the subject.
         - second_community: how \(secondName) discusses the subject.
@@ -362,7 +368,7 @@ actor ResearchCommunityComparisonService {
 
             The complete-summary digest considered every available saved post summary from both batches and each complete overall summary. The supplied original Reddit sources are representative supporting material selected only for verification and links. Do not describe the batches as snippets or infer analysis coverage from the number of citation sources.
 
-            Give a direct everyday-language answer in 2 to 5 concise claims. Use claimType first_community or second_community for a point supported by only one side. Use common_ground or biggest_difference only for a direct two-community statement, and cite evidence from both sides for those claim types. If the saved evidence cannot answer the question, say so in missingData. Every factual claim must cite a supplied saved post or comment ID.
+            \(broadThemeRequest ? "Give a complete everyday-language overview in 8 to 14 distinct findings. Cover at least three important themes from each community and at least two meaningful similarities or differences. Preserve important internal disagreement, and do not reduce a 50-post batch to one or two headline topics." : "Give a direct everyday-language answer in 2 to 5 concise claims.") Use claimType first_community or second_community for a point supported by only one side. Use common_ground or biggest_difference only for a direct two-community statement, and cite evidence from both sides for those claim types. If the saved evidence cannot answer the question, say so in missingData. Every factual claim must cite a supplied saved post or comment ID.
             """
         } else {
             instruction = comparisonInstruction
@@ -382,7 +388,7 @@ actor ResearchCommunityComparisonService {
             maximumGuidanceCharacters: max(24_000, guidance.count),
             usePreselectedSources: true,
             requireRemoteSummaryProvider: true,
-            promptVersion: 5
+            promptVersion: 6
         )
         let checked = Self.removingCitationSelectionLimitations(
             Self.enforceTwoSidedComparisons(generated.response)
@@ -496,6 +502,19 @@ actor ResearchCommunityComparisonService {
             return "\(question)\n\(subject)"
         }
         return "\(subject)\n\(digest)"
+    }
+
+    static func isBroadThemeRequest(subject: String, question: String?) -> Bool {
+        let text = (question?.nilIfBlank ?? subject)
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .lowercased()
+        let broadPhrases = [
+            "main theme", "main topic", "major theme", "major topic",
+            "overall theme", "overall topic", "themes discussed", "topics discussed",
+            "what is discussed", "what are they discussing", "complete overview",
+            "overview of", "summarize the communities", "summarise the communities"
+        ]
+        return broadPhrases.contains { text.contains($0) }
     }
 
     static func summaryChunks(
@@ -672,14 +691,26 @@ actor ResearchCommunityComparisonService {
 
     static func citationSources(
         query: String,
+        guidingDigest: String,
+        broadThemeRequest: Bool,
         detail: ResearchRunDetail,
         side: ResearchCommunitySourceReference.Side
     ) -> [ResearchSourceInput] {
-        let selected = GroundedResearchService.relevantSources(
-            for: query,
-            from: detail.sources.map(ResearchSourceInput.init(record:)),
-            characterBudget: citationCharacterBudgetPerCommunity
-        )
+        let allSources = detail.sources.map(ResearchSourceInput.init(record:))
+        let selected: [ResearchSourceInput]
+        if broadThemeRequest {
+            selected = GroundedResearchService.representativeSources(
+                for: "\(query)\n\(guidingDigest)",
+                from: allSources,
+                characterBudget: broadThemeCitationCharacterBudgetPerCommunity
+            )
+        } else {
+            selected = GroundedResearchService.relevantSources(
+                for: query,
+                from: allSources,
+                characterBudget: targetedCitationCharacterBudgetPerCommunity
+            )
+        }
         return selected.map { source in
             func encode(_ sourceID: String) -> String {
                 ResearchCommunitySourceReference(

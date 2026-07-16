@@ -214,6 +214,32 @@ final class redappTests: XCTestCase {
         let state = ResearchCommunityComparisonStoredState.decode(stored.compatibilityJSON)
         XCTAssertEqual(state.compatibility, compatibility)
         XCTAssertEqual(state.digestCache, cache)
+
+        let comparisonArtifact = try store.addArtifact(
+            runID: openAI.id,
+            kind: .communityComparison,
+            title: "AI-generated interfaces",
+            body: "Saved comparison"
+        )
+        let followUpArtifact = try store.addArtifact(
+            runID: openAI.id,
+            kind: .questionAnswer,
+            title: "Community Q&A [\(record.id.uuidString)]: Main themes",
+            body: "Saved answer"
+        )
+        try store.updateCommunityComparison(
+            id: record.id,
+            state: .ready,
+            artifactID: comparisonArtifact.id
+        )
+        try store.deleteCommunityComparison(id: record.id)
+
+        XCTAssertNil(try store.communityComparison(id: record.id))
+        let remainingArtifactIDs = Set(try store.artifacts(runID: openAI.id).map(\.id))
+        XCTAssertFalse(remainingArtifactIDs.contains(comparisonArtifact.id))
+        XCTAssertFalse(remainingArtifactIDs.contains(followUpArtifact.id))
+        XCTAssertNotNil(try store.run(id: openAI.id))
+        XCTAssertNotNil(try store.run(id: swiftUI.id))
     }
 
     func testCommunityCompatibilityExplainsSampleMismatches() {
@@ -462,6 +488,27 @@ final class redappTests: XCTestCase {
             digest: "Complete cached themes"
         )
         XCTAssertTrue(initialQuery.contains("Complete cached themes"))
+    }
+
+    func testCommunityComparisonRecognizesBroadThemeRequests() {
+        XCTAssertTrue(
+            ResearchCommunityComparisonService.isBroadThemeRequest(
+                subject: "Compare the main themes of each community",
+                question: nil
+            )
+        )
+        XCTAssertTrue(
+            ResearchCommunityComparisonService.isBroadThemeRequest(
+                subject: "Model quality",
+                question: "What are the main themes discussed?"
+            )
+        )
+        XCTAssertFalse(
+            ResearchCommunityComparisonService.isBroadThemeRequest(
+                subject: "Model quality",
+                question: "Which community reported more crashes?"
+            )
+        )
     }
 
     func testCommunityComparisonsRequireARemoteLanguageProvider() {

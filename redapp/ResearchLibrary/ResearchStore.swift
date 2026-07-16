@@ -657,6 +657,47 @@ final class ResearchLibraryStore: ObservableObject {
         reloadCurrentQuery()
     }
 
+    func deleteCommunityComparison(id: UUID) throws {
+        guard let record = try communityComparison(id: id) else {
+            throw ResearchStoreError.runNotFound
+        }
+
+        let owningRunID = record.leftRunID
+        let followUpPrefix = "Community Q&A [\(id.uuidString)]: "
+        let comparisonArtifacts = try artifacts(runID: owningRunID).filter { artifact in
+            artifact.id == record.artifactID || artifact.title.hasPrefix(followUpPrefix)
+        }
+        let artifactIDs = Set(comparisonArtifacts.map(\.id))
+
+        for asset in try offlineAssets(runID: owningRunID)
+        where asset.artifactID.map(artifactIDs.contains) == true {
+            if let directory = try? Self.researchDirectory() {
+                let fileURL = directory.appendingPathComponent(asset.relativePath)
+                try? FileManager.default.removeItem(at: fileURL)
+            }
+            context.delete(asset)
+        }
+
+        for artifact in comparisonArtifacts {
+            for claim in try claims(artifactID: artifact.id) {
+                for citation in try citations(claimID: claim.id) {
+                    context.delete(citation)
+                }
+                context.delete(claim)
+            }
+            context.delete(artifact)
+        }
+
+        context.delete(record)
+        try context.save()
+
+        if let run = try run(id: owningRunID) {
+            try rebuildSearchIndex(itemID: run.itemID)
+            try context.save()
+        }
+        reloadCurrentQuery()
+    }
+
     func run(id: UUID) throws -> ResearchRunRecord? {
         var descriptor = FetchDescriptor<ResearchRunRecord>(
             predicate: #Predicate { $0.id == id }

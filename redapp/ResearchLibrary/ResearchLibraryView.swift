@@ -49,6 +49,7 @@ struct ResearchLibraryView: View {
     @State private var selectedTags = Set<String>()
     @State private var presentedExport: ResearchExportDocument?
     @State private var communityComparisons: [ResearchCommunityComparisonRecord] = []
+    @State private var communityComparisonPendingDeletion: ResearchCommunityComparisonRecord?
     @State private var errorMessage: String?
 
     init(
@@ -116,6 +117,20 @@ struct ResearchLibraryView: View {
                                         .foregroundStyle(.secondary)
                                 }
                                 .padding(.vertical, 3)
+                            }
+                            .contextMenu {
+                                Button(role: .destructive) {
+                                    communityComparisonPendingDeletion = comparison
+                                } label: {
+                                    Label("Delete Comparison…", systemImage: "trash")
+                                }
+                            }
+                            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                                Button(role: .destructive) {
+                                    communityComparisonPendingDeletion = comparison
+                                } label: {
+                                    Label("Delete", systemImage: "trash")
+                                }
                             }
                         }
                     }
@@ -227,6 +242,19 @@ struct ResearchLibraryView: View {
             } message: {
                 Text(errorMessage ?? store.lastError ?? "Unknown error")
             }
+            .alert("Delete community comparison?", isPresented: Binding(
+                get: { communityComparisonPendingDeletion != nil },
+                set: { if !$0 { communityComparisonPendingDeletion = nil } }
+            )) {
+                Button("Cancel", role: .cancel) {
+                    communityComparisonPendingDeletion = nil
+                }
+                Button("Delete", role: .destructive) {
+                    deletePendingCommunityComparison()
+                }
+            } message: {
+                Text("This removes the comparison and its generated answers. The two saved subreddit batches will remain in the Research Library.")
+            }
         }
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
@@ -284,6 +312,19 @@ struct ResearchLibraryView: View {
         case .preparing, .running: return "Comparison in progress"
         case .ready: return "Ready · \(comparison.updatedAt.formatted(date: .abbreviated, time: .shortened))"
         case .failed: return "Needs attention"
+        }
+    }
+
+    private func deletePendingCommunityComparison() {
+        guard let comparison = communityComparisonPendingDeletion else { return }
+        communityComparisonPendingDeletion = nil
+        let jobKey = "community:\(comparison.id.uuidString)"
+        comparisonJobs.cancelAndDismiss(key: jobKey)
+        do {
+            try store.deleteCommunityComparison(id: comparison.id)
+            communityComparisons.removeAll { $0.id == comparison.id }
+        } catch {
+            errorMessage = error.localizedDescription
         }
     }
 
@@ -1828,6 +1869,11 @@ final class ResearchComparisonGenerationCoordinator: ObservableObject {
         guard states[key]?.phase != .running else { return }
         states.removeValue(forKey: key)
     }
+
+    func cancelAndDismiss(key: String) {
+        tasks.removeValue(forKey: key)?.cancel()
+        states.removeValue(forKey: key)
+    }
 }
 
 private enum ResearchComparisonGenerationError: LocalizedError {
@@ -1857,6 +1903,7 @@ struct ResearchComparisonView: View {
     @State private var selectedSource: ResearchSourceRecord?
     @State private var areAddedSourcesExpanded = false
     @State private var areEarlierOnlySourcesExpanded = false
+    @State private var areEditedSourcesExpanded = false
     @State private var areScoreChangesExpanded = false
     @State private var errorMessage: String?
 
@@ -1946,28 +1993,42 @@ struct ResearchComparisonView: View {
                 }
 
                 if !difference.edited.isEmpty {
-                    Section("Edited sources") {
-                        ForEach(difference.edited) { delta in
-                            VStack(alignment: .leading, spacing: 8) {
-                                Label(
-                                    delta.displayTitle,
-                                    systemImage: delta.kind == .post ? "doc.text" : "text.bubble"
-                                )
-                                .font(.headline)
-                                HStack {
-                                    sourceButton(
-                                        title: snapshotName(left),
-                                        runID: difference.oldRunID,
-                                        sourceID: delta.sourceID
+                    Section {
+                        DisclosureGroup(isExpanded: $areEditedSourcesExpanded) {
+                            ForEach(difference.edited) { delta in
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Label(
+                                        delta.displayTitle,
+                                        systemImage: delta.kind == .post ? "doc.text" : "text.bubble"
                                     )
-                                    sourceButton(
-                                        title: snapshotName(right),
-                                        runID: difference.newRunID,
-                                        sourceID: delta.sourceID
-                                    )
+                                    .font(.headline)
+                                    HStack {
+                                        sourceButton(
+                                            title: snapshotName(left),
+                                            runID: difference.oldRunID,
+                                            sourceID: delta.sourceID
+                                        )
+                                        sourceButton(
+                                            title: snapshotName(right),
+                                            runID: difference.newRunID,
+                                            sourceID: delta.sourceID
+                                        )
+                                    }
                                 }
+                                .padding(.vertical, 3)
                             }
-                            .padding(.vertical, 3)
+                        } label: {
+                            HStack {
+                                Label("Edited sources", systemImage: "pencil.and.list.clipboard")
+                                    .foregroundStyle(.primary)
+                                Spacer()
+                                Text("\(difference.edited.count)")
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    } footer: {
+                        if !areEditedSourcesExpanded {
+                            Text("Collapsed to keep large comparisons easy to scan.")
                         }
                     }
                 }
@@ -2097,9 +2158,7 @@ struct ResearchComparisonView: View {
         Section("\(snapshotName(detail)) — Overall summary") {
             if let summary = detail.revisionArtifacts.overallSummary {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text(summary.body)
-                        .lineLimit(nil)
-                        .fixedSize(horizontal: false, vertical: true)
+                    MarkdownTextView(content: summary.body, fontScale: 0.8)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .textSelection(.enabled)
                     Text("Saved \(summary.createdAt.formatted(date: .abbreviated, time: .shortened))")
