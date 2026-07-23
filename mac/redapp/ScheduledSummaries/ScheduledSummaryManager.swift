@@ -37,6 +37,10 @@ final class ScheduledSummaryManager: ObservableObject {
     private var timer: Timer?
     private var didStart = false
 
+    nonisolated static func needsBackgroundAgent(for schedules: [ScheduledSummaryDefinition]) -> Bool {
+        schedules.contains(where: \.isEnabled)
+    }
+
     private init() {
         do {
             let loaded = try store.load()
@@ -67,9 +71,9 @@ final class ScheduledSummaryManager: ObservableObject {
                 await ScheduledSummaryManager.shared.checkForDueSchedules()
             }
         }
-        if schedules.contains(where: \.isEnabled) {
-            registerBackgroundAgent()
-        }
+        // Reconcile both directions at launch. An earlier app version may have
+        // left the helper registered even after every schedule was removed.
+        refreshBackgroundRegistration()
         Task { await checkForDueSchedules() }
     }
 
@@ -242,7 +246,7 @@ final class ScheduledSummaryManager: ObservableObject {
     }
 
     private func refreshBackgroundRegistration() {
-        if schedules.contains(where: \.isEnabled) {
+        if Self.needsBackgroundAgent(for: schedules) {
             registerBackgroundAgent()
         } else if agent.status == .enabled || agent.status == .requiresApproval {
             Task {

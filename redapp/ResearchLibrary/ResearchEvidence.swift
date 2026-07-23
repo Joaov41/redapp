@@ -81,6 +81,7 @@ enum ResearchEvidenceValidator {
         coverage: ResearchCoverageInput
     ) throws -> ValidatedGroundedResponse {
         let sourceMap = Dictionary(uniqueKeysWithValues: sources.map { ($0.sourceID, $0) })
+        let sourceResolver = CitationSourceResolver(sources: sources)
         var rejectedMessages: [String] = []
         var validatedClaims: [ResearchClaimInput] = []
 
@@ -90,12 +91,11 @@ enum ResearchEvidenceValidator {
 
             var seenSourceIDs = Set<String>()
             let citations = payloadClaim.citations.compactMap { citation -> ResearchCitationInput? in
-                let sourceID = citation.sourceID.trimmingCharacters(in: .whitespacesAndNewlines)
+                let suppliedSourceID = citation.sourceID.trimmingCharacters(in: .whitespacesAndNewlines)
                 let quote = citation.quote.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !sourceID.isEmpty,
+                guard !suppliedSourceID.isEmpty,
                       !quote.isEmpty,
-                      seenSourceIDs.insert(sourceID).inserted,
-                      let source = sourceMap[sourceID] else {
+                      let source = sourceResolver.resolve(suppliedSourceID) else {
                     return nil
                 }
 
@@ -107,7 +107,11 @@ enum ResearchEvidenceValidator {
                       normalizedSource.contains(normalizedQuote) else {
                     return nil
                 }
-                return ResearchCitationInput(sourceID: sourceID, supportingQuote: quote)
+
+                // Do not let an invalid first attempt for a source suppress a later
+                // citation whose quote is actually present in that source.
+                guard seenSourceIDs.insert(source.sourceID).inserted else { return nil }
+                return ResearchCitationInput(sourceID: source.sourceID, supportingQuote: quote)
             }
 
             guard !citations.isEmpty else {
@@ -115,7 +119,14 @@ enum ResearchEvidenceValidator {
                 continue
             }
 
-            let conflictIDs = (payloadClaim.conflictingSourceIDs ?? []).filter { sourceMap[$0] != nil }
+            var seenConflictIDs = Set<String>()
+            let conflictIDs: [String] = (payloadClaim.conflictingSourceIDs ?? []).compactMap { suppliedID -> String? in
+                guard let source = sourceResolver.resolve(suppliedID),
+                      seenConflictIDs.insert(source.sourceID).inserted else {
+                    return nil
+                }
+                return source.sourceID
+            }
             let citedPosts = Set(citations.compactMap { sourceMap[$0.sourceID]?.postSourceID })
             let confidence = confidence(
                 citationCount: citations.count,
@@ -143,7 +154,9 @@ enum ResearchEvidenceValidator {
         }
         return ValidatedGroundedResponse(
             title: payload.title?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? "Grounded Report",
-            overview: nil,
+            // Model-written overview prose has no citation objects of its own. Keep
+            // the displayed overview grounded by deriving it from validation state.
+            overview: verifiedOverview(for: validatedClaims),
             claims: validatedClaims,
             conflicts: payload.conflicts ?? [],
             missingData: missingData
@@ -158,17 +171,37 @@ enum ResearchEvidenceValidator {
     ) -> ResearchEvidenceConfidence {
         guard citationCount > 0 else { return .unverified }
         let incompleteCoverage = !coverage.failureMessages.isEmpty
+            || !coverage.truncationMessages.isEmpty
             || coverage.commentsOmitted > 0
+            || coverage.commentsAnalyzed < coverage.commentsFetched
+            || coverage.commentsReported > coverage.commentsFetched
             || coverage.postsAnalyzed < coverage.postsRequested
-        if hasConflict || incompleteCoverage { return .low }
-        if citationCount >= 3 && independentPostCount >= 2 { return .high }
-        if citationCount >= 2 && independentPostCount >= 2 { return .medium }
-        return .low
+        if hasConflict { return .low }
+
+        let evidenceConfidence: ResearchEvidenceConfidence
+        if citationCount >= 3 && independentPostCount >= 2 {
+            evidenceConfidence = .high
+        } else if citationCount >= 2 && independentPostCount >= 2 {
+            evidenceConfidence = .medium
+        } else {
+            evidenceConfidence = .low
+        }
+
+        // Incomplete capture limits how broadly strong evidence can be generalized,
+        // but it does not make otherwise independent evidence intrinsically weak.
+        if incompleteCoverage, evidenceConfidence == .high { return .medium }
+        return evidenceConfidence
     }
 
     private static func coverageWarnings(_ coverage: ResearchCoverageInput) -> [String] {
         var warnings = coverage.failureMessages + coverage.truncationMessages
-        if coverage.postsAnalyzed < coverage.postsRequested {
+        let hasRecordedPostGap = warnings.contains { warning in
+            let value = warning.lowercased()
+            return value.contains("post")
+                && value.contains("request")
+                && value.rangeOfCharacter(from: .decimalDigits) != nil
+        }
+        if coverage.postsAnalyzed < coverage.postsRequested, !hasRecordedPostGap {
             warnings.append("Only \(coverage.postsAnalyzed) of \(coverage.postsRequested) requested posts were analyzed.")
         }
         if coverage.commentsOmitted > 0 {
@@ -182,11 +215,93 @@ enum ResearchEvidenceValidator {
         return Array(Set(warnings)).sorted()
     }
 
+    static func verifiedOverview(for claims: [ResearchClaimInput]) -> String? {
+        guard !claims.isEmpty else { return nil }
+        let noun = claims.count == 1 ? "finding" : "findings"
+        return "The report below contains \(claims.count) \(noun) verified against the saved posts and comments; each finding includes its supporting source links."
+    }
+
     private static func normalizedEvidenceText(_ value: String) -> String {
-        value.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+        removingMarkdownEmphasis(from: value)
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
             .lowercased()
             .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func removingMarkdownEmphasis(from value: String) -> String {
+        // Remove only paired Markdown emphasis delimiters whose contents touch
+        // both delimiters. This preserves ordinary underscores (for example,
+        // `token_budget`) and keeps quote validation as an exact substring check.
+        let patterns = [
+            #"\*\*\*([^*\s](?:[^*\r\n]*?[^*\s])?)\*\*\*"#,
+            #"(?<![\p{L}\p{N}_])___([^_\s](?:[^_\r\n]*?[^_\s])?)___(?![\p{L}\p{N}_])"#,
+            #"\*\*([^*\s](?:[^*\r\n]*?[^*\s])?)\*\*"#,
+            #"(?<![\p{L}\p{N}_])__([^_\s](?:[^_\r\n]*?[^_\s])?)__(?![\p{L}\p{N}_])"#,
+            #"(?<!\*)\*([^*\s](?:[^*\r\n]*?[^*\s])?)\*(?!\*)"#,
+            #"(?<![\p{L}\p{N}_])_([^_\s](?:[^_\r\n]*?[^_\s])?)_(?![\p{L}\p{N}_])"#
+        ]
+        return patterns.reduce(value) { result, pattern in
+            result.replacingOccurrences(
+                of: pattern,
+                with: "$1",
+                options: .regularExpression
+            )
+        }
+    }
+
+    private struct CitationSourceResolver {
+        private let sourcesByID: [String: ResearchSourceInput]
+        private let canonicalIDsByAlias: [String: Set<String>]
+
+        init(sources: [ResearchSourceInput]) {
+            sourcesByID = Dictionary(uniqueKeysWithValues: sources.map { ($0.sourceID, $0) })
+            var aliases: [String: Set<String>] = [:]
+            for source in sources {
+                for alias in Self.aliases(for: source.sourceID) {
+                    aliases[Self.lookupKey(alias), default: []].insert(source.sourceID)
+                }
+            }
+            canonicalIDsByAlias = aliases
+        }
+
+        func resolve(_ suppliedID: String) -> ResearchSourceInput? {
+            let trimmedID = suppliedID.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedID.isEmpty else { return nil }
+            if let exact = sourcesByID[trimmedID] { return exact }
+            guard let candidates = canonicalIDsByAlias[Self.lookupKey(trimmedID)],
+                  candidates.count == 1,
+                  let canonicalID = candidates.first else {
+                return nil
+            }
+            return sourcesByID[canonicalID]
+        }
+
+        private static func aliases(for canonicalID: String) -> Set<String> {
+            let canonicalID = canonicalID.trimmingCharacters(in: .whitespacesAndNewlines)
+            var aliases: Set<String> = [canonicalID]
+            guard let reference = ResearchCommunitySourceReference.parse(canonicalID) else {
+                return aliases
+            }
+
+            let side = reference.side.rawValue
+            let runID = reference.runID.uuidString
+            let subreddit = reference.subreddit
+            let underlyingID = reference.sourceID
+            aliases.formUnion([
+                "\(side):\(runID):\(subreddit):\(underlyingID)",
+                "\(runID):\(subreddit):\(underlyingID)",
+                "\(subreddit):\(underlyingID)",
+                "community:\(side):\(underlyingID)",
+                "\(side):\(underlyingID)",
+                underlyingID
+            ])
+            return aliases
+        }
+
+        private static func lookupKey(_ sourceID: String) -> String {
+            sourceID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        }
     }
 }
 
@@ -617,11 +732,11 @@ actor GroundedResearchService {
         Return one JSON object only, with exactly this shape:
         {
           "title": "short title",
-          "overview": "brief scope-aware overview",
+          "overview": "optional one-sentence scope note without factual findings",
           "claims": [
             {
               "text": "one atomic factual claim",
-              "claimType": "finding|sentiment|trend|answer",
+              "claimType": "task-specific value requested above, otherwise finding",
               "citations": [
                 {"sourceID": "exact source id", "quote": "exact verbatim excerpt from that source"}
               ],
@@ -634,9 +749,11 @@ actor GroundedResearchService {
         }
 
         Requirements:
+        - Do not put factual findings or prevalence counts in overview; the app derives its displayed overview from the validated claims.
         - Every claim must have at least one citation.
         - Every quote must be an exact, contiguous excerpt from its cited source.
         - Split compound statements into atomic claims.
+        - Use any task-specific claimType values from the Task exactly as requested; otherwise use finding.
         - Report genuine disagreement under conflicts; do not average it away.
         - State missing or insufficient evidence under missingData.
         - If the sources do not answer the task, return an empty claims array and explain why in missingData.

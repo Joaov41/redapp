@@ -10,6 +10,97 @@ import XCTest
 @testable import redapp
 
 final class redappTests: XCTestCase {
+    func testQuestionAnswerFormatterUnwrapsSingleFieldPCCJSON() {
+        let response = """
+        {
+          "main_theme": "Diverse uses and perceptions of ChatGPT"
+        }
+        """
+
+        XCTAssertEqual(
+            QuestionAnswerTextFormatter.displayText(from: response),
+            "Diverse uses and perceptions of ChatGPT"
+        )
+    }
+
+    func testQuestionAnswerFormatterPreservesNormalProse() {
+        let response = "The main theme is how people use and perceive ChatGPT."
+        XCTAssertEqual(QuestionAnswerTextFormatter.displayText(from: response), response)
+    }
+
+    func testQuestionAnswerFormatterUnwrapsPCCSummaryJSON() {
+        let response = """
+        ```json
+        {"summary":"Commenters discuss stable SwiftUI identity."}
+        ```
+        """
+
+        XCTAssertEqual(
+            QuestionAnswerTextFormatter.displayText(from: response),
+            "Commenters discuss stable SwiftUI identity."
+        )
+    }
+
+    func testQuestionAnswerFormatterRendersCategorizedPCCBatchJSON() {
+        let response = """
+        {
+          "categorized_summary": {
+            "SwiftUI technical deep dives": [
+              {
+                "topic": "ForEach without Identifiable elements",
+                "summary": "Commenters discuss stable identity workarounds."
+              }
+            ]
+          }
+        }
+        """
+
+        let displayed = QuestionAnswerTextFormatter.displayText(from: response)
+        XCTAssertTrue(displayed.contains("## SwiftUI technical deep dives"))
+        XCTAssertTrue(displayed.contains("ForEach without Identifiable elements"))
+        XCTAssertTrue(displayed.contains("Commenters discuss stable identity workarounds."))
+        XCTAssertFalse(displayed.contains("categorized_summary"))
+    }
+
+    func testQuestionAnswerFormatterRepairsInvalidPCCBackslashEscape() {
+        let response = #"{"categorized_summary":{"SwiftUI Patterns & Syntax":{"topics":["ForEach using \.self"],"summary":"Identity workarounds."}}}"#
+
+        let displayed = QuestionAnswerTextFormatter.displayText(from: response)
+        XCTAssertTrue(displayed.contains("## SwiftUI Patterns & Syntax"))
+        XCTAssertTrue(displayed.contains(#"ForEach using \.self"#))
+        XCTAssertTrue(displayed.contains("Identity workarounds."))
+        XCTAssertFalse(displayed.contains("categorized_summary"))
+    }
+
+    func testPostSummaryPresentationHidesInternalEvidenceTokensAndStructuresLegacyProse() {
+        let raw = """
+        Commenters mostly oppose fixed five-hour limits because they interrupt long work sessions [SOURCE:t1_alpha] [SOURCE:t1_beta]. Many prefer weekly budgets with visible burn-rate warnings [SOURCE:t1_gamma]. A minority likes the existing window because it creates a stopping point [SOURCE:t1_delta].
+        """
+
+        let markdown = ResearchPostSummaryPresentation.displayMarkdown(from: raw)
+        XCTAssertFalse(markdown.contains("[SOURCE:"))
+        XCTAssertTrue(markdown.contains("- "))
+        XCTAssertTrue(markdown.contains("Commenters mostly oppose"))
+        XCTAssertEqual(
+            ResearchPostSummaryPresentation.sourceIDs(in: raw),
+            ["t1_alpha", "t1_beta", "t1_gamma", "t1_delta"]
+        )
+    }
+
+    func testPostSummaryPresentationPreservesRealMarkdownStructure() {
+        let raw = """
+        Two positions recur in the discussion. [SOURCE:t3_post]
+
+        - Most commenters want weekly limits. [SOURCE:t1_one]
+        - A minority prefers session windows. [SOURCE:t1_two]
+        """
+
+        let markdown = ResearchPostSummaryPresentation.displayMarkdown(from: raw)
+        XCTAssertTrue(markdown.contains("\n\n- Most commenters"))
+        XCTAssertTrue(markdown.contains("\n- A minority"))
+        XCTAssertFalse(markdown.contains("[SOURCE:"))
+    }
+
     func testResearchCaptureLabelsDescribeFeedTypeAndTopRange() {
         XCTAssertEqual(
             ResearchCaptureLabel.displayName(sortMode: "top", timeRange: "day"),
@@ -306,6 +397,168 @@ final class redappTests: XCTestCase {
         let checked = ResearchCommunityComparisonService.enforceTwoSidedComparisons(response)
         XCTAssertEqual(checked.claims.map(\.text), ["Both communities emphasize practical use."])
         XCTAssertTrue(checked.missingData.contains { $0.contains("both communities") })
+    }
+
+    func testGroupedCommunityThemesRequireEveryComparativeRole() throws {
+        let first = ResearchCommunitySourceReference(
+            side: .first,
+            runID: UUID(),
+            subreddit: "codex",
+            sourceID: "t3_first"
+        )
+        let second = ResearchCommunitySourceReference(
+            side: .second,
+            runID: UUID(),
+            subreddit: "openai",
+            sourceID: "t3_second"
+        )
+        func claim(
+            _ role: ResearchCommunityThemeClaimType.Role,
+            citations: [String]
+        ) -> ResearchClaimInput {
+            let type = ResearchCommunityThemeClaimType(
+                index: 1,
+                role: role,
+                title: "Resets and quotas"
+            )
+            return ResearchClaimInput(
+                order: role == .shared ? 0 : 1,
+                text: "Supported \(role.rawValue) point.",
+                claimType: type.encoded,
+                citations: citations.map { .init(sourceID: $0) },
+                confidence: .medium
+            )
+        }
+
+        let complete = [
+            claim(.shared, citations: [first.encodedID, second.encodedID]),
+            claim(.first, citations: [first.encodedID]),
+            claim(.second, citations: [second.encodedID]),
+            claim(.difference, citations: [first.encodedID, second.encodedID])
+        ]
+
+        XCTAssertEqual(ResearchCommunityComparisonService.completeThemeCount(in: complete), 1)
+        let parsed = try XCTUnwrap(
+            ResearchCommunityThemeClaimType.parse(complete[0].claimType)
+        )
+        XCTAssertEqual(parsed.title, "Resets and quotas")
+        XCTAssertEqual(parsed.role, .shared)
+        XCTAssertEqual(ResearchCommunityComparisonService.completeThemeCount(in: Array(complete.dropLast())), 0)
+
+        let wrongSide = claim(.second, citations: [first.encodedID])
+        let checked = ResearchCommunityComparisonService.enforceTwoSidedComparisons(
+            ValidatedGroundedResponse(
+                title: "Comparison",
+                overview: nil,
+                claims: [wrongSide],
+                conflicts: [],
+                missingData: []
+            )
+        )
+        XCTAssertTrue(checked.claims.isEmpty)
+    }
+
+    func testCommunityThemePlanDecodesFencedJSONAndRejectsUnplannedThemes() throws {
+        let raw = """
+        ```json
+        {"themes":[
+          {"title":"Usage limits","sharedIssue":"Quota resets affect continued use.","firstPerspective":"Users manage burn directly.","secondPerspective":"Users question the strategy.","divergence":"Operational control versus market interpretation.","firstSourceIDs":["t3_first"],"secondSourceIDs":["t3_second"]},
+          {"title":"Workflow friction","sharedIssue":"Desktop reliability interrupts work.","firstPerspective":"Users troubleshoot the coding client.","secondPerspective":"Users criticize the broader product UX.","divergence":"Harness fixes versus product design.","firstSourceIDs":["t3_first2"],"secondSourceIDs":["t3_second2"]},
+          {"title":"Model routing","sharedIssue":"Different models fit different tasks.","firstPerspective":"Users route work inside Codex.","secondPerspective":"Users compare providers.","divergence":"Internal routing versus vendor selection.","firstSourceIDs":["t3_first3"],"secondSourceIDs":["t3_second3"]}
+        ]}
+        ```
+        """
+        let plan = try XCTUnwrap(ResearchCommunityComparisonService.decodeThemePlan(raw))
+        XCTAssertEqual(plan.themes.map(\.title), ["Usage limits", "Workflow friction", "Model routing"])
+
+        func claim(title: String) -> ResearchClaimInput {
+            ResearchClaimInput(
+                order: 0,
+                text: "A supported point.",
+                claimType: ResearchCommunityThemeClaimType(
+                    index: 1,
+                    role: .first,
+                    title: title
+                ).encoded,
+                citations: [],
+                confidence: .medium
+            )
+        }
+        let checked = ResearchCommunityComparisonService.enforcePlannedThemes(
+            ValidatedGroundedResponse(
+                title: "Comparison",
+                overview: nil,
+                claims: [claim(title: "Usage limits"), claim(title: "Practical output")],
+                conflicts: [],
+                missingData: []
+            ),
+            plan: plan
+        )
+        XCTAssertEqual(checked.claims.map(\.claimType), ["theme:1:first:Usage limits"])
+    }
+
+    func testComparisonLimitationsCollapseDuplicateCollectionWarnings() {
+        let coverage = ResearchCoverageInput(
+            postsRequested: 100,
+            postsFetched: 96,
+            postsAnalyzed: 96,
+            commentsReported: 3_239,
+            commentsFetched: 3_066,
+            commentsAnalyzed: 3_066,
+            commentsOmitted: 0,
+            failureMessages: [],
+            truncationMessages: []
+        )
+        let cleaned = ResearchCommunityComparisonService.cleanedComparisonResponse(
+            ValidatedGroundedResponse(
+                title: "Comparison",
+                overview: "The report below contains 14 findings.",
+                claims: [],
+                conflicts: [],
+                missingData: [
+                    "Only 48 posts per community were loaded although 50 were requested.",
+                    "Only 48 posts were loaded when the batch started although 50 were requested.",
+                    "Reddit reported 3239 comments, but only 3066 were fetched."
+                ]
+            ),
+            coverage: coverage
+        )
+
+        XCTAssertNil(cleaned.overview)
+        XCTAssertEqual(cleaned.missingData.count, 2)
+        XCTAssertTrue(cleaned.missingData.contains { $0.contains("96 of 100") })
+        XCTAssertTrue(cleaned.missingData.contains { $0.contains("3,239") || $0.contains("3239") })
+    }
+
+    func testBroadComparisonLimitationsComeOnlyFromCoverageLedger() {
+        let coverage = ResearchCoverageInput(
+            postsRequested: 100,
+            postsFetched: 96,
+            postsAnalyzed: 96,
+            commentsReported: 3_239,
+            commentsFetched: 3_066,
+            commentsAnalyzed: 3_066,
+            commentsOmitted: 0,
+            failureMessages: [],
+            truncationMessages: []
+        )
+        let cleaned = ResearchCommunityComparisonService.cleanedComparisonResponse(
+            ValidatedGroundedResponse(
+                title: "Comparison",
+                overview: nil,
+                claims: [],
+                conflicts: [],
+                missingData: [
+                    "Some supplied original sources have empty or truncated content.",
+                    "A proposed theme could not be verified."
+                ]
+            ),
+            coverage: coverage,
+            includeModelLimitations: false
+        )
+
+        XCTAssertEqual(cleaned.missingData.count, 2)
+        XCTAssertTrue(cleaned.missingData.allSatisfy { $0.hasPrefix("Across both saved batches") })
     }
 
     func testCommunitySummaryChunksIncludeEverySummaryAndFullOverview() {

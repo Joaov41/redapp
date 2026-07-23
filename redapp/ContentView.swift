@@ -4384,6 +4384,8 @@ struct SettingsView: View {
     @State private var modelStorageStatus: String? = nil
     @State private var pendingModelStorageDelete: LocalModelStorageItem? = nil
     @State private var showModelStorageDeleteConfirm: Bool = false
+    @AppStorage("experimentalSettingsGlassEnabled") private var experimentalSettingsGlassEnabled = true
+    @AppStorage("experimentalSettingsGlassVariant") private var experimentalSettingsGlassVariant = 11
 
     // MLX Local model management
     @State private var isLoadingMLXModel = false
@@ -4419,6 +4421,10 @@ struct SettingsView: View {
         AppColors.background
     }
 
+    private var settingsSurfaceBackground: Color {
+        settingsBackground
+    }
+
     private func launchWebAILogin(_ provider: WebAIProvider) {
         dismiss()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
@@ -4429,7 +4435,7 @@ struct SettingsView: View {
     var body: some View {
         NavigationView {
             ZStack {
-                settingsBackground
+                settingsSurfaceBackground
                     .ignoresSafeArea()
                 
                 Form {
@@ -5485,6 +5491,69 @@ struct SettingsView: View {
                     Text("When enabled, app will always use dark mode. When disabled, app follows system setting.")
                         .font(.caption)
                         .foregroundColor(.secondary)
+
+                    Divider()
+
+                    Toggle("Experimental Glass Everywhere", isOn: $experimentalSettingsGlassEnabled)
+
+                    VStack(alignment: .leading, spacing: 7) {
+                        HStack {
+                            Text("Glass Variant")
+                            Spacer()
+                            Text("\(experimentalSettingsGlassVariant)")
+                                .monospacedDigit()
+                                .foregroundStyle(.secondary)
+                        }
+
+                        Slider(
+                            value: Binding(
+                                get: { Double(experimentalSettingsGlassVariant) },
+                                set: { experimentalSettingsGlassVariant = Int($0.rounded()) }
+                            ),
+                            in: 0...19,
+                            step: 1
+                        )
+
+                        HStack {
+                            Text("0")
+                            Spacer()
+                            Button("Reset to 11") {
+                                experimentalSettingsGlassVariant = 11
+                            }
+                            .buttonStyle(.borderless)
+                            Spacer()
+                            Text("19")
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
+
+                    if experimentalSettingsGlassEnabled {
+                        ExperimentalAppGlassSurface(
+                            enabled: true,
+                            variant: experimentalSettingsGlassVariant,
+                            cornerRadius: 14
+                        ) {
+                            HStack(spacing: 12) {
+                                Image(systemName: "sparkles.rectangle.stack")
+                                    .font(.system(size: 26, weight: .medium))
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text("Glass Variant \(experimentalSettingsGlassVariant)")
+                                        .font(.headline)
+                                    Text("Native iOS Liquid Glass preview")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                            }
+                            .padding(16)
+                        }
+                        .frame(height: 78)
+                    }
+
+                    Text("Experimental appearance. Disable this switch to restore the complete standard iOS interface instantly.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 } header: {
                     Text("Appearance")
                 }
@@ -5509,12 +5578,12 @@ struct SettingsView: View {
                 }
                 .formStyle(.grouped)
                 .scrollContentBackground(.hidden)
-                .background(settingsBackground)
+                .background(settingsSurfaceBackground)
             }
             .navigationTitle("Settings")
             #if os(iOS)
             .toolbarBackground(.visible, for: .navigationBar)
-            .toolbarBackground(settingsBackground, for: .navigationBar)
+            .toolbarBackground(settingsSurfaceBackground, for: .navigationBar)
             .toolbarColorScheme(colorScheme == .dark ? .dark : .light, for: .navigationBar)
             #endif
             .toolbar {
@@ -5534,9 +5603,9 @@ struct SettingsView: View {
                 #endif
             }
         }
-        .background(settingsBackground)
+        .background(settingsSurfaceBackground)
         #if os(iOS)
-        .presentationBackground(settingsBackground)
+        .presentationBackground(settingsSurfaceBackground)
         #endif
         .alert("API Key Help", isPresented: $showApiKeyHelp) {
             Button("OK") { }
@@ -8515,6 +8584,7 @@ class RedditSubredditViewModel: ObservableObject {
             publishWidgetSnapshot()
         }
     }
+    @Published var batchFinalSummaryWasPCC = false
     @Published var batchFinalSummaryCondensed: String? {
         didSet {
             if isApplyingFinalSummaryUpdate { return }
@@ -9086,7 +9156,18 @@ class RedditSubredditViewModel: ObservableObject {
                             // MLX models need instructions BEFORE content to avoid repeating instructions
                             if SummaryService.shared.settings.selectedSummaryProvider == .mlxLocal {
                                 batchPrompt = """
-                                You will summarize \(batchPostData.count) Reddit posts. For each post, write a 1-2 paragraph summary. Separate paragraphs with a blank line.
+                                You will summarize \(batchPostData.count) Reddit posts. For each post, write a compact evidence-preserving summary.
+
+                                For every post, retain:
+                                - the main subject and how commenters frame it;
+                                - the dominant reaction and tone;
+                                - meaningful disagreement or minority viewpoints;
+                                - concrete examples, constraints, or workarounds;
+                                - the supplied [SOURCE:...] IDs beside the points they support.
+
+                                Do not turn a mixed discussion into a single consensus. Do not invent prevalence or reactions.
+
+                                \(ResearchPostSummaryPresentation.generationInstructions)
 
                                 OUTPUT FORMAT (one per post):
                                 POST 1 SUMMARY: [your summary text here]
@@ -9097,7 +9178,14 @@ class RedditSubredditViewModel: ObservableObject {
 
                                 """
                             } else {
-                                batchPrompt = "Provide SHORT summaries for the following Reddit posts. Each summary should be NO MORE THAN 2 PARAGRAPHS. Be extremely concise. Separate every paragraph with a blank line.\n\n"
+                                batchPrompt = """
+                                Produce a compact evidence-preserving summary for each Reddit post below.
+
+                                For every post, retain the main subject, how commenters frame it, the dominant reaction and tone, meaningful disagreement or minority viewpoints, and concrete examples or workarounds. Keep the supplied [SOURCE:...] IDs beside the points they support. Do not collapse mixed reactions into consensus, invent prevalence, or omit a minority view merely to be shorter.
+
+                                \(ResearchPostSummaryPresentation.generationInstructions)
+
+                                """
                             }
 
                             for (index, postData) in batchPostData.enumerated() {
@@ -9487,9 +9575,12 @@ class RedditSubredditViewModel: ObservableObject {
         return """
         Summarize this Reddit post from \(feedDescription).
 
-        Write a concise 1-2 paragraph summary of what the post and comments are about.
-        Capture the main point, notable reactions, sentiment, disagreements, and any useful context.
+        Write a compact evidence-preserving summary of what the post and comments are about.
+        Capture the main point, how commenters frame it, the dominant reaction and tone, meaningful minority viewpoints, disagreements, and concrete examples or workarounds. Keep supplied [SOURCE:...] IDs beside the points they support.
+        Do not collapse mixed reactions into consensus or invent prevalence.
         Do not transcribe the comments. Do not include markdown tables. Output only the summary.
+
+        \(ResearchPostSummaryPresentation.generationInstructions)
 
         Post title:
         \(post.title)
@@ -9834,10 +9925,13 @@ class RedditSubredditViewModel: ObservableObject {
 
 		        // Local limited-context providers: use one combined request when it fits. If it does not fit, ask the user to reroute.
 		        if isLocalLimitedContextProvider {
-		            var combinedPrompt = ""
-		            combinedPrompt += "Provide SHORT summaries for the following \(allPostData.count) Reddit posts from \(feedDescription).\n"
-		            combinedPrompt += "Each summary should be NO MORE THAN 2 PARAGRAPHS. Be extremely concise.\n"
-		            combinedPrompt += "Separate paragraphs with a blank line.\n\n"
+		            var combinedPrompt = """
+		            Provide compact, evidence-preserving summaries for the following \(allPostData.count) Reddit posts from \(feedDescription).
+		            For each post, retain how commenters frame the subject, the dominant reaction and tone, meaningful disagreement or minority viewpoints, concrete examples or workarounds, and supplied [SOURCE:...] IDs. Do not invent prevalence or flatten mixed reactions into consensus.
+
+		            \(ResearchPostSummaryPresentation.generationInstructions)
+
+		            """
 
 		            for (index, postData) in allPostData.enumerated() {
 		                combinedPrompt += "\nPOST \(index + 1): \(postData.title)\n"
@@ -9941,7 +10035,9 @@ class RedditSubredditViewModel: ObservableObject {
                 // Build single-post prompt with limited comments to keep shortcut payload small
                 let limitedComments = postData.comments.prefix(8000) // Limit to ~2k tokens
                 let singlePostPrompt = """
-                Summarize this Reddit post in 1-2 paragraphs. Be concise. Separate paragraphs with a blank line.
+                Summarize this Reddit post and its comments while retaining how commenters frame the subject, the dominant reaction and tone, meaningful disagreement or minority viewpoints, and concrete examples or workarounds. Keep supplied [SOURCE:...] IDs beside the points they support. Do not invent prevalence or flatten mixed reactions into consensus.
+
+                \(ResearchPostSummaryPresentation.generationInstructions)
 
                 POST: \(postData.title)
                 COMMENTS:
@@ -10032,9 +10128,10 @@ class RedditSubredditViewModel: ObservableObject {
                 }
 
                 var combinedPrompt = """
-                Provide VERY SHORT summaries (1-2 paragraphs each) for the following \(batchPosts.count) Reddit posts from \(feedDescription).
-                Be concise.
-                Separate paragraphs with a blank line.
+                Provide compact, evidence-preserving summaries for the following \(batchPosts.count) Reddit posts from \(feedDescription).
+                For each post, retain how commenters frame the subject, the dominant reaction and tone, meaningful disagreement or minority viewpoints, concrete examples or workarounds, and supplied [SOURCE:...] IDs. Do not invent prevalence or flatten mixed reactions into consensus.
+
+                \(ResearchPostSummaryPresentation.generationInstructions)
 
                 """
 
@@ -10107,9 +10204,10 @@ class RedditSubredditViewModel: ObservableObject {
             }
 
             var combinedPrompt = """
-            Provide SHORT summaries for the following \(allPostData.count) Reddit posts from \(feedDescription).
-            Each summary should be NO MORE THAN 2 PARAGRAPHS. Be extremely concise.
-            Separate paragraphs with a blank line.
+            Provide compact, evidence-preserving summaries for the following \(allPostData.count) Reddit posts from \(feedDescription).
+            For each post, retain how commenters frame the subject, the dominant reaction and tone, meaningful disagreement or minority viewpoints, concrete examples or workarounds, and supplied [SOURCE:...] IDs. Do not invent prevalence or flatten mixed reactions into consensus.
+
+            \(ResearchPostSummaryPresentation.generationInstructions)
 
             """
 
@@ -10538,6 +10636,8 @@ class RedditSubredditViewModel: ObservableObject {
             3. Key topics of discussion
             4. Any notable trends or patterns
 
+            Use the individual post summaries to distinguish recurring themes from meaningful minority topics and preserve disagreement. Do not state an exact supporting-post count unless the matching supplied [SOURCE:...] IDs are retained, and do not translate post support into claims about a majority of commenters.
+
             Individual Post Summaries:
 
             \(shortSummaries)
@@ -10553,6 +10653,8 @@ class RedditSubredditViewModel: ObservableObject {
         3. Key topics of discussion
         4. Any notable trends or patterns
 
+        Use the individual post summaries to distinguish recurring themes from meaningful minority topics and preserve disagreement. Do not state an exact supporting-post count unless the matching supplied [SOURCE:...] IDs are retained, and do not translate post support into claims about a majority of commenters.
+
         Individual Post Summaries:
 
         \(combinedSummaries)
@@ -10560,11 +10662,13 @@ class RedditSubredditViewModel: ObservableObject {
     }
 
     private func generateFinalSummary(subreddit: String) async {
+        let selectedProvider = SummaryService.shared.settings.selectedSummaryProvider
         await MainActor.run {
             self.batchProgress = 1.0
             self.batchCurrentPostTitle = "Generating overall summary..."
             self.showBatchResults = true
             self.batchFinalSummary = ""
+            self.batchFinalSummaryWasPCC = selectedProvider == .applePCCGateway
             self.isGeneratingBatchOverallSummary = true
             #if os(iOS)
             if #available(iOS 16.1, *) {
@@ -10578,11 +10682,14 @@ class RedditSubredditViewModel: ObservableObject {
             #endif
         }
 
-        let finalPrompt = overallSummaryPrompt(for: subreddit)
+        let baseFinalPrompt = overallSummaryPrompt(for: subreddit)
+        let finalPrompt = selectedProvider == .applePCCGateway
+            ? baseFinalPrompt + "\n\nReturn only a readable overall summary in plain natural-language Markdown. Do not return JSON, a property list, or a code block."
+            : baseFinalPrompt
 
         do {
             let finalSummary: String
-            if SummaryService.shared.settings.selectedSummaryProvider == .webAI {
+            if selectedProvider == .webAI {
                 await MainActor.run {
                     AppState.shared.isWebAIHandoffMinimized = true
                 }
@@ -10595,6 +10702,8 @@ class RedditSubredditViewModel: ObservableObject {
                     self.batchCurrentPostTitle = ""
                     self.showBatchResults = true
                 }
+            } else if selectedProvider == .applePCCGateway {
+                finalSummary = try await SummaryService.shared.summarize(text: finalPrompt)
             } else {
                 finalSummary = try await SummaryService.shared.summarize(
                     text: finalPrompt,
@@ -10603,10 +10712,13 @@ class RedditSubredditViewModel: ObservableObject {
                     }
                 )
             }
-            let condensedSummary = await generateWidgetCondensedSummary(from: finalSummary)
+            let displaySummary = selectedProvider == .applePCCGateway
+                ? QuestionAnswerTextFormatter.displayText(from: finalSummary)
+                : finalSummary
+            let condensedSummary = await generateWidgetCondensedSummary(from: displaySummary)
             await MainActor.run {
                 self.isApplyingFinalSummaryUpdate = true
-                self.batchFinalSummary = finalSummary
+                self.batchFinalSummary = displaySummary
                 self.batchFinalSummaryCondensed = condensedSummary
                 self.batchCurrentPostTitle = ""
                 self.isBatchProcessing = false
@@ -12556,6 +12668,7 @@ struct CommentSummaryView: View {
         \(allRawComments)
 
         Answer the following question based on the information in the comments above: \(question)
+
         """
 
         answerGenerationTask = Task {
@@ -12575,7 +12688,9 @@ struct CommentSummaryView: View {
                     )
                 }
                 await MainActor.run {
-                    self.answer = fetchedAnswer
+                    self.answer = SummaryService.shared.settings.selectedSummaryProvider == .applePCCGateway
+                        ? QuestionAnswerTextFormatter.displayText(from: fetchedAnswer)
+                        : fetchedAnswer
                     self.isAnswering = false
                 }
             } catch is CancellationError {
@@ -13492,16 +13607,23 @@ private func splitLongReplyParagraph(_ paragraph: String) -> [String] {
 struct ReadableReplyText: View {
     let content: String
     let fontScale: CGFloat
+    let sourceLinks: [String: URL]
 
-    init(content: String, fontScale: CGFloat = 1.0) {
+    init(
+        content: String,
+        fontScale: CGFloat = 1.0,
+        sourceLinks: [String: URL] = [:]
+    ) {
         self.content = content
         self.fontScale = fontScale
+        self.sourceLinks = sourceLinks
     }
 
     var body: some View {
         MarkdownTextView(
             content: readableReplyText(content),
-            fontScale: fontScale
+            fontScale: fontScale,
+            sourceLinks: sourceLinks
         )
     }
 }
@@ -13511,13 +13633,20 @@ struct MarkdownTextView: View {
     let content: String
     let fontScale: CGFloat
     let justifyParagraphs: Bool
+    let sourceLinks: [String: URL]
     @Environment(\.colorScheme) var colorScheme
     
     // Initialize with optional font scale
-    init(content: String, fontScale: CGFloat = 1.0, justifyParagraphs: Bool = false) {
+    init(
+        content: String,
+        fontScale: CGFloat = 1.0,
+        justifyParagraphs: Bool = false,
+        sourceLinks: [String: URL] = [:]
+    ) {
         self.content = content
         self.fontScale = fontScale
         self.justifyParagraphs = justifyParagraphs
+        self.sourceLinks = sourceLinks
     }
     
     // Platform-specific base font size with scale factor
@@ -13820,6 +13949,48 @@ struct MarkdownTextView: View {
         
         // Process the text character by character
         while currentIndex < text.endIndex {
+            // Turn evidence tokens into compact, clickable Reddit citations.
+            if text[currentIndex...].lowercased().hasPrefix("[source:"),
+               let closingBracket = text[currentIndex...].firstIndex(of: "]") {
+                let idStart = text.index(currentIndex, offsetBy: 8)
+                let sourceID = String(text[idStart..<closingBracket])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !sourceID.isEmpty {
+                    var source = AttributedString("[\(sourceID)]")
+                    if let destination = sourceLinks[sourceID] {
+                        source.link = destination
+                        source.foregroundColor = .accentColor
+                        source.underlineStyle = .single
+                    }
+                    result.append(source)
+                    currentIndex = text.index(after: closingBracket)
+                    continue
+                }
+            }
+
+            // Handle ordinary inline Markdown links as real links as well.
+            if text[currentIndex] == "[",
+               let labelEnd = text[currentIndex...].firstIndex(of: "]"),
+               labelEnd < text.index(before: text.endIndex) {
+                let openParen = text.index(after: labelEnd)
+                if text[openParen] == "(",
+                   let closeParen = text[openParen...].firstIndex(of: ")") {
+                    let labelStart = text.index(after: currentIndex)
+                    let urlStart = text.index(after: openParen)
+                    let label = String(text[labelStart..<labelEnd])
+                    let urlString = String(text[urlStart..<closeParen])
+                    if let destination = URL(string: urlString), !label.isEmpty {
+                        var link = AttributedString(label)
+                        link.link = destination
+                        link.foregroundColor = .accentColor
+                        link.underlineStyle = .single
+                        result.append(link)
+                        currentIndex = text.index(after: closeParen)
+                        continue
+                    }
+                }
+            }
+
             // Check for bold text (**text** or __text__)
             if text[currentIndex...].hasPrefix("**") || text[currentIndex...].hasPrefix("__") {
                 let delimiter = String(text[currentIndex...].prefix(2))
@@ -14103,13 +14274,42 @@ struct ResizableTextBox: View {
 }
 
 // MARK: - Liquid Glass Styles
+/// Native Liquid Glass with the app's existing compact control measurements.
+/// Keeping this as a regular `ButtonStyle` also lets `Menu` labels receive the
+/// same treatment as buttons instead of falling back to unstyled blue icons.
 struct LiquidGlassButtonStyle: ButtonStyle {
     var isProminent: Bool = false
-    
+
+    @ViewBuilder
     func makeBody(configuration: Configuration) -> some View {
+        #if os(iOS)
+        if #available(iOS 26.0, *) {
+            let shape = RoundedRectangle(cornerRadius: 20, style: .continuous)
+            let glass = isProminent
+                ? Glass.regular.tint(Color.accentColor.opacity(0.24))
+                : Glass.regular
+
+            configuration.label
+                .font(.callout)
+                .foregroundStyle(.primary)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .contentShape(shape)
+                .glassEffect(glass.interactive(), in: .rect(cornerRadius: 20))
+                .scaleEffect(configuration.isPressed ? 0.95 : 1.0)
+                .animation(.easeInOut(duration: 0.1), value: configuration.isPressed)
+        } else {
+            legacyBody(configuration: configuration)
+        }
+        #else
+        legacyBody(configuration: configuration)
+        #endif
+    }
+
+    private func legacyBody(configuration: Configuration) -> some View {
         let shape = RoundedRectangle(cornerRadius: 20, style: .continuous)
 
-        configuration.label
+        return configuration.label
             .font(.callout)
             .foregroundStyle(.primary)
             .padding(.horizontal, 16)
@@ -14902,7 +15102,6 @@ struct CommentView: View {
     @ObservedObject private var authManager = RedditAuthManager.shared
     @Environment(\.openURL) private var openURL
     @Environment(\.colorScheme) private var colorScheme
-
     private var isDarkMode: Bool {
         colorScheme == .dark
     }
@@ -15055,10 +15254,10 @@ struct CommentView: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 14)
-        .background(
+        .background {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .fill(cardFill)
-        )
+        }
         .overlay(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .stroke(cardBorder, lineWidth: 1)
@@ -17362,7 +17561,7 @@ struct PostsList: View {
                 }
             } else {
                 LazyVStack(spacing: 0) {
-                        // Add top padding to account for header/controls overlay
+                    // Add top padding to account for header/controls overlay
                     Color.clear
                         .frame(height: topInset)
                         .id("batchSummaryTop")
@@ -17496,6 +17695,7 @@ struct BatchResultsView: View {
     @Environment(\.dismiss) var dismiss
     var onClose: (() -> Void)? = nil
     var onMinimize: (() -> Void)? = nil
+    var extendsBackgroundIntoSafeArea: Bool = true
     
     // Q&A state
     @State private var question: String = ""
@@ -17601,6 +17801,7 @@ struct BatchResultsView: View {
     // Batch LLM summary state
     @State private var isSendingBatchResultsToLLM: Bool = false
     @State private var batchLLMResponse: String?
+    @State private var batchLLMResponseWasPCC: Bool = false
     @State private var batchLLMError: String?
     @State private var batchLLMTask: Task<Void, Never>?
     @State private var shouldScrollToLLMSummaryOnCompletion: Bool = false
@@ -17612,6 +17813,23 @@ struct BatchResultsView: View {
 
     private var isWebBatchMode: Bool {
         viewModel.batchExecutionMode == .web
+    }
+
+    private var batchSourceLinks: [String: URL] {
+        var links: [String: URL] = [:]
+        for source in viewModel.batchCapturedSources {
+            let permalink = normalizeRedditPermalink(source.permalink)
+            if let url = URL(string: permalink), !permalink.isEmpty {
+                links[source.sourceID] = url
+            }
+        }
+        for (sourceID, source) in groundedAnswerSources {
+            let permalink = normalizeRedditPermalink(source.permalink)
+            if let url = URL(string: permalink), !permalink.isEmpty {
+                links[sourceID] = url
+            }
+        }
+        return links
     }
 
     private struct MarkdownTableBlock: Identifiable {
@@ -17674,8 +17892,7 @@ struct BatchResultsView: View {
         NavigationView {
             ZStack {
                 // Glass background
-                GlassBackgroundView(variant: .summary)
-                    .ignoresSafeArea()
+                batchResultsBackground
                 
                 ScrollViewReader { proxy in
                     ScrollView {
@@ -17745,7 +17962,10 @@ struct BatchResultsView: View {
                         } else {
                         // Overall summary section
                         if viewModel.batchFinalSummary != nil || viewModel.isGeneratingBatchOverallSummary {
-                            let finalSummary = viewModel.batchFinalSummary ?? ""
+                            let rawFinalSummary = viewModel.batchFinalSummary ?? ""
+                            let finalSummary = (viewModel.batchFinalSummaryWasPCC || summaryService.settings.selectedSummaryProvider == .applePCCGateway)
+                                ? QuestionAnswerTextFormatter.displayText(from: rawFinalSummary)
+                                : rawFinalSummary
                             let finalSummaryIsEmpty = finalSummary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                             VStack(alignment: .leading, spacing: 12) {
                                 HStack {
@@ -17831,7 +18051,7 @@ struct BatchResultsView: View {
                                     }
                                     .cornerRadius(12)
                                 } else {
-                                    ReadableReplyText(content: finalSummary, fontScale: 0.9)
+                                    ReadableReplyText(content: finalSummary, fontScale: 0.9, sourceLinks: batchSourceLinks)
                                         .frame(maxWidth: .infinity, alignment: .leading)
                                         .fixedSize(horizontal: false, vertical: true)
                                         .padding()
@@ -18073,7 +18293,7 @@ struct BatchResultsView: View {
                                                 .padding(.vertical, 4)
                                         }
                                         
-                                        ReadableReplyText(content: (showingTopicSummaryCondensed && topicSummaryCondensed != nil) ? topicSummaryCondensed! : topicSummary, fontScale: 0.9)
+                                        ReadableReplyText(content: (showingTopicSummaryCondensed && topicSummaryCondensed != nil) ? topicSummaryCondensed! : topicSummary, fontScale: 0.9, sourceLinks: batchSourceLinks)
                                             .frame(maxWidth: .infinity, alignment: .leading)
                                             .fixedSize(horizontal: false, vertical: true)
                                             .padding()
@@ -18146,7 +18366,7 @@ struct BatchResultsView: View {
                                     #endif
                                 }
                                 
-                                ReadableReplyText(content: overallSummary, fontScale: 0.9)
+                                ReadableReplyText(content: overallSummary, fontScale: 0.9, sourceLinks: batchSourceLinks)
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                     .fixedSize(horizontal: false, vertical: true)
                                     .padding()
@@ -18179,6 +18399,9 @@ struct BatchResultsView: View {
                         }
 
                         if let llmResponse = batchLLMResponse {
+                            let displayedLLMResponse = (batchLLMResponseWasPCC || summaryService.settings.selectedSummaryProvider == .applePCCGateway)
+                                ? QuestionAnswerTextFormatter.displayText(from: llmResponse)
+                                : llmResponse
                             VStack(alignment: .leading, spacing: 12) {
                                 Color.clear
                                     .frame(height: 0)
@@ -18193,7 +18416,7 @@ struct BatchResultsView: View {
                                         .fontWeight(.semibold)
                                     Spacer()
                                     Button(action: {
-                                        copyToClipboard(llmResponse)
+                                        copyToClipboard(displayedLLMResponse)
                                     }) {
                                         Image(systemName: "doc.on.doc")
                                             .font(.caption)
@@ -18222,13 +18445,13 @@ struct BatchResultsView: View {
                                     #endif
                                 }
 
-                                let llmBlocks = parseBatchLLMBlocks(from: llmResponse)
+                                let llmBlocks = parseBatchLLMBlocks(from: displayedLLMResponse)
 
                                 VStack(alignment: .leading, spacing: 14) {
                                     ForEach(Array(llmBlocks.enumerated()), id: \.offset) { _, block in
                                         switch block {
                                         case .text(let text):
-                                            ReadableReplyText(content: text, fontScale: 0.9)
+                                            ReadableReplyText(content: text, fontScale: 0.9, sourceLinks: batchSourceLinks)
                                                 .frame(maxWidth: .infinity, alignment: .leading)
                                                 .fixedSize(horizontal: false, vertical: true)
                                         case .table(let table):
@@ -18304,7 +18527,7 @@ struct BatchResultsView: View {
                                             }
                                         }
 
-                                        ReadableReplyText(content: summary.summary, fontScale: 0.72)
+                                        ReadableReplyText(content: summary.summary, fontScale: 0.72, sourceLinks: batchSourceLinks)
                                             .fixedSize(horizontal: false, vertical: true)
                                     }
                                     .padding()
@@ -18599,6 +18822,16 @@ struct BatchResultsView: View {
 #if os(iOS)
         .navigationViewStyle(StackNavigationViewStyle())
 #endif
+    }
+
+    @ViewBuilder
+    private var batchResultsBackground: some View {
+        if extendsBackgroundIntoSafeArea {
+            GlassBackgroundView(variant: .summary)
+                .ignoresSafeArea()
+        } else {
+            GlassBackgroundView(variant: .summary)
+        }
     }
 #if os(iOS)
     private var topSwipeToMinimizeArea: some View {
@@ -20691,7 +20924,10 @@ struct BatchResultsView: View {
     @ViewBuilder
     private func webBatchGeneratedResultsSection(proxy: ScrollViewProxy) -> some View {
         if viewModel.batchFinalSummary != nil || viewModel.isGeneratingBatchOverallSummary {
-            let finalSummary = viewModel.batchFinalSummary ?? ""
+            let rawFinalSummary = viewModel.batchFinalSummary ?? ""
+            let finalSummary = (viewModel.batchFinalSummaryWasPCC || summaryService.settings.selectedSummaryProvider == .applePCCGateway)
+                ? QuestionAnswerTextFormatter.displayText(from: rawFinalSummary)
+                : rawFinalSummary
             let finalSummaryIsEmpty = finalSummary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
 
             VStack(alignment: .leading, spacing: 12) {
@@ -20723,7 +20959,7 @@ struct BatchResultsView: View {
                             .foregroundColor(.secondary)
                     }
                 } else if !finalSummaryIsEmpty {
-                    ReadableReplyText(content: finalSummary, fontScale: 0.9)
+                    ReadableReplyText(content: finalSummary, fontScale: 0.9, sourceLinks: batchSourceLinks)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .fixedSize(horizontal: false, vertical: true)
                         .padding()
@@ -20755,6 +20991,9 @@ struct BatchResultsView: View {
 
         if let llmResponse = batchLLMResponse,
            !llmResponse.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let displayedLLMResponse = (batchLLMResponseWasPCC || summaryService.settings.selectedSummaryProvider == .applePCCGateway)
+                ? QuestionAnswerTextFormatter.displayText(from: llmResponse)
+                : llmResponse
             VStack(alignment: .leading, spacing: 12) {
                 Color.clear
                     .frame(height: 0)
@@ -20770,7 +21009,7 @@ struct BatchResultsView: View {
                     Spacer()
 
                     Button(action: {
-                        copyToClipboard(llmResponse)
+                        copyToClipboard(displayedLLMResponse)
                     }) {
                         Image(systemName: "doc.on.doc")
                             .font(.caption)
@@ -20778,13 +21017,13 @@ struct BatchResultsView: View {
                     .buttonStyle(PlainButtonStyle())
                 }
 
-                let llmBlocks = parseBatchLLMBlocks(from: llmResponse)
+                let llmBlocks = parseBatchLLMBlocks(from: displayedLLMResponse)
 
                 VStack(alignment: .leading, spacing: 14) {
                     ForEach(Array(llmBlocks.enumerated()), id: \.offset) { _, block in
                         switch block {
                         case .text(let text):
-                            ReadableReplyText(content: text, fontScale: 0.9)
+                            ReadableReplyText(content: text, fontScale: 0.9, sourceLinks: batchSourceLinks)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .fixedSize(horizontal: false, vertical: true)
                         case .table(let table):
@@ -20960,7 +21199,7 @@ struct BatchResultsView: View {
                 }
             }
 
-            ReadableReplyText(content: post.comments, fontScale: 0.72)
+            ReadableReplyText(content: post.comments, fontScale: 0.72, sourceLinks: batchSourceLinks)
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding()
@@ -21276,6 +21515,7 @@ struct BatchResultsView: View {
         isSendingBatchResultsToLLM = true
         shouldScrollToLLMSummaryOnCompletion = true
         batchLLMResponse = ""
+        batchLLMResponseWasPCC = false
         batchLLMTask?.cancel()
 
         appState.performWebAIRequest(
@@ -21534,7 +21774,11 @@ struct BatchResultsView: View {
     private func sendBatchResultsToLLM() {
         guard !isSendingBatchResultsToLLM else { return }
 
-        let instructions = categorizedLLMSummaryPrompt()
+        let selectedProvider = SummaryService.shared.settings.selectedSummaryProvider
+        let baseInstructions = categorizedLLMSummaryPrompt()
+        let instructions = selectedProvider == .applePCCGateway
+            ? baseInstructions + "\n\nReturn only a readable categorized summary in plain natural-language Markdown. Do not return JSON, a property list, or a code block."
+            : baseInstructions
         guard !instructions.isEmpty else {
             batchLLMError = "No batch results available to send."
             return
@@ -21558,18 +21802,27 @@ struct BatchResultsView: View {
         shouldScrollToLLMSummaryOnCompletion = true
         batchLLMResponse = ""
         batchLLMTask?.cancel()
+        batchLLMResponseWasPCC = selectedProvider == .applePCCGateway
         
         batchLLMTask = Task {
             do {
-                let response = try await SummaryService.shared.summarize(
-                    text: instructions,
-                    onPartial: { token in
-                        self.batchLLMResponse = (self.batchLLMResponse ?? "") + token
-                    }
-                )
+                let response: String
+                if selectedProvider == .applePCCGateway {
+                    response = try await SummaryService.shared.summarize(text: instructions)
+                } else {
+                    response = try await SummaryService.shared.summarize(
+                        text: instructions,
+                        onPartial: { token in
+                            self.batchLLMResponse = (self.batchLLMResponse ?? "") + token
+                        }
+                    )
+                }
                 await MainActor.run {
-                    self.batchLLMResponse = response
-                    self.persistLegacyBatchArtifact(kind: .categorizedReport, title: "Categorized Summary", body: response)
+                    let displayResponse = selectedProvider == .applePCCGateway
+                        ? QuestionAnswerTextFormatter.displayText(from: response)
+                        : response
+                    self.batchLLMResponse = displayResponse
+                    self.persistLegacyBatchArtifact(kind: .categorizedReport, title: "Categorized Summary", body: displayResponse)
                     self.isSendingBatchResultsToLLM = false
                 }
             } catch is CancellationError {
@@ -22120,7 +22373,9 @@ struct BatchResultsView: View {
                     )
                 }
                 await MainActor.run {
-                    self.answer = fetchedAnswer
+                    self.answer = SummaryService.shared.settings.selectedSummaryProvider == .applePCCGateway
+                        ? QuestionAnswerTextFormatter.displayText(from: fetchedAnswer)
+                        : fetchedAnswer
                     self.isAnswering = false
                 }
             } catch is CancellationError {
@@ -22248,7 +22503,7 @@ struct BatchResultsView: View {
                 }
             }
         } else {
-            ReadableReplyText(content: fallback, fontScale: 0.9)
+            ReadableReplyText(content: fallback, fontScale: 0.9, sourceLinks: batchSourceLinks)
         }
     }
 
@@ -24654,7 +24909,6 @@ private struct BatchResultsOverlay: View {
             ZStack(alignment: .bottomTrailing) {
                 if isPresented {
                     Color.black.opacity(0.25)
-                        .ignoresSafeArea()
                         .transition(.opacity)
                         .onTapGesture {
                             minimize(animated: true)
@@ -24669,11 +24923,11 @@ private struct BatchResultsOverlay: View {
                         },
                         onMinimize: {
                             minimize(animated: true)
-                        }
+                        },
+                        extendsBackgroundIntoSafeArea: false
                     )
                     .frame(width: geometry.size.width, height: totalHeight)
                     .offset(y: currentOffset(totalHeight))
-                    .ignoresSafeArea()
                     .gesture(
                         DragGesture()
                             .onChanged { value in
@@ -24763,6 +25017,148 @@ private struct BatchResultsOverlay: View {
 }
 #endif
 
+// MARK: - Root Glass Chassis
+#if os(iOS)
+private struct AppGlassChassis<Content: View>: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @AppStorage("experimentalSettingsGlassEnabled") private var experimentalAppGlassEnabled = true
+
+    private let content: Content
+    private let safeAreaInsets: EdgeInsets
+    private let horizontalOuterInset: CGFloat = 3
+    private let rimWidth: CGFloat = 9
+    private let maximumContainerBottomInset: CGFloat = 34
+
+    init(safeAreaInsets: EdgeInsets, @ViewBuilder content: () -> Content) {
+        self.safeAreaInsets = safeAreaInsets
+        self.content = content()
+    }
+
+    var body: some View {
+        ZStack {
+            chassisSurface
+
+            content
+                .padding(.top, safeAreaInsets.top)
+                // GeometryProxy includes the software keyboard in its bottom
+                // safe-area inset. The chassis already continues to respect the
+                // keyboard region, so only restore the permanent window inset.
+                .padding(.bottom, min(safeAreaInsets.bottom, maximumContainerBottomInset))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(experimentalAppGlassEnabled ? Color.black : Color(uiColor: .systemBackground))
+                .clipShape(innerShape)
+                .overlay {
+                    innerShape
+                        .strokeBorder(
+                            LinearGradient(
+                                colors: [
+                                    Color.white.opacity(colorScheme == .dark ? 0.38 : 0.62),
+                                    Color.white.opacity(0.08),
+                                    Color.black.opacity(colorScheme == .dark ? 0.78 : 0.30)
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            ),
+                            lineWidth: 1
+                        )
+                }
+                .padding(rimWidth)
+        }
+        .padding(.horizontal, horizontalOuterInset)
+        .ignoresSafeArea(.container, edges: .vertical)
+        .background {
+            if reduceTransparency {
+                Color(uiColor: .systemBackground)
+            } else {
+                Color.clear
+            }
+        }
+    }
+
+    private var outerShape: ContainerRelativeShape {
+        ContainerRelativeShape()
+    }
+
+    private var innerShape: ContainerRelativeShape {
+        ContainerRelativeShape()
+    }
+
+    @ViewBuilder
+    private var chassisSurface: some View {
+        if reduceTransparency {
+            outerShape
+                .fill(Color(uiColor: .secondarySystemBackground))
+                .overlay { chassisHighlights }
+        } else if #available(iOS 26.0, *) {
+            outerShape
+                .fill(Color.white.opacity(0.012))
+                .glassEffect(
+                    .clear.tint(Color.white.opacity(colorScheme == .dark ? 0.24 : 0.34)),
+                    in: outerShape
+                )
+                .overlay { chassisHighlights }
+                .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.34 : 0.16), radius: 10, y: 3)
+        } else {
+            outerShape
+                .fill(.ultraThinMaterial)
+                .overlay { chassisHighlights }
+                .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.34 : 0.16), radius: 10, y: 3)
+        }
+    }
+
+    private var chassisHighlights: some View {
+        outerShape
+            .strokeBorder(
+                LinearGradient(
+                    colors: [
+                        Color.white.opacity(colorScheme == .dark ? 0.96 : 0.88),
+                        Color.white.opacity(0.28),
+                        Color.white.opacity(0.64),
+                        Color.black.opacity(colorScheme == .dark ? 0.24 : 0.10)
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                ),
+                lineWidth: 1.4
+            )
+            .overlay {
+                outerShape
+                    .strokeBorder(
+                        LinearGradient(
+                            colors: [
+                                Color.white.opacity(colorScheme == .dark ? 0.42 : 0.56),
+                                Color.white.opacity(0.10),
+                                Color.white.opacity(colorScheme == .dark ? 0.30 : 0.44),
+                                Color.clear
+                            ],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        ),
+                        lineWidth: rimWidth
+                    )
+                    .blendMode(.screen)
+            }
+            .overlay {
+                outerShape
+                    .inset(by: rimWidth - 1)
+                    .strokeBorder(
+                        LinearGradient(
+                            colors: [
+                                Color.white.opacity(colorScheme == .dark ? 0.56 : 0.72),
+                                Color.white.opacity(0.10),
+                                Color.black.opacity(colorScheme == .dark ? 0.62 : 0.22)
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ),
+                        lineWidth: 1
+                    )
+            }
+    }
+}
+#endif
+
 // MARK: - Main View
 struct ContentView: View {
     @EnvironmentObject private var appState: AppState
@@ -24785,6 +25181,8 @@ struct ContentView: View {
     @State private var isBatchResultsMinimized = false
     @State private var columnVisibility: NavigationSplitViewVisibility = .automatic
     @State private var currentLayoutIsCompact = false
+    @AppStorage("experimentalSettingsGlassEnabled") private var experimentalAppGlassEnabled = true
+    @AppStorage("experimentalSettingsGlassVariant") private var experimentalAppGlassVariant = 11
     @FocusState private var sidebarFocusedField: SidebarControls.Field?
 
     private func shouldUseCompactLayout(for width: CGFloat) -> Bool {
@@ -24836,13 +25234,108 @@ struct ContentView: View {
         }
     }
 
+#if os(iOS)
+    private func restoreMinimizedResearchLibrary() {
+        comparisonToResume = nil
+        isResearchLibraryMinimized = false
+        showResearchLibrary = true
+    }
+
+    private func closeMinimizedResearchLibrary() {
+        isResearchLibraryMinimized = false
+        researchLibraryNavigationPath = NavigationPath()
+    }
+
+    private var minimizedResearchLibraryLabel: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "books.vertical.fill")
+                .foregroundStyle(.primary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Research Library")
+                    .font(.subheadline.weight(.semibold))
+                Text("Minimized — tap to return")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Image(systemName: "chevron.up")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder
+    private var minimizedResearchLibraryControls: some View {
+        if #available(iOS 26.0, *) {
+            GlassEffectContainer(spacing: 9) {
+                HStack(spacing: 9) {
+                    Button(action: restoreMinimizedResearchLibrary) {
+                        minimizedResearchLibraryLabel
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 11)
+                            .contentShape(Capsule())
+                            .glassEffect(
+                                .regular.interactive(),
+                                in: .capsule
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Restore Research Library")
+                    .accessibilityHint("Returns to the minimized Research Library")
+
+                    Button(action: closeMinimizedResearchLibrary) {
+                        Image(systemName: "xmark")
+                            .font(.caption.weight(.bold))
+                            .frame(width: 44, height: 44)
+                            .contentShape(Circle())
+                            .glassEffect(.regular.interactive(), in: .circle)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Close minimized Research Library")
+                }
+            }
+        } else {
+            HStack(spacing: 9) {
+                Button(action: restoreMinimizedResearchLibrary) {
+                    minimizedResearchLibraryLabel
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 11)
+                        .background(.regularMaterial, in: Capsule())
+                        .overlay {
+                            Capsule()
+                                .stroke(Color.primary.opacity(0.16), lineWidth: 1)
+                        }
+                        .shadow(color: .black.opacity(0.18), radius: 14, y: 7)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Restore Research Library")
+                .accessibilityHint("Returns to the minimized Research Library")
+
+                Button(action: closeMinimizedResearchLibrary) {
+                    Image(systemName: "xmark")
+                        .font(.caption.weight(.bold))
+                        .frame(width: 32, height: 32)
+                        .background(.regularMaterial, in: Circle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Close minimized Research Library")
+            }
+        }
+    }
+#endif
+
     var body: some View {
-        GeometryReader { geometry in
-            let useCompactLayout = shouldUseCompactLayout(for: geometry.size.width)
-            ZStack {
-                splitView(isCompactLayout: useCompactLayout)
+        ZStack {
+            if experimentalAppGlassEnabled {
+                ExperimentalAppGlassBackdrop(variant: experimentalAppGlassVariant)
+            }
+
+            GeometryReader { geometry in
+                let useCompactLayout = shouldUseCompactLayout(for: geometry.size.width)
+                appSurface(safeAreaInsets: geometry.safeAreaInsets) {
+                    ZStack {
+                    splitView(isCompactLayout: useCompactLayout)
                 
-                if viewModel.showBatchResults || (isBatchResultsMinimized && viewModel.canRestoreBatchResults) {
+                    if viewModel.showBatchResults || (isBatchResultsMinimized && viewModel.canRestoreBatchResults) {
                     BatchResultsOverlay(
                         viewModel: viewModel,
                         isPresented: Binding(
@@ -24852,11 +25345,11 @@ struct ContentView: View {
                         isMinimized: $isBatchResultsMinimized,
                         onClose: closeBatchResults
                     )
-                    .frame(width: geometry.size.width, height: geometry.size.height + geometry.safeAreaInsets.top + geometry.safeAreaInsets.bottom)
-                    .ignoresSafeArea()
-                }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .clipped()
+                    }
 
-                if !showResearchLibrary {
+                    if !showResearchLibrary {
                     if let job = comparisonJobs.latestStatusJob,
                        !hiddenResearchComparisonStatusIDs.contains(job.id) {
                         VStack {
@@ -24928,48 +25421,7 @@ struct ContentView: View {
                             Spacer()
                             HStack {
                                 Spacer()
-                                Button {
-                                    comparisonToResume = nil
-                                    isResearchLibraryMinimized = false
-                                    showResearchLibrary = true
-                                } label: {
-                                    HStack(spacing: 12) {
-                                        Image(systemName: "books.vertical.fill")
-                                            .foregroundStyle(.blue)
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            Text("Research Library")
-                                                .font(.subheadline.weight(.semibold))
-                                            Text("Minimized — tap to return")
-                                                .font(.caption)
-                                                .foregroundStyle(.secondary)
-                                        }
-                                        Image(systemName: "chevron.up")
-                                            .font(.caption.weight(.semibold))
-                                            .foregroundStyle(.secondary)
-                                    }
-                                    .padding(.horizontal, 16)
-                                    .padding(.vertical, 11)
-                                    .background(.regularMaterial, in: Capsule())
-                                    .overlay {
-                                        Capsule()
-                                            .stroke(Color.blue.opacity(0.75), lineWidth: 1.5)
-                                    }
-                                    .shadow(color: .black.opacity(0.18), radius: 14, y: 7)
-                                }
-                                .buttonStyle(.plain)
-                                .accessibilityLabel("Restore Research Library")
-                                .accessibilityHint("Returns to the minimized Research Library")
-                                Button {
-                                    isResearchLibraryMinimized = false
-                                    researchLibraryNavigationPath = NavigationPath()
-                                } label: {
-                                    Image(systemName: "xmark")
-                                        .font(.caption.weight(.bold))
-                                        .frame(width: 32, height: 32)
-                                        .background(.regularMaterial, in: Circle())
-                                }
-                                .buttonStyle(.plain)
-                                .accessibilityLabel("Close minimized Research Library")
+                                minimizedResearchLibraryControls
                             }
                         }
                         .padding(.trailing, 24)
@@ -24979,8 +25431,8 @@ struct ContentView: View {
                     }
                 }
 
-                if appState.showFallbackNotification {
-                    VStack {
+                    if appState.showFallbackNotification {
+                        VStack {
                         Spacer()
                         Text(appState.fallbackNotification)
                             .font(.caption)
@@ -24993,18 +25445,36 @@ struct ContentView: View {
                             .padding(.bottom, 16)
                     }
                     .padding(.horizontal)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                    }
                 }
             }
-            .onAppear {
-                currentLayoutIsCompact = useCompactLayout
-                updateColumnVisibility(animated: false)
-            }
-            .onChange(of: useCompactLayout) { newValue in
-                currentLayoutIsCompact = newValue
-                updateColumnVisibility(animated: true)
+                .onAppear {
+                    currentLayoutIsCompact = useCompactLayout
+                    updateColumnVisibility(animated: false)
+                }
+                .onChange(of: useCompactLayout) { newValue in
+                    currentLayoutIsCompact = newValue
+                    updateColumnVisibility(animated: true)
+                }
             }
         }
+    }
+
+    @ViewBuilder
+    private func appSurface<Surface: View>(
+        safeAreaInsets: EdgeInsets,
+        @ViewBuilder content: () -> Surface
+    ) -> some View {
+#if os(iOS)
+        if UIDevice.current.userInterfaceIdiom == .pad {
+            AppGlassChassis(safeAreaInsets: safeAreaInsets, content: content)
+        } else {
+            content()
+        }
+#else
+        content()
+#endif
     }
     
     private func splitView(isCompactLayout: Bool) -> some View {
@@ -25065,6 +25535,7 @@ struct ContentView: View {
                         researchLibraryNavigationPath = NavigationPath()
                     }
                 )
+                .presentationBackground(Color(uiColor: .systemBackground))
             }
             .confirmationDialog(
                 "Local batch is too large",
@@ -25141,18 +25612,39 @@ struct ContentView: View {
                 .navigationTitle(viewModel.activeFeedTitle)
 #if os(iOS)
                 .navigationBarTitleDisplayMode(.inline)
-                .toolbarBackground(isSidebarScrolling ? .hidden : .visible, for: .navigationBar)
-                .toolbarBackground(isDarkMode ? Color.black : Color(uiColor: .systemBackground), for: .navigationBar)
+                .toolbar(.hidden, for: .navigationBar)
+                .toolbarBackground(
+                    experimentalAppGlassEnabled
+                        ? Color.clear
+                        : (isDarkMode ? Color.black : Color(uiColor: .systemBackground)),
+                    for: .navigationBar
+                )
+                .toolbarBackground(
+                    experimentalAppGlassEnabled || isSidebarScrolling ? .hidden : .visible,
+                    for: .navigationBar
+                )
+                .scrollEdgeEffectHidden(experimentalAppGlassEnabled, for: .top)
                 .toolbarColorScheme(isDarkMode ? .dark : .light, for: .navigationBar)
 #endif
 #if os(macOS)
                 .toolbarBackground(.hidden, for: .windowToolbar)
 #endif
                 .toolbar {
+#if !os(iOS)
                     primaryToolbarContent
+#endif
                 }
         } detail: {
             detailColumn
+        }
+        .overlay(alignment: .topLeading) {
+#if os(iOS)
+            if columnVisibility == .detailOnly {
+                experimentalSidebarRevealButton
+                    .padding(.top, 12)
+                    .padding(.leading, 16)
+            }
+#endif
         }
     }
 
@@ -25162,12 +25654,24 @@ struct ContentView: View {
                 .navigationTitle(viewModel.activeFeedTitle)
 #if os(iOS)
                 .navigationBarTitleDisplayMode(.inline)
-                .toolbarBackground(isSidebarScrolling ? .hidden : .visible, for: .navigationBar)
-                .toolbarBackground(isDarkMode ? Color.black : Color(uiColor: .systemBackground), for: .navigationBar)
+                .toolbar(.hidden, for: .navigationBar)
+                .toolbarBackground(
+                    experimentalAppGlassEnabled
+                        ? Color.clear
+                        : (isDarkMode ? Color.black : Color(uiColor: .systemBackground)),
+                    for: .navigationBar
+                )
+                .toolbarBackground(
+                    experimentalAppGlassEnabled || isSidebarScrolling ? .hidden : .visible,
+                    for: .navigationBar
+                )
+                .scrollEdgeEffectHidden(experimentalAppGlassEnabled, for: .top)
                 .toolbarColorScheme(isDarkMode ? .dark : .light, for: .navigationBar)
 #endif
                 .toolbar {
+#if !os(iOS)
                     primaryToolbarContent
+#endif
                 }
         }
         .overlay {
@@ -25204,6 +25708,7 @@ struct ContentView: View {
                         focusedField: $sidebarFocusedField
                     )
                 }
+                .padding(.top, 82)
                 .background(
                     GeometryReader { proxy in
                         Color.clear
@@ -25222,6 +25727,14 @@ struct ContentView: View {
                 
                 Spacer()
             }
+
+#if os(iOS)
+            experimentalFloatingToolbar
+                .padding(.top, 12)
+                .padding(.trailing, 16)
+                .frame(maxWidth: .infinity, alignment: .topTrailing)
+                .zIndex(10)
+#endif
         }
         .onPreferenceChange(SidebarOverlayHeightPreferenceKey.self) { newValue in
             if newValue > 0 {
@@ -25229,7 +25742,9 @@ struct ContentView: View {
             }
         }
         .background {
-            if isDarkMode {
+            if experimentalAppGlassEnabled {
+                Color.black
+            } else if isDarkMode {
                 Color.black
             } else {
                 Color.clear.background(.ultraThinMaterial)
@@ -25271,19 +25786,118 @@ struct ContentView: View {
         RoundedRectangle(cornerRadius: 28, style: .continuous)
     }
 
+    @ViewBuilder
     private var sidebarOverlayBackground: some View {
-        sidebarOverlayShape
-            .fill(.ultraThinMaterial)
-            .overlay {
-                sidebarOverlayShape
-                    .fill(isDarkMode ? Color.black.opacity(0.34) : Color.white.opacity(0.10))
-            }
-            .overlay {
-                sidebarOverlayShape
-                    .stroke(Color.white.opacity(isDarkMode ? 0.10 : 0.16), lineWidth: 0.75)
-            }
-            .shadow(color: Color.black.opacity(isDarkMode ? 0.28 : 0.12), radius: 18, y: 10)
+        if experimentalAppGlassEnabled {
+            sidebarOverlayShape
+                .fill(Color.clear)
+                .experimentalAppGlass(
+                    enabled: true,
+                    variant: experimentalAppGlassVariant,
+                    cornerRadius: 28
+                )
+                .overlay {
+                    sidebarOverlayShape
+                        .stroke(Color.white.opacity(isDarkMode ? 0.12 : 0.18), lineWidth: 0.75)
+                }
+                .shadow(color: Color.black.opacity(isDarkMode ? 0.24 : 0.10), radius: 18, y: 10)
+        } else {
+            sidebarOverlayShape
+                .fill(.ultraThinMaterial)
+                .overlay {
+                    sidebarOverlayShape
+                        .fill(isDarkMode ? Color.black.opacity(0.34) : Color.white.opacity(0.10))
+                }
+                .overlay {
+                    sidebarOverlayShape
+                        .stroke(Color.white.opacity(isDarkMode ? 0.10 : 0.16), lineWidth: 0.75)
+                }
+                .shadow(color: Color.black.opacity(isDarkMode ? 0.28 : 0.12), radius: 18, y: 10)
+        }
     }
+
+#if os(iOS)
+    private var experimentalFloatingToolbar: some View {
+        GlassEffectContainer(spacing: 10) {
+            HStack(spacing: 10) {
+                HStack(spacing: 0) {
+                    experimentalToolbarButton(
+                        systemName: "books.vertical",
+                        accessibilityLabel: "Research Library"
+                    ) {
+                        comparisonToResume = nil
+                        researchLibraryNavigationPath = NavigationPath()
+                        isResearchLibraryExplicitlyClosing = false
+                        isResearchLibraryMinimized = false
+                        showResearchLibrary = true
+                    }
+
+                    if RedditAuthManager.shared.isAuthenticated {
+                        experimentalToolbarButton(
+                            systemName: "square.and.pencil",
+                            accessibilityLabel: "Create Post"
+                        ) {
+                            showCreatePost = true
+                        }
+                    }
+
+                    experimentalToolbarButton(
+                        systemName: "gearshape",
+                        accessibilityLabel: "Settings"
+                    ) {
+                        showSettings = true
+                    }
+                }
+                .padding(.horizontal, 4)
+                .padding(.vertical, 4)
+                .glassEffect(.regular, in: .capsule)
+
+                if !currentLayoutIsCompact {
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            columnVisibility = .detailOnly
+                        }
+                    } label: {
+                        Image(systemName: "sidebar.leading")
+                            .font(.system(size: 24, weight: .medium))
+                            .frame(width: 44, height: 44)
+                    }
+                    .buttonStyle(.glass)
+                    .accessibilityLabel("Hide Sidebar")
+                }
+            }
+        }
+    }
+
+    private func experimentalToolbarButton(
+        systemName: String,
+        accessibilityLabel: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: 24, weight: .medium))
+                .frame(width: 58, height: 44)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(accessibilityLabel)
+    }
+
+    private var experimentalSidebarRevealButton: some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                columnVisibility = .all
+            }
+        } label: {
+            Image(systemName: "sidebar.leading")
+                .font(.system(size: 24, weight: .medium))
+                .frame(width: 44, height: 44)
+        }
+        .buttonStyle(.glass)
+        .accessibilityLabel("Show Sidebar")
+    }
+#endif
 
     @ToolbarContentBuilder
     private var primaryToolbarContent: some ToolbarContent {
@@ -25354,7 +25968,10 @@ struct ContentView: View {
 
     private var detailColumn: some View {
         ZStack {
-            if isDarkMode {
+            if experimentalAppGlassEnabled {
+                Color.black
+                    .ignoresSafeArea()
+            } else if isDarkMode {
                 Color.black
                     .ignoresSafeArea()
             } else {
@@ -25397,12 +26014,15 @@ struct ContentView: View {
         let onClose: () -> Void
         @State private var dragOffset: CGFloat = 0
         @State private var isBackGestureActive = false
+        @AppStorage("experimentalSettingsGlassEnabled") private var experimentalAppGlassEnabled = true
         @Environment(\.colorScheme) private var colorScheme
 
         var body: some View {
             ZStack {
                 Group {
-                    if colorScheme == .dark {
+                    if experimentalAppGlassEnabled {
+                        Color.black
+                    } else if colorScheme == .dark {
                         Color.black
                     } else {
                         Color.black.opacity(backgroundOpacity)
@@ -25430,7 +26050,9 @@ struct ContentView: View {
                         }
                 }
                 .background {
-                    if colorScheme == .dark {
+                    if experimentalAppGlassEnabled {
+                        Color.black
+                    } else if colorScheme == .dark {
                         Color.black
                     } else {
                         Color.clear.background(.ultraThinMaterial)
@@ -25549,6 +26171,7 @@ struct RedditCommentsView: View {
         @ObservedObject private var summaryService = SummaryService.shared
         @EnvironmentObject private var appState: AppState
         @Environment(\.colorScheme) private var colorScheme
+        @AppStorage("experimentalSettingsGlassEnabled") private var experimentalAppGlassEnabled = true
         @State private var isLoading = true
         @State private var error: String?
         @State private var allComments = [CommentData]()
@@ -25720,7 +26343,9 @@ struct RedditCommentsView: View {
                                 }
                                 .padding(.vertical)
                                 .background {
-                                    if isDarkMode {
+                                    if experimentalAppGlassEnabled {
+                                        Color.black
+                                    } else if isDarkMode {
                                         Color.black
                                     } else {
                                         Color.clear.background(.ultraThinMaterial)
@@ -25934,20 +26559,22 @@ struct RedditCommentsView: View {
                             }
                             
                             if !allComments.isEmpty {
-                                LazyVStack(alignment: .leading, spacing: 12) {
-                                ForEach(allComments.prefix(visibleCount)) { comment in
-                                    CommentView(comment: comment, postPermalink: postPermalink)
-                                }
-                                if visibleCount < allComments.count {
-                                    Button("Load More Comments") {
-                                        visibleCount += 10
+                                ExperimentalAppGlassContainer(enabled: experimentalAppGlassEnabled, spacing: 18) {
+                                    LazyVStack(alignment: .leading, spacing: 12) {
+                                        ForEach(allComments.prefix(visibleCount)) { comment in
+                                            CommentView(comment: comment, postPermalink: postPermalink)
+                                        }
+                                        if visibleCount < allComments.count {
+                                            Button("Load More Comments") {
+                                                visibleCount += 10
+                                            }
+                                            .buttonStyle(LiquidGlassButtonStyle())
+                                            .padding()
+                                        }
                                     }
-                                    .buttonStyle(LiquidGlassButtonStyle())
-                                    .padding()
                                 }
-                            }
-                            .padding(.vertical)
-                            .padding(.horizontal, 8)
+                                .padding(.vertical)
+                                .padding(.horizontal, 8)
                             }
                         }
                         
@@ -26235,52 +26862,50 @@ struct RedditCommentsView: View {
                                     }
                                     
                                     if showBottomActions {
-                                        HStack {
+                                        HStack(spacing: 8) {
                                             Button(action: copyCommentsToClipboard) {
-                                                Text("Copy Comments")
+                                                Image(systemName: "doc.on.doc")
                                             }
                                             .buttonStyle(LiquidGlassButtonStyle())
-                                            
-                                            Spacer()
-                                    
-                                    // Summarize Post button with dropdown menu
-                                    Menu {
-                                        Button {
-                                            selectedSummaryType = .short
-                                            summarizePost(isShort: true)
-                                        } label: {
-                                            Label("Short Summary", systemImage: "text.badge.minus")
-                                            Text("2 paragraphs max")
-                                        }
-                                        
-                                        Button {
-                                            selectedSummaryType = .long
-                                            summarizePost(isShort: false)
-                                        } label: {
-                                            Label("Long Summary", systemImage: "text.badge.plus")
-                                            Text("Detailed analysis")
-                                        }
-                                    } label: {
-                                        if isSummarizingPost {
-                                            ProgressView()
-                                        } else {
-                                            Text("Summarize Post")
-                                        }
-                                    }
-                                    .buttonStyle(LiquidGlassButtonStyle())
-                                    .disabled(isSummarizingPost || (postTitle.isEmpty && postContent.isEmpty))
+                                            .accessibilityLabel("Copy Comments")
 
-                                    // Read All Comments TTS button
-                                    if isReadingAllComments {
-                                        Button {
-                                            stopReadingAllComments()
+                                        Menu {
+                                            Button {
+                                                selectedSummaryType = .short
+                                                summarizePost(isShort: true)
+                                            } label: {
+                                                Label("Short Summary", systemImage: "text.badge.minus")
+                                                Text("2 paragraphs max")
+                                            }
+
+                                            Button {
+                                                selectedSummaryType = .long
+                                                summarizePost(isShort: false)
+                                            } label: {
+                                                Label("Long Summary", systemImage: "text.badge.plus")
+                                                Text("Detailed analysis")
+                                            }
                                         } label: {
-                                            Label("Stop", systemImage: "stop.circle.fill")
-                                                .font(.system(size: 14, weight: .medium))
-                                                .foregroundColor(.red)
+                                            if isSummarizingPost {
+                                                ProgressView()
+                                            } else {
+                                                Image(systemName: "doc.richtext")
+                                            }
                                         }
                                         .buttonStyle(LiquidGlassButtonStyle())
-                                    } else {
+                                        .disabled(isSummarizingPost || (postTitle.isEmpty && postContent.isEmpty))
+                                        .accessibilityLabel("Summarize Post")
+
+                                        if isReadingAllComments {
+                                            Button {
+                                                stopReadingAllComments()
+                                            } label: {
+                                                Image(systemName: "stop.circle.fill")
+                                                    .foregroundColor(.red)
+                                            }
+                                            .buttonStyle(LiquidGlassButtonStyle())
+                                            .accessibilityLabel("Stop Reading Comments")
+                                        } else {
                                         Menu {
                                             Button {
                                                 readAllCommentsCloud()
@@ -26298,67 +26923,63 @@ struct RedditCommentsView: View {
                                                 Label("MLX TTS", systemImage: "waveform")
                                             }
                                         } label: {
-                                            Label("Read", systemImage: "speaker.wave.2")
-                                                .font(.system(size: 14, weight: .medium))
+                                            Image(systemName: "speaker.wave.2")
                                         }
                                         .buttonStyle(LiquidGlassButtonStyle())
                                         .disabled(allComments.isEmpty)
-                                    }
+                                        .accessibilityLabel("Read Comments")
+                                        }
 
-                                    Button {
-                                        withAnimation(.easeInOut(duration: 0.25)) {
-                                            proxy.scrollTo(askQuestionSectionID, anchor: .center)
-                                        }
-                                    } label: {
-                                        Image(systemName: "arrow.down.circle.fill")
-                                            .font(.system(size: 18, weight: .semibold))
-                                    }
-                                    .buttonStyle(LiquidGlassButtonStyle())
-                                    .accessibilityLabel("Jump to Ask a Question")
-                                    
-                                    Spacer()
-                                    // Summarize Comments button with dropdown menu
-                                    Menu {
                                         Button {
-                                            selectedSummaryType = .short
-                                            summarizeComments(isShort: true)
+                                            withAnimation(.easeInOut(duration: 0.25)) {
+                                                proxy.scrollTo(askQuestionSectionID, anchor: .center)
+                                            }
                                         } label: {
-                                            Label("Short Summary", systemImage: "text.badge.minus")
-                                            Text("2 paragraphs max")
+                                            Image(systemName: "arrow.down.circle.fill")
                                         }
-                                        
-                                        Button {
-                                            selectedSummaryType = .long
-                                            summarizeComments(isShort: false)
+                                        .buttonStyle(LiquidGlassButtonStyle())
+                                        .accessibilityLabel("Jump to Ask a Question")
+
+                                        Menu {
+                                            Button {
+                                                selectedSummaryType = .short
+                                                summarizeComments(isShort: true)
+                                            } label: {
+                                                Label("Short Summary", systemImage: "text.badge.minus")
+                                                Text("2 paragraphs max")
+                                            }
+
+                                            Button {
+                                                selectedSummaryType = .long
+                                                summarizeComments(isShort: false)
+                                            } label: {
+                                                Label("Long Summary", systemImage: "text.badge.plus")
+                                                Text("Detailed analysis")
+                                            }
                                         } label: {
-                                            Label("Long Summary", systemImage: "text.badge.plus")
-                                            Text("Detailed analysis")
+                                            if isSummarizing {
+                                                ProgressView()
+                                            } else {
+                                                Image(systemName: "bubble.left.and.bubble.right")
+                                            }
                                         }
-                                    } label: {
-                                        if isSummarizing {
-                                            ProgressView()
-                                        } else {
-                                            Text("Summarize Comments")
+                                        .buttonStyle(LiquidGlassButtonStyle())
+                                        .disabled(isSummarizing)
+                                        .accessibilityLabel("Summarize Comments")
+
+                                        Button(action: {
+                                            withAnimation(.easeInOut(duration: 0.2)) {
+                                                showBottomActions = false
+                                            }
+                                        }) {
+                                            Image(systemName: "xmark")
+                                                .foregroundColor(.secondary)
                                         }
+                                        .buttonStyle(LiquidGlassButtonStyle())
+                                        .accessibilityLabel("Close Actions")
                                     }
-                                    .buttonStyle(LiquidGlassButtonStyle())
-                                    .disabled(isSummarizing)
-                                    
-                                    Spacer()
-                                    
-                                    // Close button
-                                    Button(action: {
-                                        withAnimation(.easeInOut(duration: 0.2)) {
-                                            showBottomActions = false
-                                        }
-                                    }) {
-                                        Image(systemName: "xmark.circle.fill")
-                                            .font(.system(size: 20))
-                                            .foregroundColor(.gray)
-                                    }
-                                    .buttonStyle(PlainButtonStyle())
-                                }
-                                .transition(.move(edge: .bottom).combined(with: .opacity))
+                                    .frame(maxWidth: .infinity)
+                                    .transition(.move(edge: .bottom).combined(with: .opacity))
                                 }
                                 }
                                 .padding(.horizontal)
@@ -27673,7 +28294,9 @@ struct RedditCommentsView: View {
                         }
                     )
                     await MainActor.run {
-                        self.postSummary = fetchedSummary
+                        self.postSummary = SummaryService.shared.settings.selectedSummaryProvider == .applePCCGateway
+                            ? QuestionAnswerTextFormatter.displayText(from: fetchedSummary)
+                            : fetchedSummary
                         self.isSummarizingPost = false
                     }
                 } catch is CancellationError {
@@ -27718,6 +28341,7 @@ struct RedditCommentsView: View {
             - Key points or arguments made
             - Any important context or background information
             - The overall purpose or goal of the post
+
             
             \(postFullContent)
             """
@@ -28060,7 +28684,9 @@ struct RedditCommentsView: View {
                         }
                     )
                     await MainActor.run {
-                        self.summary = fetchedSummary
+                        self.summary = SummaryService.shared.settings.selectedSummaryProvider == .applePCCGateway
+                            ? QuestionAnswerTextFormatter.displayText(from: fetchedSummary)
+                            : fetchedSummary
                         self.isSummarizing = false
                     }
                 } catch is CancellationError {
@@ -28184,7 +28810,9 @@ struct RedditCommentsView: View {
                         )
                     }
                     await MainActor.run {
-                        self.answer = fetchedAnswer
+                        self.answer = provider == .applePCCGateway
+                            ? QuestionAnswerTextFormatter.displayText(from: fetchedAnswer)
+                            : fetchedAnswer
                         self.isAnswering = false
                     }
                 } catch is CancellationError {
@@ -28212,6 +28840,7 @@ struct RedditCommentsView: View {
             \(commentsText)
 
             Answer the following question based on the information in the comments above: \(question)
+
             """
         }
 

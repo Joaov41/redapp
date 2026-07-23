@@ -12,6 +12,27 @@ extension EnvironmentValues {
     }
 }
 
+extension View {
+    func researchLibraryExperimentalGlassSurface() -> some View {
+        modifier(ResearchLibraryExperimentalGlassSurfaceModifier())
+    }
+}
+
+private struct ResearchLibraryExperimentalGlassSurfaceModifier: ViewModifier {
+    @AppStorage("experimentalSettingsGlassEnabled") private var experimentalAppGlassEnabled = true
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if experimentalAppGlassEnabled {
+            content
+                .scrollContentBackground(.hidden)
+                .background(Color.black)
+        } else {
+            content
+        }
+    }
+}
+
 enum ResearchLibraryRoute: Hashable {
     case item(id: UUID)
     case run(id: UUID)
@@ -70,9 +91,38 @@ struct ResearchLibraryView: View {
         }
     }
 
+#if os(macOS)
+    private var librarySearchText: Binding<String> {
+        Binding(
+            get: { searchText },
+            set: { newValue in
+                searchText = newValue
+                if !newValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                   !navigationPath.isEmpty {
+                    navigationPath = NavigationPath()
+                }
+            }
+        )
+    }
+#endif
+
     var body: some View {
         NavigationStack(path: $navigationPath) {
             List {
+#if os(macOS)
+                Section {
+                    HStack(spacing: 8) {
+                        Image(systemName: "magnifyingglass")
+                            .foregroundStyle(.secondary)
+                        TextField("Search saved research", text: librarySearchText)
+                            .textFieldStyle(.plain)
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 7)
+                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+                }
+                .listRowBackground(Color.clear)
+#endif
                 if !comparisonJobs.activeJobs.isEmpty {
                     Section("Comparison in progress") {
                         ForEach(comparisonJobs.activeJobs) { job in
@@ -190,6 +240,7 @@ struct ResearchLibraryView: View {
                     Text("Saved batches")
                 }
             }
+            .researchLibraryExperimentalGlassSurface()
             .listStyle(.insetGrouped)
             .navigationTitle("Research Library")
             .searchable(
@@ -463,6 +514,7 @@ struct ResearchItemDetailView: View {
                 ProgressView()
             }
         }
+        .researchLibraryExperimentalGlassSurface()
         .navigationTitle(item?.title ?? "Saved Research")
         .toolbar {
             if let item {
@@ -494,6 +546,7 @@ struct ResearchItemDetailView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+                .researchLibraryExperimentalGlassSurface()
                 .navigationTitle("Tags")
                 .toolbar {
                     ToolbarItem(placement: .cancellationAction) {
@@ -586,6 +639,7 @@ private struct ResearchCrossFilterComparisonPickerView: View {
                 ProgressView()
             }
         }
+        .researchLibraryExperimentalGlassSurface()
         .navigationTitle("Compare Feed Types")
         .task { load() }
         .alert("Comparison unavailable", isPresented: Binding(
@@ -717,6 +771,7 @@ struct ResearchRunDetailView: View {
                 ProgressView()
             }
         }
+        .researchLibraryExperimentalGlassSurface()
         .navigationTitle(detail.map { "Revision \($0.run.revision)" } ?? "Research Run")
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
@@ -1059,11 +1114,15 @@ struct ResearchRunDetailView: View {
 
         let postSummaries = latestDetail.revisionArtifacts.postSummaries
         guard !postSummaries.isEmpty else { throw GroundedResearchError.noPostSummaries }
-        let prompt = completeOverviewPrompt(from: postSummaries, detail: latestDetail)
-        let startedAt = Date()
         let service = SummaryService.shared
+        let selectedProvider = service.settings.selectedSummaryProvider
+        let basePrompt = completeOverviewPrompt(from: postSummaries, detail: latestDetail)
+        let prompt = selectedProvider == .applePCCGateway
+            ? basePrompt + "\n\nReturn only a readable overview in plain natural-language Markdown. Do not return JSON, a property list, or a code block."
+            : basePrompt
+        let startedAt = Date()
         let generated: String
-        if service.settings.selectedSummaryProvider == .webAI {
+        if selectedProvider == .webAI {
             generated = try await AppState.shared.performWebAIRequestAsync(
                 title: "Complete Revision Overview",
                 prompt: prompt
@@ -1072,7 +1131,10 @@ struct ResearchRunDetailView: View {
             generated = try await service.summarize(text: prompt)
         }
 
-        let body = generated.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawBody = generated.trimmingCharacters(in: .whitespacesAndNewlines)
+        let body = selectedProvider == .applePCCGateway
+            ? QuestionAnswerTextFormatter.displayText(from: rawBody)
+            : rawBody
         guard !body.isEmpty else { throw GroundedResearchError.invalidResponse }
 
         // A second action may have finished while the model was working.
@@ -1225,6 +1287,7 @@ private struct ResearchSourcesListView: View {
                 .padding(.vertical, 4)
             }
         }
+        .researchLibraryExperimentalGlassSurface()
         .navigationTitle("Saved Sources")
         .task {
             do {
@@ -1390,7 +1453,7 @@ private struct ResearchArtifactView: View {
                     .foregroundStyle(.secondary)
             }
             if claims.isEmpty {
-                MarkdownTextView(content: artifact.body, fontScale: 0.8)
+                MarkdownTextView(content: displayBody, fontScale: 0.8)
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else {
                 ForEach(claims) { claim in
@@ -1454,6 +1517,9 @@ private struct ResearchArtifactView: View {
                 }
                 .font(.caption.weight(.semibold))
             }
+            if artifact.kind == .postSummary {
+                postSummaryEvidence
+            }
             ForEach(artifact.conflicts, id: \.self) {
                 Label($0, systemImage: "arrow.triangle.branch")
                     .foregroundStyle(.orange)
@@ -1470,6 +1536,54 @@ private struct ResearchArtifactView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var displayBody: String {
+        let body = artifact.kind == .postSummary
+            ? ResearchPostSummaryPresentation.displayMarkdown(from: artifact.body)
+            : artifact.body
+        guard artifactWasGeneratedByPCC else { return body }
+        return QuestionAnswerTextFormatter.displayText(from: body)
+    }
+
+    private var artifactWasGeneratedByPCC: Bool {
+        guard let receipt = artifact.generationReceipt else { return false }
+        return [receipt.requestedProvider, receipt.actualProvider, receipt.route]
+            .contains { $0.localizedCaseInsensitiveContains("PCC") }
+    }
+
+    @ViewBuilder
+    private var postSummaryEvidence: some View {
+        let sourceIDs = ResearchPostSummaryPresentation.sourceIDs(in: artifact.body)
+        let linkedSourceIDs = sourceIDs.filter { sourceForID($0) != nil }
+        if !linkedSourceIDs.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                Label("Evidence from \(linkedSourceIDs.count) saved sources", systemImage: "link")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(linkedSourceIDs, id: \.self) { sourceID in
+                            if let source = sourceForID(sourceID) {
+                                Button(evidenceLabel(for: source)) {
+                                    openSource(source)
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                                .help("Open \(sourceID)")
+                            }
+                        }
+                    }
+                }
+            }
+            .padding(.top, 2)
+        }
+    }
+
+    private func evidenceLabel(for source: ResearchSourceRecord) -> String {
+        if source.kind == .post { return "Original post" }
+        if let author = source.author, !author.isEmpty { return "u/\(author)" }
+        return "Comment"
     }
 
     private func readableMissingData(_ message: String) -> String {
@@ -1545,7 +1659,7 @@ private struct ResearchArtifactView: View {
         let operationID = UUID()
         speechOperationID = operationID
         let settings = SummaryService.shared.settings
-        let plainText = MarkdownTextView.extractPlainText(from: artifact.body)
+        let plainText = MarkdownTextView.extractPlainText(from: displayBody)
         let chunks = KokoroTTSService.shared.speechChunks(from: plainText)
 
         guard !chunks.isEmpty else {
@@ -1606,7 +1720,7 @@ private struct ResearchArtifactView: View {
         let operationID = UUID()
         speechOperationID = operationID
         let settings = SummaryService.shared.settings
-        let plainText = MarkdownTextView.extractPlainText(from: artifact.body)
+        let plainText = MarkdownTextView.extractPlainText(from: displayBody)
         let chunkCount = KokoroTTSService.shared.speechChunks(from: plainText).count
 
         guard chunkCount > 0 else {
@@ -1753,6 +1867,7 @@ struct ResearchSourceDetailView: View {
                     .textSelection(.enabled)
             }
         }
+        .researchLibraryExperimentalGlassSurface()
         .navigationTitle(source.kind == .post ? "Supporting Post" : "Supporting Comment")
         .toolbar {
             if showsDoneButton {
@@ -2093,6 +2208,7 @@ struct ResearchComparisonView: View {
                 ProgressView()
             }
         }
+        .researchLibraryExperimentalGlassSurface()
         .navigationTitle(comparesDifferentFilters ? "Compare Feeds" : "Compare Revisions")
         .toolbar {
             if isGeneratingReport {

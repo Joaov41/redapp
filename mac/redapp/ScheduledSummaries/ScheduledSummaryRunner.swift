@@ -259,9 +259,15 @@ final class ScheduledSummaryRunner {
 
         Requirements:
         - Explain the main subject and what the community said about it.
-        - Include disagreement, uncertainty, or missing information when important.
+        - Preserve how commenters frame the subject, the dominant reaction and tone, concrete examples or workarounds, and meaningful minority viewpoints.
+        - Include disagreement, uncertainty, or missing information when important; do not flatten mixed reactions into consensus.
+        - Keep the supplied [SOURCE:...] IDs beside the points they support.
+        - Do not invent prevalence or claim that a reaction is universal.
         - Do not invent reactions that are not present in the comments.
-        - Write one to three concise paragraphs in Markdown.
+        - Follow the Markdown presentation instructions below exactly.
+
+        Presentation instructions:
+        \(ResearchPostSummaryPresentation.generationInstructions)
 
         Post: \(post.title)
         Post source: [SOURCE:\(response.postID)]
@@ -284,7 +290,7 @@ final class ScheduledSummaryRunner {
         return """
         Write a comprehensive overall summary of the \(schedule.feedDescription) feed from r/\(subreddit).
 
-        This overview must represent the most important themes across all \(summaries.count) analyzed posts and their comments. Explain how the subreddit is progressing, the strongest recurring subjects, community sentiment, meaningful disagreements, and notable changes or patterns. Use clear everyday language and Markdown headings. Do not focus only on the first few posts.
+        This overview must represent the most important themes across all \(summaries.count) analyzed posts and their comments. Explain how the subreddit is progressing, the strongest recurring subjects, community sentiment, meaningful disagreements, and notable changes or patterns. Use the individual summaries to distinguish recurring themes from meaningful minority topics. Do not state an exact supporting-post count unless the matching supplied [SOURCE:...] IDs are retained, and do not translate post support into claims about a majority of commenters. Use clear everyday language and Markdown headings. Do not focus only on the first few posts.
 
         Individual post and comment summaries:
         \(inputs)

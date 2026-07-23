@@ -1,4 +1,5 @@
 import Foundation
+import NaturalLanguage
 import SwiftData
 #if canImport(CryptoKit)
 import CryptoKit
@@ -33,6 +34,105 @@ enum ResearchArtifactKind: String, Codable, CaseIterable, Sendable {
         case .changeReport: return "What Changed"
         case .communityComparison: return "Community Comparison"
         }
+    }
+}
+
+/// Converts evidence-preserving model output into text intended for people to read.
+/// Raw `[SOURCE:...]` tokens remain stored on the artifact for validation, but are
+/// presented separately as interactive evidence links in the library.
+enum ResearchPostSummaryPresentation {
+    static let generationInstructions = """
+    Write valid Markdown using this compact structure:
+
+    **Discussion**
+    One or two sentences explaining the post's subject and the overall response.
+
+    **What commenters emphasized**
+    - **Dominant view:** The prevailing reaction and tone.
+    - **Reasons and examples:** The main reasoning, examples, constraints, or workarounds.
+    - **Disagreement:** A meaningful counterpoint, minority view, or uncertainty.
+
+    Omit a bullet when the discussion does not support it. Keep each supplied [SOURCE:...] ID immediately after the sentence it supports. Use at most 180 words. Do not output a table, preamble, or closing note.
+    """
+
+    private static let sourcePattern = try! NSRegularExpression(
+        pattern: #"\[SOURCE:\s*([^\]\s]+)\s*\]"#,
+        options: [.caseInsensitive]
+    )
+
+    static func sourceIDs(in body: String) -> [String] {
+        let range = NSRange(body.startIndex..<body.endIndex, in: body)
+        var seen = Set<String>()
+        return sourcePattern.matches(in: body, range: range).compactMap { match in
+            guard let sourceRange = Range(match.range(at: 1), in: body) else { return nil }
+            let sourceID = String(body[sourceRange])
+            return seen.insert(sourceID).inserted ? sourceID : nil
+        }
+    }
+
+    static func displayMarkdown(from body: String) -> String {
+        var cleaned = sourcePattern.stringByReplacingMatches(
+            in: body,
+            range: NSRange(body.startIndex..<body.endIndex, in: body),
+            withTemplate: ""
+        )
+
+        // Older batch parsing flattened Markdown lines into a single paragraph.
+        // Recover the unambiguous labelled-list form before rendering.
+        cleaned = cleaned.replacingOccurrences(
+            of: #"\s+-\s+(?=\*\*)"#,
+            with: "\n- ",
+            options: .regularExpression
+        )
+        cleaned = tidyWhitespace(in: cleaned)
+
+        guard !cleaned.isEmpty, !hasMarkdownStructure(cleaned) else { return cleaned }
+
+        let paragraphs = cleaned.components(separatedBy: "\n\n").filter {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        guard paragraphs.count == 1 else { return cleaned }
+
+        let sentences = sentenceRanges(in: cleaned)
+        guard sentences.count >= 3 else { return cleaned }
+
+        let introduction = sentences[0]
+        let keyPoints = sentences.dropFirst().map { "- \($0)" }.joined(separator: "\n")
+        return "\(introduction)\n\n**What commenters emphasized**\n\n\(keyPoints)"
+    }
+
+    private static func sentenceRanges(in text: String) -> [String] {
+        let tokenizer = NLTokenizer(unit: .sentence)
+        tokenizer.string = text
+        var sentences: [String] = []
+        tokenizer.enumerateTokens(in: text.startIndex..<text.endIndex) { range, _ in
+            let sentence = text[range].trimmingCharacters(in: .whitespacesAndNewlines)
+            if !sentence.isEmpty { sentences.append(sentence) }
+            return true
+        }
+        return sentences
+    }
+
+    private static func hasMarkdownStructure(_ text: String) -> Bool {
+        text.components(separatedBy: .newlines).contains { line in
+            let line = line.trimmingCharacters(in: .whitespaces)
+            return line.range(of: #"^#{1,6}\s+"#, options: .regularExpression) != nil
+                || line.range(of: #"^[-*+]\s+"#, options: .regularExpression) != nil
+                || line.range(of: #"^\d+[.)]\s+"#, options: .regularExpression) != nil
+        }
+    }
+
+    private static func tidyWhitespace(in text: String) -> String {
+        text
+            .components(separatedBy: .newlines)
+            .map {
+                $0.replacingOccurrences(of: #"[\t ]{2,}"#, with: " ", options: .regularExpression)
+                    .replacingOccurrences(of: #"\s+([,.;:!?])"#, with: "$1", options: .regularExpression)
+                    .trimmingCharacters(in: .whitespaces)
+            }
+            .joined(separator: "\n")
+            .replacingOccurrences(of: #"\n{3,}"#, with: "\n\n", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 

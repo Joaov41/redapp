@@ -50,6 +50,15 @@ final class ScheduledSummaryTests: XCTestCase {
         XCTAssertEqual(ScheduledSummaryRunner.analyzedCommentLimit, 500)
     }
 
+    func testBackgroundAgentIsNeededOnlyForAnEnabledSchedule() {
+        let enabled = ScheduledSummaryDefinition(subreddit: "SwiftUI", isEnabled: true)
+        let paused = ScheduledSummaryDefinition(subreddit: "OpenAI", isEnabled: false)
+
+        XCTAssertFalse(ScheduledSummaryManager.needsBackgroundAgent(for: []))
+        XCTAssertFalse(ScheduledSummaryManager.needsBackgroundAgent(for: [paused]))
+        XCTAssertTrue(ScheduledSummaryManager.needsBackgroundAgent(for: [paused, enabled]))
+    }
+
     func testMacAppEmbedsScheduledSummaryLaunchAgent() throws {
         let appBundle = Bundle.main.bundleURL
         let agentURL = appBundle
@@ -70,6 +79,61 @@ final class ScheduledSummaryTests: XCTestCase {
         let helperURL = appBundle.appendingPathComponent("Contents/MacOS/redapp-schedule-agent")
         XCTAssertTrue(FileManager.default.isExecutableFile(atPath: helperURL.path), helperURL.path)
 
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = helperURL
+        process.arguments = ["--print-app-path"]
+        process.currentDirectoryURL = URL(fileURLWithPath: "/", isDirectory: true)
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        process.waitUntilExit()
+
+        let resolvedPath = String(
+            decoding: output.fileHandleForReading.readDataToEndOfFile(),
+            as: UTF8.self
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTAssertEqual(process.terminationStatus, 0, resolvedPath)
+        XCTAssertEqual(
+            resolvedPath,
+            appBundle.resolvingSymlinksInPath().standardizedFileURL.path
+        )
+
+        let scheduleStoreURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("scheduler-agent-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: scheduleStoreURL) }
+
+        func wakeDecision(nextRunAt: Date?, isEnabled: Bool) throws -> String {
+            let formatter = ISO8601DateFormatter()
+            var schedule: [String: Any] = ["isEnabled": isEnabled]
+            if let nextRunAt {
+                schedule["nextRunAt"] = formatter.string(from: nextRunAt)
+            }
+            let data = try JSONSerialization.data(withJSONObject: ["schedules": [schedule]])
+            try data.write(to: scheduleStoreURL, options: .atomic)
+
+            let decisionProcess = Process()
+            let decisionOutput = Pipe()
+            decisionProcess.executableURL = helperURL
+            decisionProcess.arguments = [
+                "--schedule-store-path", scheduleStoreURL.path,
+                "--print-wake-decision"
+            ]
+            decisionProcess.standardOutput = decisionOutput
+            decisionProcess.standardError = decisionOutput
+            try decisionProcess.run()
+            decisionProcess.waitUntilExit()
+            XCTAssertEqual(decisionProcess.terminationStatus, 0)
+            return String(
+                decoding: decisionOutput.fileHandleForReading.readDataToEndOfFile(),
+                as: UTF8.self
+            ).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        XCTAssertEqual(try wakeDecision(nextRunAt: nil, isEnabled: true), "skip")
+        XCTAssertEqual(try wakeDecision(nextRunAt: Date().addingTimeInterval(3_600), isEnabled: true), "skip")
+        XCTAssertEqual(try wakeDecision(nextRunAt: Date().addingTimeInterval(-60), isEnabled: false), "skip")
+        XCTAssertEqual(try wakeDecision(nextRunAt: Date().addingTimeInterval(-60), isEnabled: true), "open")
     }
 }
 #endif

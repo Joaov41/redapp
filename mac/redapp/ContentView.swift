@@ -2286,11 +2286,13 @@ class SummaryService: ObservableObject {
         let group = DispatchGroup()
 
         ImageCache.default.clearMemoryCache()
+        #if os(iOS)
         group.enter()
         ImageCache.default.clearDiskCache {
             print("🗑️ SummaryService: Cleared Kingfisher disk cache")
             group.leave()
         }
+        #endif
 
         #if os(iOS)
         group.enter()
@@ -2311,15 +2313,21 @@ class SummaryService: ObservableObject {
     func getRemovableCacheSize() -> String {
         var total: UInt64 = 0
         total += UInt64(URLCache.shared.currentDiskUsage)
-        total += directorySizeIncludingHidden(at: FileManager.default.temporaryDirectory)
+        total += appOwnedTemporaryFileSize()
 
         if let cachesURL = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first {
-            total += directorySizeIncludingHidden(at: cachesURL, excluding: modelCacheRoots())
+            total += directorySizeIncludingHidden(
+                at: cachesURL.appendingPathComponent(appStorageIdentifier, isDirectory: true)
+            )
         }
 
         if let libraryURL = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first {
-            total += directorySizeIncludingHidden(at: libraryURL.appendingPathComponent("WebKit", isDirectory: true))
-            total += directorySizeIncludingHidden(at: libraryURL.appendingPathComponent("HTTPStorages", isDirectory: true))
+            total += directorySizeIncludingHidden(
+                at: libraryURL.appendingPathComponent("WebKit/\(appStorageIdentifier)", isDirectory: true)
+            )
+            total += directorySizeIncludingHidden(
+                at: libraryURL.appendingPathComponent("HTTPStorages/\(appStorageIdentifier)", isDirectory: true)
+            )
         }
 
         return formattedByteCount(total)
@@ -2426,43 +2434,50 @@ class SummaryService: ObservableObject {
             ))
         }
 
-        if let documentsURL = fm.urls(for: .documentDirectory, in: .userDomainMask).first {
-            add("Documents", detail: documentsURL.path, url: documentsURL)
+        if let groupURL = fm.containerURL(forSecurityApplicationGroupIdentifier: "group.com.jv.redapp") {
+            add("Shared App Data", detail: "redapp and widget data", url: groupURL)
         }
 
         if let appSupportURL = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
-            let liteRTModelsURL = appSupportURL.appendingPathComponent("LiteRTModels", isDirectory: true)
             add(
-                "Application Support Data",
-                detail: "App support files excluding LiteRT models",
-                url: appSupportURL,
-                sizeOverride: directorySizeIncludingHidden(at: appSupportURL, excluding: [liteRTModelsURL])
+                "Research Library",
+                detail: "Saved research and source data",
+                url: appSupportURL.appendingPathComponent("ResearchLibrary-v1", isDirectory: true)
             )
+            add(
+                "App Support Data",
+                detail: "redapp settings and scheduled summaries",
+                url: appSupportURL.appendingPathComponent("redapp", isDirectory: true)
+            )
+            let liteRTModelsURL = appSupportURL.appendingPathComponent("LiteRTModels", isDirectory: true)
             add("LiteRT Models", detail: "Downloaded .litertlm files", url: liteRTModelsURL, isModelStorage: true)
         }
 
         if let cachesURL = fm.urls(for: .cachesDirectory, in: .userDomainMask).first {
             add(
-                "Removable Caches",
-                detail: "Caches excluding MLX / Hugging Face models",
-                url: cachesURL,
-                cleanupKind: .caches,
-                sizeOverride: directorySizeIncludingHidden(at: cachesURL, excluding: modelCacheRoots())
+                "App Cache",
+                detail: "Cache files owned by redapp",
+                url: cachesURL.appendingPathComponent(appStorageIdentifier, isDirectory: true),
+                cleanupKind: .caches
             )
-            add("Kingfisher Images", detail: "Image cache", url: cachesURL.appendingPathComponent("com.onevcat.Kingfisher.ImageCache", isDirectory: true), cleanupKind: .kingfisherImages)
         }
 
         if let libraryURL = fm.urls(for: .libraryDirectory, in: .userDomainMask).first {
-            add("WebKit", detail: "Web AI browser data", url: libraryURL.appendingPathComponent("WebKit", isDirectory: true), cleanupKind: .webKit)
-            add("HTTPStorages", detail: "URLSession and web storage", url: libraryURL.appendingPathComponent("HTTPStorages", isDirectory: true), cleanupKind: .httpStorages)
-            add("Saved Application State", detail: "System window/session state", url: libraryURL.appendingPathComponent("Saved Application State", isDirectory: true), cleanupKind: .savedApplicationState)
-            add("Logs", detail: "App and framework logs", url: libraryURL.appendingPathComponent("Logs", isDirectory: true), cleanupKind: .logs)
+            add("WebKit", detail: "redapp Web AI browser data", url: libraryURL.appendingPathComponent("WebKit/\(appStorageIdentifier)", isDirectory: true), cleanupKind: .webKit)
+            add("HTTP Storage", detail: "redapp URLSession and web storage", url: libraryURL.appendingPathComponent("HTTPStorages/\(appStorageIdentifier)", isDirectory: true), cleanupKind: .httpStorages)
+            add("Saved Application State", detail: "redapp window and session state", url: libraryURL.appendingPathComponent("Saved Application State/\(appStorageIdentifier).savedState", isDirectory: true), cleanupKind: .savedApplicationState)
+            add("Logs", detail: "redapp logs", url: libraryURL.appendingPathComponent("Logs/\(appStorageIdentifier)", isDirectory: true), cleanupKind: .logs)
         }
 
-        add("Temporary Files", detail: fm.temporaryDirectory.path, url: fm.temporaryDirectory, cleanupKind: .temporaryFiles)
-
-        for root in modelCacheRoots() {
-            add("MLX / Hugging Face Models", detail: root.path, url: root, isModelStorage: true)
+        let temporarySize = appOwnedTemporaryFileSize()
+        if temporarySize > 0 {
+            add(
+                "Temporary Files",
+                detail: "Temporary files created by redapp",
+                url: fm.temporaryDirectory,
+                cleanupKind: .temporaryFiles,
+                sizeOverride: temporarySize
+            )
         }
 
         return items.sorted { $0.sizeBytes > $1.sizeBytes }
@@ -2480,7 +2495,7 @@ class SummaryService: ObservableObject {
                 includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
                 options: [.skipsHiddenFiles]
             ) {
-                for file in files where file.pathExtension == "litertlm" {
+                for file in files where file.pathExtension == "litertlm" && file.lastPathComponent == currentLiteRTFileName {
                     let size = directorySizeIncludingHidden(at: file)
                     items.append(LocalModelStorageItem(
                         id: file.path,
@@ -2504,6 +2519,7 @@ class SummaryService: ObservableObject {
                 for entry in entries {
                     let values = try? entry.resourceValues(forKeys: [.isDirectoryKey])
                     guard values?.isDirectory == true else { continue }
+                    guard isCurrentMLXModelDirectory(entry.lastPathComponent) else { continue }
                     let size = directorySizeIncludingHidden(at: entry)
                     guard size > 0 else { continue }
                     items.append(LocalModelStorageItem(
@@ -2533,6 +2549,21 @@ class SummaryService: ObservableObject {
         #endif
     }
 
+    private func currentMLXModelCacheDirectories() -> [URL] {
+        let fm = FileManager.default
+        let current = settings.coreAIMLXModelID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !current.isEmpty, !current.hasPrefix("external:") else { return [] }
+
+        return modelCacheRoots().flatMap { root -> [URL] in
+            guard let entries = try? fm.contentsOfDirectory(
+                at: root,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            ) else { return [] }
+            return entries.filter { isCurrentMLXModelDirectory($0.lastPathComponent) }
+        }
+    }
+
     private func displayNameForModelCacheDirectory(_ name: String) -> String {
         if name.hasPrefix("models--") {
             return String(name.dropFirst("models--".count)).replacingOccurrences(of: "--", with: "/")
@@ -2550,10 +2581,12 @@ class SummaryService: ObservableObject {
     private func removeFailedModelDownloadFiles() -> UInt64 {
         let fm = FileManager.default
         var freedBytes: UInt64 = 0
-        var roots = modelCacheRoots()
+        var roots = currentMLXModelCacheDirectories()
+        #if os(iOS)
         if let appSupportURL = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
             roots.append(appSupportURL.appendingPathComponent("LiteRTModels", isDirectory: true))
         }
+        #endif
 
         for root in roots where fm.fileExists(atPath: root.path) {
             guard let enumerator = fm.enumerator(
@@ -2582,32 +2615,81 @@ class SummaryService: ObservableObject {
         case .caches:
             URLCache.shared.removeAllCachedResponses()
             guard let cachesURL = fm.urls(for: .cachesDirectory, in: .userDomainMask).first else { return 0 }
-            return removeDirectoryContents(at: cachesURL, preserving: modelCacheRoots())
+            return removeItemIfExists(
+                at: cachesURL.appendingPathComponent(appStorageIdentifier, isDirectory: true)
+            )
 
         case .kingfisherImages:
             ImageCache.default.clearMemoryCache()
-            guard let cachesURL = fm.urls(for: .cachesDirectory, in: .userDomainMask).first else { return 0 }
-            return removeItemIfExists(at: cachesURL.appendingPathComponent("com.onevcat.Kingfisher.ImageCache", isDirectory: true))
+            // The default Kingfisher directory is global in this unsandboxed
+            // build, so never remove it directly.
+            return 0
 
         case .webKit:
             guard let libraryURL = fm.urls(for: .libraryDirectory, in: .userDomainMask).first else { return 0 }
-            return removeItemIfExists(at: libraryURL.appendingPathComponent("WebKit", isDirectory: true))
+            return removeItemIfExists(
+                at: libraryURL.appendingPathComponent("WebKit/\(appStorageIdentifier)", isDirectory: true)
+            )
 
         case .httpStorages:
             guard let libraryURL = fm.urls(for: .libraryDirectory, in: .userDomainMask).first else { return 0 }
-            return removeItemIfExists(at: libraryURL.appendingPathComponent("HTTPStorages", isDirectory: true))
+            return removeItemIfExists(
+                at: libraryURL.appendingPathComponent("HTTPStorages/\(appStorageIdentifier)", isDirectory: true)
+            )
 
         case .savedApplicationState:
             guard let libraryURL = fm.urls(for: .libraryDirectory, in: .userDomainMask).first else { return 0 }
-            return removeItemIfExists(at: libraryURL.appendingPathComponent("Saved Application State", isDirectory: true))
+            return removeItemIfExists(
+                at: libraryURL.appendingPathComponent("Saved Application State/\(appStorageIdentifier).savedState", isDirectory: true)
+            )
 
         case .logs:
             guard let libraryURL = fm.urls(for: .libraryDirectory, in: .userDomainMask).first else { return 0 }
-            return removeItemIfExists(at: libraryURL.appendingPathComponent("Logs", isDirectory: true))
+            return removeItemIfExists(
+                at: libraryURL.appendingPathComponent("Logs/\(appStorageIdentifier)", isDirectory: true)
+            )
 
         case .temporaryFiles:
-            return removeDirectoryContents(at: fm.temporaryDirectory, preserving: [])
+            return removeAppOwnedTemporaryFiles()
         }
+    }
+
+    private var appStorageIdentifier: String {
+        Bundle.main.bundleIdentifier ?? "com.jv.redapp"
+    }
+
+    private var appOwnedTemporaryPrefixes: [String] {
+        ["tts_", "tts_analysis_", "mlx_tts_", "mlx_tts_report_", "redapp-"]
+    }
+
+    private func appOwnedTemporaryFileSize() -> UInt64 {
+        let fm = FileManager.default
+        guard let contents = try? fm.contentsOfDirectory(
+            at: fm.temporaryDirectory,
+            includingPropertiesForKeys: nil,
+            options: []
+        ) else { return 0 }
+
+        return contents.reduce(into: UInt64(0)) { total, item in
+            if appOwnedTemporaryPrefixes.contains(where: { item.lastPathComponent.hasPrefix($0) }) {
+                total += directorySizeIncludingHidden(at: item)
+            }
+        }
+    }
+
+    private func removeAppOwnedTemporaryFiles() -> UInt64 {
+        let fm = FileManager.default
+        guard let contents = try? fm.contentsOfDirectory(
+            at: fm.temporaryDirectory,
+            includingPropertiesForKeys: nil,
+            options: []
+        ) else { return 0 }
+
+        var freedBytes: UInt64 = 0
+        for item in contents where appOwnedTemporaryPrefixes.contains(where: { item.lastPathComponent.hasPrefix($0) }) {
+            freedBytes += removeItemIfExists(at: item)
+        }
+        return freedBytes
     }
 
     private func removeDirectoryContents(at directory: URL, preserving protectedURLs: [URL]) -> UInt64 {
@@ -4482,6 +4564,8 @@ struct SettingsView: View {
     @State private var externalDownloadTarget: ExternalModelDownloadTarget? = nil
     @AppStorage("summarizeDaemonToken") private var summarizeDaemonTokenStorage: String = ""
     @AppStorage("macBridgeSecret") private var summarizeBridgeSecretStorage: String = ""
+    @AppStorage("experimentalSettingsGlassEnabled") private var experimentalSettingsGlassEnabled = true
+    @AppStorage("experimentalSettingsGlassVariant") private var experimentalSettingsGlassVariant = 11
     
     // Local TTS Voice selection
     @State private var iosVoices: [(id: String, title: String)] = []
@@ -4508,6 +4592,14 @@ struct SettingsView: View {
 
     private var settingsBackground: Color {
         AppColors.background
+    }
+
+    private var settingsSurfaceBackground: Color {
+        #if os(macOS)
+        experimentalSettingsGlassEnabled ? .clear : settingsBackground
+        #else
+        settingsBackground
+        #endif
     }
 
     private func launchWebAILogin(_ provider: WebAIProvider) {
@@ -4562,7 +4654,7 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             ZStack {
-                settingsBackground
+                settingsSurfaceBackground
                     .ignoresSafeArea()
                 
                 Form {
@@ -5433,7 +5525,7 @@ struct SettingsView: View {
                 Section {
                     VStack(alignment: .leading, spacing: 12) {
                         HStack {
-                            Text("App Container")
+                            Text("App-owned Files")
                                 .foregroundColor(.secondary)
                             Spacer()
                             if isLoadingStorageBreakdown {
@@ -5498,7 +5590,7 @@ struct SettingsView: View {
                                 .foregroundColor(.secondary)
                         }
 
-                        Text("Removable cache rows exclude local models. Use model rows or Local Model Storage to delete downloaded models.")
+                        Text("Only redapp-owned locations are shown. Shared home folders and models belonging to other applications are excluded.")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
@@ -5599,6 +5691,70 @@ struct SettingsView: View {
                     Text("When enabled, app will always use dark mode. When disabled, app follows system setting.")
                         .font(.caption)
                         .foregroundColor(.secondary)
+
+                    #if os(macOS)
+                    Divider()
+
+                    Toggle("Experimental Glass Everywhere", isOn: $experimentalSettingsGlassEnabled)
+
+                    VStack(alignment: .leading, spacing: 7) {
+                        HStack {
+                            Text("Glass Variant")
+                            Spacer()
+                            Text("\(experimentalSettingsGlassVariant)")
+                                .monospacedDigit()
+                                .foregroundStyle(.secondary)
+                        }
+
+                        Slider(
+                            value: Binding(
+                                get: { Double(experimentalSettingsGlassVariant) },
+                                set: { experimentalSettingsGlassVariant = Int($0.rounded()) }
+                            ),
+                            in: 0...19,
+                            step: 1
+                        )
+
+                        HStack {
+                            Text("0")
+                            Spacer()
+                            Button("Reset to 11") {
+                                experimentalSettingsGlassVariant = 11
+                            }
+                            .buttonStyle(.borderless)
+                            Spacer()
+                            Text("19")
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
+
+                    if experimentalSettingsGlassEnabled {
+                        ExperimentalSettingsGlassBackground(
+                            variant: ExperimentalSettingsGlassVariant(rawValue: experimentalSettingsGlassVariant) ?? .v11,
+                            cornerRadius: 14
+                        ) {
+                            HStack(spacing: 12) {
+                                Image(systemName: "sparkles.rectangle.stack")
+                                    .font(.system(size: 26, weight: .medium))
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text("Glass Variant \(experimentalSettingsGlassVariant)")
+                                        .font(.headline)
+                                    Text("Private NSGlassEffectView preview")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                            }
+                            .padding(16)
+                        }
+                        .frame(height: 78)
+                    }
+
+                    Text("Experimental private API. Use the sparkle button in either toolbar to restore the complete standard app UI instantly.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    #endif
                 } header: {
                     Text("Appearance")
                 }
@@ -5623,7 +5779,12 @@ struct SettingsView: View {
                 }
                 .formStyle(.grouped)
                 .scrollContentBackground(.hidden)
-                .background(settingsBackground)
+                .background(settingsSurfaceBackground)
+                .experimentalSettingsGlass(
+                    enabled: experimentalSettingsGlassEnabled,
+                    variant: experimentalSettingsGlassVariant,
+                    cornerRadius: 18
+                )
             }
             .navigationTitle("Settings")
             .toolbar {
@@ -5637,6 +5798,18 @@ struct SettingsView: View {
                 }
                 #else
                 ToolbarItem(placement: .automatic) {
+                    Button {
+                        experimentalSettingsGlassEnabled.toggle()
+                    } label: {
+                        Label(
+                            experimentalSettingsGlassEnabled ? "Disable Glass" : "Enable Glass",
+                            systemImage: experimentalSettingsGlassEnabled ? "sparkles.rectangle.stack.fill" : "sparkles.rectangle.stack"
+                        )
+                    }
+                    .help(experimentalSettingsGlassEnabled ? "Restore the standard app appearance" : "Enable app-wide experimental glass")
+                }
+
+                ToolbarItem(placement: .automatic) {
                     Button("Done") {
                         dismiss()
                     }
@@ -5645,7 +5818,7 @@ struct SettingsView: View {
                 #endif
             }
         }
-        .background(settingsBackground)
+        .background(settingsSurfaceBackground)
 #if os(macOS)
         .frame(minWidth: 720, idealWidth: 760, minHeight: 760, idealHeight: 820)
         .background {
@@ -8909,6 +9082,7 @@ class RedditSubredditViewModel: ObservableObject {
             publishWidgetSnapshot()
         }
     }
+    @Published var batchFinalSummaryWasPCC = false
     @Published var batchFinalSummaryCondensed: String? {
         didSet {
             if isApplyingFinalSummaryUpdate { return }
@@ -9493,7 +9667,18 @@ class RedditSubredditViewModel: ObservableObject {
                             // MLX models need instructions BEFORE content to avoid repeating instructions
                             if SummaryService.shared.settings.selectedSummaryProvider == .mlxLocal {
                                 batchPrompt = """
-                                You will summarize \(batchPostData.count) Reddit posts. For each post, write a 1-2 paragraph summary.
+                                You will summarize \(batchPostData.count) Reddit posts. For each post, write a compact evidence-preserving summary.
+
+                                For every post, retain:
+                                - the main subject and how commenters frame it;
+                                - the dominant reaction and tone;
+                                - meaningful disagreement or minority viewpoints;
+                                - concrete examples, constraints, or workarounds;
+                                - the supplied [SOURCE:...] IDs beside the points they support.
+
+                                Do not turn a mixed discussion into a single consensus. Do not invent prevalence or reactions.
+
+                                \(ResearchPostSummaryPresentation.generationInstructions)
 
                                 OUTPUT FORMAT (one per post):
                                 POST 1 SUMMARY: [your summary text here]
@@ -9504,7 +9689,14 @@ class RedditSubredditViewModel: ObservableObject {
 
                                 """
                             } else {
-                                batchPrompt = "Provide SHORT summaries for the following Reddit posts. Each summary should be NO MORE THAN 2 PARAGRAPHS. Be extremely concise.\n\n"
+                                batchPrompt = """
+                                Produce a compact evidence-preserving summary for each Reddit post below.
+
+                                For every post, retain the main subject, how commenters frame it, the dominant reaction and tone, meaningful disagreement or minority viewpoints, and concrete examples or workarounds. Keep the supplied [SOURCE:...] IDs beside the points they support. Do not collapse mixed reactions into consensus, invent prevalence, or omit a minority view merely to be shorter.
+
+                                \(ResearchPostSummaryPresentation.generationInstructions)
+
+                                """
                             }
 
                             for (index, postData) in batchPostData.enumerated() {
@@ -9880,9 +10072,12 @@ class RedditSubredditViewModel: ObservableObject {
         return """
         Summarize this Reddit post from \(feedDescription).
 
-        Write a concise 1-2 paragraph summary of what the post and comments are about.
-        Capture the main point, notable reactions, sentiment, disagreements, and any useful context.
+        Write a compact evidence-preserving summary of what the post and comments are about.
+        Capture the main point, how commenters frame it, the dominant reaction and tone, meaningful minority viewpoints, disagreements, and concrete examples or workarounds. Keep supplied [SOURCE:...] IDs beside the points they support.
+        Do not collapse mixed reactions into consensus or invent prevalence.
         Do not transcribe the comments. Do not include markdown tables. Output only the summary.
+
+        \(ResearchPostSummaryPresentation.generationInstructions)
 
         Post title:
         \(post.title)
@@ -9972,7 +10167,7 @@ class RedditSubredditViewModel: ObservableObject {
             }
 
             if !matched && currentPostIndex >= 0 {
-                currentSummary += " " + trimmedLine
+                currentSummary += (currentSummary.isEmpty ? "" : "\n") + trimmedLine
             }
         }
 
@@ -10033,7 +10228,7 @@ class RedditSubredditViewModel: ObservableObject {
                     }
                 }
                 if currentIdx >= 0 {
-                    currentContent += " " + trimmed
+                    currentContent += (currentContent.isEmpty ? "" : "\n") + trimmed
                 }
             }
             // Save last
@@ -10338,7 +10533,9 @@ class RedditSubredditViewModel: ObservableObject {
                 // Build single-post prompt with limited comments to keep shortcut payload small
                 let limitedComments = postData.comments.prefix(8000) // Limit to ~2k tokens
                 let singlePostPrompt = """
-                Summarize this Reddit post in 1-2 paragraphs. Be concise.
+                Summarize this Reddit post and its comments while retaining how commenters frame the subject, the dominant reaction and tone, meaningful disagreement or minority viewpoints, and concrete examples or workarounds. Keep supplied [SOURCE:...] IDs beside the points they support. Do not invent prevalence or flatten mixed reactions into consensus.
+
+                \(ResearchPostSummaryPresentation.generationInstructions)
 
                 POST: \(postData.title)
                 COMMENTS:
@@ -10450,8 +10647,10 @@ class RedditSubredditViewModel: ObservableObject {
                 }
 
                 var combinedPrompt = """
-                Provide VERY SHORT summaries (1-2 paragraphs each) for the following \(batchPosts.count) Reddit posts from \(feedDescription).
-                Be concise.
+                Provide compact, evidence-preserving summaries for the following \(batchPosts.count) Reddit posts from \(feedDescription).
+                For each post, retain how commenters frame the subject, the dominant reaction and tone, meaningful disagreement or minority viewpoints, concrete examples or workarounds, and supplied [SOURCE:...] IDs. Do not invent prevalence or flatten mixed reactions into consensus.
+
+                \(ResearchPostSummaryPresentation.generationInstructions)
 
                 """
 
@@ -10524,8 +10723,10 @@ class RedditSubredditViewModel: ObservableObject {
             }
 
             var combinedPrompt = """
-            Provide SHORT summaries for the following \(allPostData.count) Reddit posts from \(feedDescription).
-            Each summary should be NO MORE THAN 2 PARAGRAPHS. Be extremely concise.
+            Provide compact, evidence-preserving summaries for the following \(allPostData.count) Reddit posts from \(feedDescription).
+            For each post, retain how commenters frame the subject, the dominant reaction and tone, meaningful disagreement or minority viewpoints, concrete examples or workarounds, and supplied [SOURCE:...] IDs. Do not invent prevalence or flatten mixed reactions into consensus.
+
+            \(ResearchPostSummaryPresentation.generationInstructions)
 
             """
 
@@ -10946,6 +11147,8 @@ class RedditSubredditViewModel: ObservableObject {
         3. Key topics of discussion
         4. Any notable trends or patterns
 
+        Use the individual post summaries to distinguish recurring themes from meaningful minority topics and preserve disagreement. Do not state an exact supporting-post count unless the matching supplied [SOURCE:...] IDs are retained, and do not translate post support into claims about a majority of commenters.
+
         Individual Post Summaries:
 
         \(combinedSummaries)
@@ -10976,6 +11179,8 @@ class RedditSubredditViewModel: ObservableObject {
             3. Key topics of discussion
             4. Any notable trends or patterns
 
+            Use the individual post summaries to distinguish recurring themes from meaningful minority topics and preserve disagreement. Do not state an exact supporting-post count unless the matching supplied [SOURCE:...] IDs are retained, and do not translate post support into claims about a majority of commenters.
+
             Individual Post Summaries:
 
             \(shortSummaries)
@@ -10991,6 +11196,8 @@ class RedditSubredditViewModel: ObservableObject {
         3. Key topics of discussion
         4. Any notable trends or patterns
 
+        Use the individual post summaries to distinguish recurring themes from meaningful minority topics and preserve disagreement. Do not state an exact supporting-post count unless the matching supplied [SOURCE:...] IDs are retained, and do not translate post support into claims about a majority of commenters.
+
         Individual Post Summaries:
 
         \(combinedSummaries)
@@ -10998,11 +11205,13 @@ class RedditSubredditViewModel: ObservableObject {
     }
 
     private func generateFinalSummary(subreddit: String) async {
+        let selectedProvider = SummaryService.shared.settings.selectedSummaryProvider
         await MainActor.run {
             self.batchProgress = 1.0
             self.batchCurrentPostTitle = "Generating overall summary..."
             self.showBatchResults = true
             self.batchFinalSummary = ""
+            self.batchFinalSummaryWasPCC = selectedProvider == .applePCCGateway
             self.isGeneratingBatchOverallSummary = true
             #if os(iOS)
             if #available(iOS 16.1, *) {
@@ -11016,11 +11225,14 @@ class RedditSubredditViewModel: ObservableObject {
             #endif
         }
 
-        let finalPrompt = overallSummaryPrompt(for: subreddit)
+        let baseFinalPrompt = overallSummaryPrompt(for: subreddit)
+        let finalPrompt = selectedProvider == .applePCCGateway
+            ? baseFinalPrompt + "\n\nReturn only a readable overall summary in plain natural-language Markdown. Do not return JSON, a property list, or a code block."
+            : baseFinalPrompt
 
         do {
             let finalSummary: String
-            if SummaryService.shared.settings.selectedSummaryProvider == .webAI {
+            if selectedProvider == .webAI {
                 await MainActor.run {
                     AppState.shared.isWebAIHandoffMinimized = true
                 }
@@ -11033,6 +11245,8 @@ class RedditSubredditViewModel: ObservableObject {
                     self.batchCurrentPostTitle = ""
                     self.showBatchResults = true
                 }
+            } else if selectedProvider == .applePCCGateway {
+                finalSummary = try await SummaryService.shared.summarize(text: finalPrompt)
             } else {
                 finalSummary = try await SummaryService.shared.summarize(
                     text: finalPrompt,
@@ -11041,10 +11255,13 @@ class RedditSubredditViewModel: ObservableObject {
                     }
                 )
             }
-            let condensedSummary = await generateWidgetCondensedSummary(from: finalSummary)
+            let displaySummary = selectedProvider == .applePCCGateway
+                ? QuestionAnswerTextFormatter.displayText(from: finalSummary)
+                : finalSummary
+            let condensedSummary = await generateWidgetCondensedSummary(from: displaySummary)
             await MainActor.run {
                 self.isApplyingFinalSummaryUpdate = true
-                self.batchFinalSummary = finalSummary
+                self.batchFinalSummary = displaySummary
                 self.batchFinalSummaryCondensed = condensedSummary
                 self.batchCurrentPostTitle = ""
                 self.isBatchProcessing = false
@@ -12980,6 +13197,7 @@ struct CommentSummaryView: View {
         \(allRawComments)
 
         Answer the following question based on the information in the comments above: \(question)
+
         """
 
         answerGenerationTask = Task {
@@ -12999,7 +13217,9 @@ struct CommentSummaryView: View {
                     )
                 }
                 await MainActor.run {
-                    self.answer = fetchedAnswer
+                    self.answer = SummaryService.shared.settings.selectedSummaryProvider == .applePCCGateway
+                        ? QuestionAnswerTextFormatter.displayText(from: fetchedAnswer)
+                        : fetchedAnswer
                     self.isAnswering = false
                 }
             } catch is CancellationError {
@@ -13926,16 +14146,23 @@ private func splitLongReplyParagraph(_ paragraph: String) -> [String] {
 struct ReadableReplyText: View {
     let content: String
     let fontScale: CGFloat
+    let sourceLinks: [String: URL]
 
-    init(content: String, fontScale: CGFloat = 1.0) {
+    init(
+        content: String,
+        fontScale: CGFloat = 1.0,
+        sourceLinks: [String: URL] = [:]
+    ) {
         self.content = content
         self.fontScale = fontScale
+        self.sourceLinks = sourceLinks
     }
 
     var body: some View {
         MarkdownTextView(
             content: readableReplyText(content),
-            fontScale: fontScale
+            fontScale: fontScale,
+            sourceLinks: sourceLinks
         )
     }
 }
@@ -13944,12 +14171,18 @@ struct ReadableReplyText: View {
 struct MarkdownTextView: View {
     let content: String
     let fontScale: CGFloat
+    let sourceLinks: [String: URL]
     @Environment(\.colorScheme) var colorScheme
     
     // Initialize with optional font scale
-    init(content: String, fontScale: CGFloat = 1.0) {
+    init(
+        content: String,
+        fontScale: CGFloat = 1.0,
+        sourceLinks: [String: URL] = [:]
+    ) {
         self.content = content
         self.fontScale = fontScale
+        self.sourceLinks = sourceLinks
     }
     
     // Platform-specific base font size with scale factor
@@ -14252,6 +14485,48 @@ struct MarkdownTextView: View {
         
         // Process the text character by character
         while currentIndex < text.endIndex {
+            // Turn evidence tokens into compact, clickable Reddit citations.
+            if text[currentIndex...].lowercased().hasPrefix("[source:"),
+               let closingBracket = text[currentIndex...].firstIndex(of: "]") {
+                let idStart = text.index(currentIndex, offsetBy: 8)
+                let sourceID = String(text[idStart..<closingBracket])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !sourceID.isEmpty {
+                    var source = AttributedString("[\(sourceID)]")
+                    if let destination = sourceLinks[sourceID] {
+                        source.link = destination
+                        source.foregroundColor = .accentColor
+                        source.underlineStyle = .single
+                    }
+                    result.append(source)
+                    currentIndex = text.index(after: closingBracket)
+                    continue
+                }
+            }
+
+            // Handle ordinary inline Markdown links as real links as well.
+            if text[currentIndex] == "[",
+               let labelEnd = text[currentIndex...].firstIndex(of: "]"),
+               labelEnd < text.index(before: text.endIndex) {
+                let openParen = text.index(after: labelEnd)
+                if text[openParen] == "(",
+                   let closeParen = text[openParen...].firstIndex(of: ")") {
+                    let labelStart = text.index(after: currentIndex)
+                    let urlStart = text.index(after: openParen)
+                    let label = String(text[labelStart..<labelEnd])
+                    let urlString = String(text[urlStart..<closeParen])
+                    if let destination = URL(string: urlString), !label.isEmpty {
+                        var link = AttributedString(label)
+                        link.link = destination
+                        link.foregroundColor = .accentColor
+                        link.underlineStyle = .single
+                        result.append(link)
+                        currentIndex = text.index(after: closeParen)
+                        continue
+                    }
+                }
+            }
+
             // Check for bold text (**text** or __text__)
             if text[currentIndex...].hasPrefix("**") || text[currentIndex...].hasPrefix("__") {
                 let delimiter = String(text[currentIndex...].prefix(2))
@@ -18524,6 +18799,7 @@ struct BatchResultsView: View {
     // Batch LLM summary state
     @State private var isSendingBatchResultsToLLM: Bool = false
     @State private var batchLLMResponse: String?
+    @State private var batchLLMResponseWasPCC: Bool = false
     @State private var batchLLMError: String?
     @State private var batchLLMTask: Task<Void, Never>?
     @State private var shouldScrollToLLMSummaryOnCompletion: Bool = false
@@ -18535,6 +18811,23 @@ struct BatchResultsView: View {
 
     private var isWebBatchMode: Bool {
         viewModel.batchExecutionMode == .web
+    }
+
+    private var batchSourceLinks: [String: URL] {
+        var links: [String: URL] = [:]
+        for source in viewModel.batchCapturedSources {
+            let permalink = normalizeRedditPermalink(source.permalink)
+            if let url = URL(string: permalink), !permalink.isEmpty {
+                links[source.sourceID] = url
+            }
+        }
+        for (sourceID, source) in groundedAnswerSources {
+            let permalink = normalizeRedditPermalink(source.permalink)
+            if let url = URL(string: permalink), !permalink.isEmpty {
+                links[sourceID] = url
+            }
+        }
+        return links
     }
 
     private struct MarkdownTableBlock: Identifiable {
@@ -18671,7 +18964,10 @@ struct BatchResultsView: View {
                         } else {
                         // Overall summary section
                         if viewModel.batchFinalSummary != nil || viewModel.isGeneratingBatchOverallSummary {
-                            let finalSummary = viewModel.batchFinalSummary ?? ""
+                            let rawFinalSummary = viewModel.batchFinalSummary ?? ""
+                            let finalSummary = (viewModel.batchFinalSummaryWasPCC || summaryService.settings.selectedSummaryProvider == .applePCCGateway)
+                                ? QuestionAnswerTextFormatter.displayText(from: rawFinalSummary)
+                                : rawFinalSummary
                             let finalSummaryIsEmpty = finalSummary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                             VStack(alignment: .leading, spacing: 12) {
                                 HStack {
@@ -18757,7 +19053,7 @@ struct BatchResultsView: View {
                                     }
                                     .cornerRadius(12)
                                 } else {
-                                    ReadableReplyText(content: finalSummary, fontScale: 0.9)
+                                    ReadableReplyText(content: finalSummary, fontScale: 0.9, sourceLinks: batchSourceLinks)
                                         .frame(maxWidth: .infinity, alignment: .leading)
                                         .fixedSize(horizontal: false, vertical: true)
                                         .padding()
@@ -18999,7 +19295,7 @@ struct BatchResultsView: View {
                                                 .padding(.vertical, 4)
                                         }
                                         
-                                        ReadableReplyText(content: (showingTopicSummaryCondensed && topicSummaryCondensed != nil) ? topicSummaryCondensed! : topicSummary, fontScale: 0.9)
+                                        ReadableReplyText(content: (showingTopicSummaryCondensed && topicSummaryCondensed != nil) ? topicSummaryCondensed! : topicSummary, fontScale: 0.9, sourceLinks: batchSourceLinks)
                                             .frame(maxWidth: .infinity, alignment: .leading)
                                             .fixedSize(horizontal: false, vertical: true)
                                             .padding()
@@ -19072,7 +19368,7 @@ struct BatchResultsView: View {
                                     #endif
                                 }
                                 
-                                ReadableReplyText(content: overallSummary, fontScale: 0.9)
+                                ReadableReplyText(content: overallSummary, fontScale: 0.9, sourceLinks: batchSourceLinks)
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                     .fixedSize(horizontal: false, vertical: true)
                                     .padding()
@@ -19105,6 +19401,9 @@ struct BatchResultsView: View {
                         }
 
                         if let llmResponse = batchLLMResponse {
+                            let displayedLLMResponse = (batchLLMResponseWasPCC || summaryService.settings.selectedSummaryProvider == .applePCCGateway)
+                                ? QuestionAnswerTextFormatter.displayText(from: llmResponse)
+                                : llmResponse
                             VStack(alignment: .leading, spacing: 12) {
                                 Color.clear
                                     .frame(height: 0)
@@ -19119,7 +19418,7 @@ struct BatchResultsView: View {
                                         .fontWeight(.semibold)
                                     Spacer()
                                     Button(action: {
-                                        copyToClipboard(llmResponse)
+                                        copyToClipboard(displayedLLMResponse)
                                     }) {
                                         Image(systemName: "doc.on.doc")
                                             .font(.caption)
@@ -19148,13 +19447,13 @@ struct BatchResultsView: View {
                                     #endif
                                 }
 
-                                let llmBlocks = parseBatchLLMBlocks(from: llmResponse)
+                                let llmBlocks = parseBatchLLMBlocks(from: displayedLLMResponse)
 
                                 VStack(alignment: .leading, spacing: 14) {
                                     ForEach(Array(llmBlocks.enumerated()), id: \.offset) { _, block in
                                         switch block {
                                         case .text(let text):
-                                            ReadableReplyText(content: text, fontScale: 0.9)
+                                            ReadableReplyText(content: text, fontScale: 0.9, sourceLinks: batchSourceLinks)
                                                 .frame(maxWidth: .infinity, alignment: .leading)
                                                 .fixedSize(horizontal: false, vertical: true)
                                         case .table(let table):
@@ -19230,7 +19529,7 @@ struct BatchResultsView: View {
                                             }
                                         }
 
-                                        ReadableReplyText(content: summary.summary, fontScale: 0.72)
+                                        ReadableReplyText(content: summary.summary, fontScale: 0.72, sourceLinks: batchSourceLinks)
                                             .fixedSize(horizontal: false, vertical: true)
                                     }
                                     .padding()
@@ -21890,7 +22189,7 @@ struct BatchResultsView: View {
                             .help("Copy answer")
                         }
 
-                        ReadableReplyText(content: answer, fontScale: 0.9)
+                        ReadableReplyText(content: answer, fontScale: 0.9, sourceLinks: batchSourceLinks)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .fixedSize(horizontal: false, vertical: true)
                             .padding()
@@ -21927,7 +22226,10 @@ struct BatchResultsView: View {
     @ViewBuilder
     private func webBatchGeneratedResultsSection(proxy: ScrollViewProxy) -> some View {
         if viewModel.batchFinalSummary != nil || viewModel.isGeneratingBatchOverallSummary {
-            let finalSummary = viewModel.batchFinalSummary ?? ""
+            let rawFinalSummary = viewModel.batchFinalSummary ?? ""
+            let finalSummary = (viewModel.batchFinalSummaryWasPCC || summaryService.settings.selectedSummaryProvider == .applePCCGateway)
+                ? QuestionAnswerTextFormatter.displayText(from: rawFinalSummary)
+                : rawFinalSummary
             let finalSummaryIsEmpty = finalSummary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
 
             VStack(alignment: .leading, spacing: 12) {
@@ -21959,7 +22261,7 @@ struct BatchResultsView: View {
                             .foregroundColor(.secondary)
                     }
                 } else if !finalSummaryIsEmpty {
-                    ReadableReplyText(content: finalSummary, fontScale: 0.9)
+                    ReadableReplyText(content: finalSummary, fontScale: 0.9, sourceLinks: batchSourceLinks)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .fixedSize(horizontal: false, vertical: true)
                         .padding()
@@ -21991,6 +22293,9 @@ struct BatchResultsView: View {
 
         if let llmResponse = batchLLMResponse,
            !llmResponse.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let displayedLLMResponse = (batchLLMResponseWasPCC || summaryService.settings.selectedSummaryProvider == .applePCCGateway)
+                ? QuestionAnswerTextFormatter.displayText(from: llmResponse)
+                : llmResponse
             VStack(alignment: .leading, spacing: 12) {
                 Color.clear
                     .frame(height: 0)
@@ -22006,7 +22311,7 @@ struct BatchResultsView: View {
                     Spacer()
 
                     Button(action: {
-                        copyToClipboard(llmResponse)
+                        copyToClipboard(displayedLLMResponse)
                     }) {
                         Image(systemName: "doc.on.doc")
                             .font(.caption)
@@ -22014,13 +22319,13 @@ struct BatchResultsView: View {
                     .buttonStyle(PlainButtonStyle())
                 }
 
-                let llmBlocks = parseBatchLLMBlocks(from: llmResponse)
+                let llmBlocks = parseBatchLLMBlocks(from: displayedLLMResponse)
 
                 VStack(alignment: .leading, spacing: 14) {
                     ForEach(Array(llmBlocks.enumerated()), id: \.offset) { _, block in
                         switch block {
                         case .text(let text):
-                            ReadableReplyText(content: text, fontScale: 0.9)
+                            ReadableReplyText(content: text, fontScale: 0.9, sourceLinks: batchSourceLinks)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .fixedSize(horizontal: false, vertical: true)
                         case .table(let table):
@@ -22177,7 +22482,7 @@ struct BatchResultsView: View {
                 }
             }
 
-            ReadableReplyText(content: post.comments, fontScale: 0.72)
+            ReadableReplyText(content: post.comments, fontScale: 0.72, sourceLinks: batchSourceLinks)
                 .fixedSize(horizontal: false, vertical: true)
         }
         }
@@ -22393,6 +22698,7 @@ struct BatchResultsView: View {
         isSendingBatchResultsToLLM = true
         shouldScrollToLLMSummaryOnCompletion = true
         batchLLMResponse = ""
+        batchLLMResponseWasPCC = false
         batchLLMTask?.cancel()
 
         appState.performWebAIRequest(
@@ -22674,7 +22980,11 @@ struct BatchResultsView: View {
     private func sendBatchResultsToLLM() {
         guard !isSendingBatchResultsToLLM else { return }
 
-        let instructions = categorizedLLMSummaryPrompt()
+        let selectedProvider = SummaryService.shared.settings.selectedSummaryProvider
+        let baseInstructions = categorizedLLMSummaryPrompt()
+        let instructions = selectedProvider == .applePCCGateway
+            ? baseInstructions + "\n\nReturn only a readable categorized summary in plain natural-language Markdown. Do not return JSON, a property list, or a code block."
+            : baseInstructions
         guard !instructions.isEmpty else {
             batchLLMError = "No batch results available to send."
             return
@@ -22698,18 +23008,27 @@ struct BatchResultsView: View {
         shouldScrollToLLMSummaryOnCompletion = true
         batchLLMResponse = ""
         batchLLMTask?.cancel()
+        batchLLMResponseWasPCC = selectedProvider == .applePCCGateway
         
         batchLLMTask = Task {
             do {
-                let response = try await SummaryService.shared.summarize(
-                    text: instructions,
-                    onPartial: { token in
-                        self.batchLLMResponse = (self.batchLLMResponse ?? "") + token
-                    }
-                )
+                let response: String
+                if selectedProvider == .applePCCGateway {
+                    response = try await SummaryService.shared.summarize(text: instructions)
+                } else {
+                    response = try await SummaryService.shared.summarize(
+                        text: instructions,
+                        onPartial: { token in
+                            self.batchLLMResponse = (self.batchLLMResponse ?? "") + token
+                        }
+                    )
+                }
                 await MainActor.run {
-                    self.batchLLMResponse = response
-                    self.persistLegacyBatchArtifact(kind: .categorizedReport, title: "Categorized Summary", body: response)
+                    let displayResponse = selectedProvider == .applePCCGateway
+                        ? QuestionAnswerTextFormatter.displayText(from: response)
+                        : response
+                    self.batchLLMResponse = displayResponse
+                    self.persistLegacyBatchArtifact(kind: .categorizedReport, title: "Categorized Summary", body: displayResponse)
                     self.isSendingBatchResultsToLLM = false
                 }
             } catch is CancellationError {
@@ -23261,7 +23580,9 @@ struct BatchResultsView: View {
                     )
                 }
                 await MainActor.run {
-                    self.answer = fetchedAnswer
+                    self.answer = SummaryService.shared.settings.selectedSummaryProvider == .applePCCGateway
+                        ? QuestionAnswerTextFormatter.displayText(from: fetchedAnswer)
+                        : fetchedAnswer
                     self.isAnswering = false
                 }
             } catch is CancellationError {
@@ -23389,7 +23710,7 @@ struct BatchResultsView: View {
                 }
             }
         } else {
-            ReadableReplyText(content: fallback, fontScale: 0.9)
+            ReadableReplyText(content: fallback, fontScale: 0.9, sourceLinks: batchSourceLinks)
         }
     }
 
@@ -26111,6 +26432,8 @@ struct ContentView: View {
     @State private var isBatchResultsMinimized = false
     @State private var columnVisibility: NavigationSplitViewVisibility = .automatic
     @State private var currentLayoutIsCompact = false
+    @AppStorage("experimentalSettingsGlassEnabled") private var experimentalAppGlassEnabled = true
+    @AppStorage("experimentalSettingsGlassVariant") private var experimentalAppGlassVariant = 11
     @FocusState private var sidebarFocusedField: SidebarControls.Field?
 
     private func shouldUseCompactLayout(for width: CGFloat) -> Bool {
@@ -26120,8 +26443,14 @@ struct ContentView: View {
         } else {
             return true
         }
-#endif
+#elseif os(macOS)
+        // A tiled half-screen window does not have enough room for both the
+        // feed and a readable comments column. Present the selected post as a
+        // full-width detail view instead of allowing the split view to crop.
+        return width < 1_050
+#else
         return false
+#endif
     }
 
     private var isDarkMode: Bool {
@@ -26159,6 +26488,64 @@ struct ContentView: View {
         case .running: return job.status
         case .completed: return "Ready — tap to open"
         case .failed: return "Needs attention — tap to review"
+        }
+    }
+
+    private func restoreMinimizedResearchLibrary() {
+        comparisonToResume = nil
+        isResearchLibraryMinimized = false
+        showResearchLibrary = true
+    }
+
+    private func closeMinimizedResearchLibrary() {
+        isResearchLibraryMinimized = false
+        researchLibraryNavigationPath = NavigationPath()
+    }
+
+    private var minimizedResearchLibraryLabel: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "books.vertical.fill")
+                .foregroundStyle(.primary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Research Library")
+                    .font(.subheadline.weight(.semibold))
+                Text("Minimized — tap to return")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Image(systemName: "chevron.up")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var minimizedResearchLibraryControls: some View {
+        GlassEffectContainer(spacing: 9) {
+            HStack(spacing: 9) {
+                Button(action: restoreMinimizedResearchLibrary) {
+                    minimizedResearchLibraryLabel
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 11)
+                        .contentShape(Capsule())
+                        .glassEffect(
+                            .regular.interactive(),
+                            in: Capsule()
+                        )
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Restore Research Library")
+                .accessibilityHint("Returns to the exact minimized screen")
+
+                Button(action: closeMinimizedResearchLibrary) {
+                    Image(systemName: "xmark")
+                        .font(.caption.weight(.bold))
+                        .frame(width: 32, height: 32)
+                        .contentShape(Circle())
+                        .glassEffect(.regular.interactive(), in: Circle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Close minimized Research Library")
+            }
         }
     }
 
@@ -26234,50 +26621,9 @@ struct ContentView: View {
                     } else if isResearchLibraryMinimized {
                         VStack {
                             Spacer()
-                            HStack(spacing: 9) {
+                            HStack {
                                 Spacer()
-                                Button {
-                                    comparisonToResume = nil
-                                    isResearchLibraryMinimized = false
-                                    showResearchLibrary = true
-                                } label: {
-                                    HStack(spacing: 12) {
-                                        Image(systemName: "books.vertical.fill")
-                                            .foregroundStyle(.blue)
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            Text("Research Library")
-                                                .font(.subheadline.weight(.semibold))
-                                            Text("Minimized — tap to return")
-                                                .font(.caption)
-                                                .foregroundStyle(.secondary)
-                                        }
-                                        Image(systemName: "chevron.up")
-                                            .font(.caption.weight(.semibold))
-                                            .foregroundStyle(.secondary)
-                                    }
-                                    .padding(.horizontal, 16)
-                                    .padding(.vertical, 11)
-                                    .background(.regularMaterial, in: Capsule())
-                                    .overlay {
-                                        Capsule().stroke(Color.blue.opacity(0.75), lineWidth: 1.5)
-                                    }
-                                    .shadow(color: .black.opacity(0.18), radius: 14, y: 7)
-                                }
-                                .buttonStyle(.plain)
-                                .accessibilityLabel("Restore Research Library")
-                                .accessibilityHint("Returns to the exact minimized screen")
-
-                                Button {
-                                    isResearchLibraryMinimized = false
-                                    researchLibraryNavigationPath = NavigationPath()
-                                } label: {
-                                    Image(systemName: "xmark")
-                                        .font(.caption.weight(.bold))
-                                        .frame(width: 32, height: 32)
-                                        .background(.regularMaterial, in: Circle())
-                                }
-                                .buttonStyle(.plain)
-                                .accessibilityLabel("Close minimized Research Library")
+                                minimizedResearchLibraryControls
                             }
                         }
                         .padding(.trailing, 24)
@@ -26343,6 +26689,11 @@ struct ContentView: View {
 #endif
             }
         }
+        .experimentalSettingsGlass(
+            enabled: experimentalAppGlassEnabled,
+            variant: experimentalAppGlassVariant,
+            cornerRadius: 0
+        )
     }
     
     private func splitView(isCompactLayout: Bool) -> some View {
@@ -26379,6 +26730,11 @@ struct ContentView: View {
             }
             .sheet(isPresented: $showCreatePost) {
                 PostComposer(isPresented: $showCreatePost, subreddit: subreddit)
+                    .experimentalSettingsGlass(
+                        enabled: experimentalAppGlassEnabled,
+                        variant: experimentalAppGlassVariant,
+                        cornerRadius: 18
+                    )
             }
             .sheet(isPresented: $showResearchLibrary, onDismiss: {
                 comparisonToResume = nil
@@ -26404,7 +26760,7 @@ struct ContentView: View {
                 )
 #if os(macOS)
                 .frame(minWidth: 700, idealWidth: 880, minHeight: 480, idealHeight: 620)
-                .background(Color.black)
+                .background(experimentalAppGlassEnabled ? Color.clear : Color.black)
                 .preferredColorScheme(.dark)
 #endif
             }
@@ -26498,7 +26854,7 @@ struct ContentView: View {
 #endif
 #if os(macOS)
                 .toolbarBackground(.visible, for: .windowToolbar)
-                .toolbarBackground(AppColors.background, for: .windowToolbar)
+                .toolbarBackground(experimentalAppGlassEnabled ? Color.clear : AppColors.background, for: .windowToolbar)
                 .navigationSplitViewColumnWidth(min: 320, ideal: 420, max: 560)
 #endif
                 .toolbar {
@@ -26575,7 +26931,9 @@ struct ContentView: View {
             }
         }
         .background {
-            if isDarkMode {
+            if experimentalAppGlassEnabled {
+                Color.clear
+            } else if isDarkMode {
                 Color.black
             } else {
                 Color.clear.background(.ultraThinMaterial)
@@ -26769,7 +27127,10 @@ struct ContentView: View {
 
     private var detailColumn: some View {
         ZStack {
-            if isDarkMode {
+            if experimentalAppGlassEnabled {
+                Color.clear
+                    .ignoresSafeArea()
+            } else if isDarkMode {
                 Color.black
                     .ignoresSafeArea()
             } else {
@@ -26798,7 +27159,7 @@ struct ContentView: View {
 #endif
 #if os(macOS)
         .toolbarBackground(.visible, for: .windowToolbar)
-        .toolbarBackground(AppColors.background, for: .windowToolbar)
+        .toolbarBackground(experimentalAppGlassEnabled ? Color.clear : AppColors.background, for: .windowToolbar)
 #endif
         .toolbar {
 #if os(iOS)
@@ -26844,13 +27205,16 @@ struct ContentView: View {
         let onClose: () -> Void
         @State private var dragOffset: CGFloat = 0
         @State private var isBackGestureActive = false
+        @AppStorage("experimentalSettingsGlassEnabled") private var experimentalAppGlassEnabled = true
         @Environment(\.colorScheme) private var colorScheme
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
         var body: some View {
             ZStack {
                 Group {
-                    if colorScheme == .dark {
+                    if experimentalAppGlassEnabled {
+                        Color.clear
+                    } else if colorScheme == .dark {
                         Color.black
                     } else {
                         Color.black.opacity(backgroundOpacity)
@@ -26872,6 +27236,13 @@ struct ContentView: View {
                                         .labelStyle(.titleAndIcon)
                                 }
                             }
+#elseif os(macOS)
+                            ToolbarItem(placement: .navigation) {
+                                Button(action: closeWithAnimation) {
+                                    Label("Posts", systemImage: "chevron.backward")
+                                        .labelStyle(.titleAndIcon)
+                                }
+                            }
 #endif
                             ToolbarItem(placement: .principal) {
                                 Text(post.title)
@@ -26882,13 +27253,14 @@ struct ContentView: View {
                         }
                 }
                 .background {
-                    if colorScheme == .dark {
+                    if experimentalAppGlassEnabled {
+                        Color.clear
+                    } else if colorScheme == .dark {
                         Color.black
                     } else {
                         Color.clear.background(.ultraThinMaterial)
                     }
                 }
-                .ignoresSafeArea()
                 .offset(x: max(dragOffset, 0))
                 .simultaneousGesture(backSwipeGesture)
             }
@@ -29115,7 +29487,9 @@ struct RedditCommentsView: View {
                         }
                     )
                     await MainActor.run {
-                        self.postSummary = fetchedSummary
+                        self.postSummary = SummaryService.shared.settings.selectedSummaryProvider == .applePCCGateway
+                            ? QuestionAnswerTextFormatter.displayText(from: fetchedSummary)
+                            : fetchedSummary
                         self.isSummarizingPost = false
                     }
                 } catch is CancellationError {
@@ -29160,6 +29534,7 @@ struct RedditCommentsView: View {
             - Key points or arguments made
             - Any important context or background information
             - The overall purpose or goal of the post
+
             
             \(postFullContent)
             """
@@ -29502,7 +29877,9 @@ struct RedditCommentsView: View {
                         }
                     )
                     await MainActor.run {
-                        self.summary = fetchedSummary
+                        self.summary = SummaryService.shared.settings.selectedSummaryProvider == .applePCCGateway
+                            ? QuestionAnswerTextFormatter.displayText(from: fetchedSummary)
+                            : fetchedSummary
                         self.isSummarizing = false
                     }
                 } catch is CancellationError {
@@ -29625,7 +30002,9 @@ struct RedditCommentsView: View {
                         )
                     }
                     await MainActor.run {
-                        self.answer = fetchedAnswer
+                        self.answer = provider == .applePCCGateway
+                            ? QuestionAnswerTextFormatter.displayText(from: fetchedAnswer)
+                            : fetchedAnswer
                         self.isAnswering = false
                     }
                 } catch is CancellationError {
@@ -29653,6 +30032,7 @@ struct RedditCommentsView: View {
             \(commentsText)
 
             Answer the following question based on the information in the comments above: \(question)
+
             """
         }
 
@@ -30306,7 +30686,7 @@ struct RedditCommentsView: View {
 #if os(macOS)
                     .background {
                         MacMainWindowConfigurator(
-                            minimumSize: CGSize(width: 1180, height: 760),
+                            minimumSize: CGSize(width: 680, height: 600),
                             preferredSize: CGSize(width: 1380, height: 900)
                         )
                     }

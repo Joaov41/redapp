@@ -11,6 +11,120 @@ import XCTest
 
 final class redappTests: XCTestCase {
 
+    func testPCCContextDetectionRecognizesNewTerminalRequirementMessage() {
+        XCTAssertTrue(
+            RedappPCCGatewayClient.isPCCContextUnavailable(
+                "Error: Private Cloud Compute is not available in this context. Please use the Terminal app."
+            )
+        )
+        XCTAssertTrue(
+            RedappPCCGatewayClient.isPCCContextUnavailable(
+                "PCC inference is not available in this context"
+            )
+        )
+        XCTAssertFalse(
+            RedappPCCGatewayClient.isPCCContextUnavailable("PCC quota exceeded")
+        )
+    }
+
+    func testQuestionAnswerFormatterUnwrapsSingleFieldPCCJSON() {
+        let response = """
+        ```json
+        {
+          "main_theme": "Diverse uses and perceptions of ChatGPT"
+        }
+        ```
+        """
+
+        XCTAssertEqual(
+            QuestionAnswerTextFormatter.displayText(from: response),
+            "Diverse uses and perceptions of ChatGPT"
+        )
+    }
+
+    func testQuestionAnswerFormatterPreservesNormalProse() {
+        let response = "The main theme is how people use and perceive ChatGPT."
+        XCTAssertEqual(QuestionAnswerTextFormatter.displayText(from: response), response)
+    }
+
+    func testQuestionAnswerFormatterUnwrapsPCCSummaryJSON() {
+        let response = """
+        ```json
+        {"summary":"Commenters discuss stable SwiftUI identity."}
+        ```
+        """
+
+        XCTAssertEqual(
+            QuestionAnswerTextFormatter.displayText(from: response),
+            "Commenters discuss stable SwiftUI identity."
+        )
+    }
+
+    func testQuestionAnswerFormatterRendersCategorizedPCCBatchJSON() {
+        let response = """
+        {
+          "categorized_summary": {
+            "SwiftUI technical deep dives": [
+              {
+                "topic": "ForEach without Identifiable elements",
+                "summary": "Commenters discuss stable identity workarounds."
+              }
+            ]
+          }
+        }
+        """
+
+        let displayed = QuestionAnswerTextFormatter.displayText(from: response)
+        XCTAssertTrue(displayed.contains("## SwiftUI technical deep dives"))
+        XCTAssertTrue(displayed.contains("ForEach without Identifiable elements"))
+        XCTAssertTrue(displayed.contains("Commenters discuss stable identity workarounds."))
+        XCTAssertFalse(displayed.contains("categorized_summary"))
+    }
+
+    func testQuestionAnswerFormatterRepairsInvalidPCCBackslashEscape() {
+        let response = #"{"categorized_summary":{"SwiftUI Patterns & Syntax":{"topics":["ForEach using \.self"],"summary":"Identity workarounds."}}}"#
+
+        let displayed = QuestionAnswerTextFormatter.displayText(from: response)
+        XCTAssertTrue(displayed.contains("## SwiftUI Patterns & Syntax"))
+        XCTAssertTrue(displayed.contains(#"ForEach using \.self"#))
+        XCTAssertTrue(displayed.contains("Identity workarounds."))
+        XCTAssertFalse(displayed.contains("categorized_summary"))
+    }
+
+    func testPostSummaryPresentationHidesInternalEvidenceTokensAndStructuresLegacyProse() {
+        let raw = """
+        Commenters debate fixed limits [SOURCE:t1_alpha]. Most oppose mandatory windows because they interrupt long sessions [SOURCE:t1_beta]. Others prefer limits because they create useful boundaries [SOURCE:t1_gamma]. Concrete workarounds include lighter models [SOURCE:t1_beta].
+        """
+
+        let markdown = ResearchPostSummaryPresentation.displayMarkdown(from: raw)
+
+        XCTAssertFalse(markdown.contains("[SOURCE:"))
+        XCTAssertTrue(markdown.contains("**What commenters emphasized**"))
+        XCTAssertTrue(markdown.contains("- Most oppose mandatory windows"))
+        XCTAssertEqual(
+            ResearchPostSummaryPresentation.sourceIDs(in: raw),
+            ["t1_alpha", "t1_beta", "t1_gamma"]
+        )
+    }
+
+    func testPostSummaryPresentationPreservesRealMarkdownStructure() {
+        let raw = """
+        **Discussion**
+
+        A discussion summary [SOURCE:t3_post].
+
+        **What commenters emphasized**
+
+        - **Dominant view:** Keep the existing workflow [SOURCE:t1_comment].
+        """
+
+        let markdown = ResearchPostSummaryPresentation.displayMarkdown(from: raw)
+
+        XCTAssertTrue(markdown.contains("**Discussion**"))
+        XCTAssertTrue(markdown.contains("- **Dominant view:**"))
+        XCTAssertFalse(markdown.contains("SOURCE"))
+    }
+
     func testMarkdownRendererRecognizesIndentedHeadingsAndLists() throws {
         let elements = MarkdownTextView(content: "").parseMarkdownContent(
             "  ## Main themes\n   ### First theme\n    - Supporting point"
@@ -348,6 +462,223 @@ final class redappTests: XCTestCase {
         let checked = ResearchCommunityComparisonService.enforceTwoSidedComparisons(response)
         XCTAssertEqual(checked.claims.map(\.text), ["Both communities emphasize practical use."])
         XCTAssertTrue(checked.missingData.contains { $0.contains("both communities") })
+        XCTAssertEqual(checked.overview, "The report below contains 1 finding verified against the saved posts and comments; each finding includes its supporting source links.")
+        let sideCounts = ResearchCommunityComparisonService.supportedSideCounts(in: checked.claims)
+        XCTAssertEqual(sideCounts.first, 1)
+        XCTAssertEqual(sideCounts.second, 1)
+
+        let withoutPrevalence = ResearchCommunityComparisonService.removingUnverifiedPrevalenceClaims(
+            ValidatedGroundedResponse(
+                title: "Comparison",
+                overview: nil,
+                claims: [
+                    checked.claims[0],
+                    ResearchClaimInput(
+                        order: 1,
+                        text: "GPT-5.6 users report excessive loops.",
+                        claimType: "first_community",
+                        citations: [.init(sourceID: first.encodedID)],
+                        confidence: .low
+                    ),
+                    ResearchClaimInput(
+                        order: 2,
+                        text: "GPT-5 users report scope creep.",
+                        claimType: "second_community",
+                        citations: [.init(sourceID: second.encodedID)],
+                        confidence: .low
+                    ),
+                    ResearchClaimInput(
+                        order: 3,
+                        text: "This was recurring across 12 posts.",
+                        claimType: "first_community",
+                        citations: [.init(sourceID: first.encodedID)],
+                        confidence: .low
+                    ),
+                    ResearchClaimInput(
+                        order: 4,
+                        text: "A majority of commenters preferred it.",
+                        claimType: "second_community",
+                        citations: [.init(sourceID: second.encodedID)],
+                        confidence: .low
+                    )
+                ],
+                conflicts: [],
+                missingData: []
+            )
+        )
+        XCTAssertEqual(
+            withoutPrevalence.claims.map(\.text),
+            [
+                "Both communities emphasize practical use.",
+                "GPT-5.6 users report excessive loops.",
+                "GPT-5 users report scope creep."
+            ]
+        )
+        XCTAssertTrue(withoutPrevalence.missingData.contains { $0.contains("2 draft prevalence claims") })
+    }
+
+    func testGroupedCommunityThemesRequireEveryComparativeRole() throws {
+        let first = ResearchCommunitySourceReference(
+            side: .first,
+            runID: UUID(),
+            subreddit: "codex",
+            sourceID: "t3_first"
+        )
+        let second = ResearchCommunitySourceReference(
+            side: .second,
+            runID: UUID(),
+            subreddit: "openai",
+            sourceID: "t3_second"
+        )
+        func claim(
+            _ role: ResearchCommunityThemeClaimType.Role,
+            citations: [String]
+        ) -> ResearchClaimInput {
+            let type = ResearchCommunityThemeClaimType(
+                index: 1,
+                role: role,
+                title: "Resets and quotas"
+            )
+            return ResearchClaimInput(
+                order: role == .shared ? 0 : 1,
+                text: "Supported \(role.rawValue) point.",
+                claimType: type.encoded,
+                citations: citations.map { .init(sourceID: $0) },
+                confidence: .medium
+            )
+        }
+
+        let complete = [
+            claim(.shared, citations: [first.encodedID, second.encodedID]),
+            claim(.first, citations: [first.encodedID]),
+            claim(.second, citations: [second.encodedID]),
+            claim(.difference, citations: [first.encodedID, second.encodedID])
+        ]
+
+        XCTAssertEqual(ResearchCommunityComparisonService.completeThemeCount(in: complete), 1)
+        let parsed = try XCTUnwrap(
+            ResearchCommunityThemeClaimType.parse(complete[0].claimType)
+        )
+        XCTAssertEqual(parsed.title, "Resets and quotas")
+        XCTAssertEqual(parsed.role, .shared)
+
+        let incomplete = Array(complete.dropLast())
+        XCTAssertEqual(ResearchCommunityComparisonService.completeThemeCount(in: incomplete), 0)
+
+        let wrongSide = claim(.second, citations: [first.encodedID])
+        let checked = ResearchCommunityComparisonService.enforceTwoSidedComparisons(
+            ValidatedGroundedResponse(
+                title: "Comparison",
+                overview: nil,
+                claims: [wrongSide],
+                conflicts: [],
+                missingData: []
+            )
+        )
+        XCTAssertTrue(checked.claims.isEmpty)
+    }
+
+    func testCommunityThemePlanDecodesFencedJSONAndRejectsUnplannedThemes() throws {
+        let raw = """
+        ```json
+        {"themes":[
+          {"title":"Usage limits","sharedIssue":"Quota resets affect continued use.","firstPerspective":"Users manage burn directly.","secondPerspective":"Users question the strategy.","divergence":"Operational control versus market interpretation.","firstSourceIDs":["t3_first"],"secondSourceIDs":["t3_second"]},
+          {"title":"Workflow friction","sharedIssue":"Desktop reliability interrupts work.","firstPerspective":"Users troubleshoot the coding client.","secondPerspective":"Users criticize the broader product UX.","divergence":"Harness fixes versus product design.","firstSourceIDs":["t3_first2"],"secondSourceIDs":["t3_second2"]},
+          {"title":"Model routing","sharedIssue":"Different models fit different tasks.","firstPerspective":"Users route work inside Codex.","secondPerspective":"Users compare providers.","divergence":"Internal routing versus vendor selection.","firstSourceIDs":["t3_first3"],"secondSourceIDs":["t3_second3"]}
+        ]}
+        ```
+        """
+        let plan = try XCTUnwrap(ResearchCommunityComparisonService.decodeThemePlan(raw))
+        XCTAssertEqual(plan.themes.map(\.title), ["Usage limits", "Workflow friction", "Model routing"])
+
+        func claim(title: String) -> ResearchClaimInput {
+            ResearchClaimInput(
+                order: 0,
+                text: "A supported point.",
+                claimType: ResearchCommunityThemeClaimType(
+                    index: 1,
+                    role: .first,
+                    title: title
+                ).encoded,
+                citations: [],
+                confidence: .medium
+            )
+        }
+        let checked = ResearchCommunityComparisonService.enforcePlannedThemes(
+            ValidatedGroundedResponse(
+                title: "Comparison",
+                overview: nil,
+                claims: [claim(title: "Usage limits"), claim(title: "Practical output")],
+                conflicts: [],
+                missingData: []
+            ),
+            plan: plan
+        )
+        XCTAssertEqual(checked.claims.map(\.claimType), ["theme:1:first:Usage limits"])
+    }
+
+    func testComparisonLimitationsCollapseDuplicateCollectionWarnings() {
+        let coverage = ResearchCoverageInput(
+            postsRequested: 100,
+            postsFetched: 96,
+            postsAnalyzed: 96,
+            commentsReported: 3_239,
+            commentsFetched: 3_066,
+            commentsAnalyzed: 3_066,
+            commentsOmitted: 0,
+            failureMessages: [],
+            truncationMessages: []
+        )
+        let cleaned = ResearchCommunityComparisonService.cleanedComparisonResponse(
+            ValidatedGroundedResponse(
+                title: "Comparison",
+                overview: "The report below contains 14 findings.",
+                claims: [],
+                conflicts: [],
+                missingData: [
+                    "Only 48 posts per community were loaded although 50 were requested.",
+                    "Only 48 posts were loaded when the batch started although 50 were requested.",
+                    "Reddit reported 3239 comments, but only 3066 were fetched."
+                ]
+            ),
+            coverage: coverage
+        )
+
+        XCTAssertNil(cleaned.overview)
+        XCTAssertEqual(cleaned.missingData.count, 2)
+        XCTAssertTrue(cleaned.missingData.contains { $0.contains("96 of 100") })
+        XCTAssertTrue(cleaned.missingData.contains { $0.contains("3,239") || $0.contains("3239") })
+    }
+
+    func testBroadComparisonLimitationsComeOnlyFromCoverageLedger() {
+        let coverage = ResearchCoverageInput(
+            postsRequested: 100,
+            postsFetched: 96,
+            postsAnalyzed: 96,
+            commentsReported: 3_239,
+            commentsFetched: 3_066,
+            commentsAnalyzed: 3_066,
+            commentsOmitted: 0,
+            failureMessages: [],
+            truncationMessages: []
+        )
+        let cleaned = ResearchCommunityComparisonService.cleanedComparisonResponse(
+            ValidatedGroundedResponse(
+                title: "Comparison",
+                overview: nil,
+                claims: [],
+                conflicts: [],
+                missingData: [
+                    "Some supplied original sources have empty or truncated content.",
+                    "A proposed theme could not be verified."
+                ]
+            ),
+            coverage: coverage,
+            includeModelLimitations: false
+        )
+
+        XCTAssertEqual(cleaned.missingData.count, 2)
+        XCTAssertTrue(cleaned.missingData.allSatisfy { $0.hasPrefix("Across both saved batches") })
     }
 
     func testCommunitySummaryChunksIncludeEverySummaryAndFullOverview() {
@@ -356,7 +687,8 @@ final class redappTests: XCTestCase {
                 artifactID: UUID(),
                 kind: .postSummary,
                 title: "Post \(index)",
-                body: "Unique saved summary sentinel-\(index) with the discussion conclusions."
+                body: "Unique saved summary sentinel-\(index) with the discussion conclusions.",
+                postSourceID: "t3_post_\(index)"
             )
         }
         let overviewID = UUID()
@@ -404,7 +736,9 @@ final class redappTests: XCTestCase {
         }.joined(separator: "\n")
         for index in 0..<100 {
             XCTAssertTrue(prompts.contains("sentinel-\(index)"), "Summary \(index) was omitted")
+            XCTAssertTrue(prompts.contains("reddit_post_id=\"t3_post_\(index)\""))
         }
+        XCTAssertTrue(prompts.contains("number of distinct saved post summaries"))
     }
 
     func testCommunityDigestCacheReusesOnlyMatchingSavedSummaries() {
@@ -469,17 +803,39 @@ final class redappTests: XCTestCase {
                 secondDocuments: changedSecond
             )
         )
+
+        let changedProvenance = [
+            ResearchCommunitySummaryDocument(
+                artifactID: secondArtifactID,
+                kind: .postSummary,
+                title: "Second post",
+                body: "Every saved second-community conclusion.",
+                postSourceID: "t3_changed"
+            )
+        ]
+        XCTAssertNil(
+            ResearchCommunityComparisonService.reusableDigestCache(
+                cache,
+                subject: "Model quality",
+                firstRunID: firstRunID,
+                firstDocuments: first,
+                secondRunID: secondRunID,
+                secondDocuments: changedProvenance
+            )
+        )
     }
 
     func testCommunityCitationQueryPrioritizesTheFollowUpQuestion() {
         let query = ResearchCommunityComparisonService.citationQuery(
             subject: "Model quality",
             question: "Which community reported more reliability problems?",
-            digest: "Complete cached themes"
+            digest: "Complete cached themes",
+            conversationContext: "Earlier answer discussed desktop crashes."
         )
 
         XCTAssertTrue(query.hasPrefix("Which community reported more reliability problems?"))
         XCTAssertTrue(query.contains("Model quality"))
+        XCTAssertTrue(query.contains("desktop crashes"))
         XCTAssertFalse(query.contains("Complete cached themes"))
 
         let initialQuery = ResearchCommunityComparisonService.citationQuery(
@@ -503,9 +859,27 @@ final class redappTests: XCTestCase {
                 question: "What are the main themes discussed?"
             )
         )
+        XCTAssertTrue(
+            ResearchCommunityComparisonService.isBroadThemeRequest(
+                subject: "analyse themes in commen on both and how they are described on each",
+                question: nil
+            )
+        )
+        XCTAssertTrue(
+            ResearchCommunityComparisonService.isBroadThemeRequest(
+                subject: "Compare topics and framing across the communities",
+                question: nil
+            )
+        )
         XCTAssertFalse(
             ResearchCommunityComparisonService.isBroadThemeRequest(
                 subject: "Model quality",
+                question: "Which community reported more crashes?"
+            )
+        )
+        XCTAssertFalse(
+            ResearchCommunityComparisonService.isBroadThemeRequest(
+                subject: "Compare all themes across both communities",
                 question: "Which community reported more crashes?"
             )
         )
@@ -528,12 +902,50 @@ final class redappTests: XCTestCase {
             conflicts: [],
             missingData: [
                 "The available snippets do not provide full post bodies.",
+                "The provided openai extracts cover only selected quoteable text.",
+                "I only used the provided saved excerpts for direct quotations.",
+                "Unverified model claim omitted: unsupported draft A.",
+                "Unverified model claim omitted: unsupported draft B.",
+                "The provided evidence cannot establish commenter distribution.",
                 "Reddit returned only 48 of 50 requested posts."
             ]
         )
 
         let cleaned = ResearchCommunityComparisonService.removingCitationSelectionLimitations(response)
-        XCTAssertEqual(cleaned.missingData, ["Reddit returned only 48 of 50 requested posts."])
+        XCTAssertEqual(
+            cleaned.missingData,
+            [
+                "The provided evidence cannot establish commenter distribution.",
+                "Reddit returned only 48 of 50 requested posts.",
+                "2 draft findings were omitted because the supporting quotes could not be verified against the saved sources."
+            ]
+        )
+    }
+
+    func testCommunityOverviewAndDigestSourceIDsRemainRecoverable() {
+        let claim = "Both communities adapt model choice to the task."
+        let markdown = """
+        The complete saved batches show several distinct themes.
+
+        - \(claim) [community:first:example]
+
+        ### Conflicts
+        - Some participants disagree.
+        """
+
+        XCTAssertEqual(
+            ResearchCommunityComparisonService.overviewPrefix(
+                from: markdown,
+                claimTexts: [claim]
+            ),
+            "The complete saved batches show several distinct themes."
+        )
+        XCTAssertEqual(
+            ResearchCommunityComparisonService.redditSourceIDs(
+                in: "Theme [t3_ABC] uses t1_reply; t3_abc is repeated."
+            ),
+            ["t3_abc", "t1_reply"]
+        )
     }
 
     func testMLXReportSpeechChunkingKeepsEveryChunkWithinModelLimit() {
@@ -882,6 +1294,7 @@ final class redappTests: XCTestCase {
 
         let result = try ResearchEvidenceValidator.validate(payload, sources: sources, coverage: coverage)
         XCTAssertEqual(result.claims.count, 1)
+        XCTAssertEqual(result.overview, "The report below contains 1 finding verified against the saved posts and comments; each finding includes its supporting source links.")
         XCTAssertEqual(result.claims[0].confidence, .high)
         XCTAssertEqual(result.claims[0].citations.count, 3)
         XCTAssertTrue(result.missingData.contains { $0.contains("Unverified model claim omitted") })
@@ -899,6 +1312,126 @@ final class redappTests: XCTestCase {
         )
         XCTAssertTrue(unanswered.claims.isEmpty)
         XCTAssertEqual(unanswered.missingData.first, "The saved sources do not answer this question.")
+    }
+
+    func testGroundedValidationRepairsCommunityIDsAndMarkdownQuotes() throws {
+        let runID = UUID()
+        let reference = ResearchCommunitySourceReference(
+            side: .first,
+            runID: runID,
+            subreddit: "openai",
+            sourceID: "t1_reset"
+        )
+        let postReference = ResearchCommunitySourceReference(
+            side: .first,
+            runID: runID,
+            subreddit: "openai",
+            sourceID: "t3_reset"
+        )
+        let savedSource = ResearchSourceInput(
+            sourceID: reference.encodedID,
+            kind: .comment,
+            postSourceID: postReference.encodedID,
+            parentSourceID: postReference.encodedID,
+            subreddit: "openai",
+            title: nil,
+            permalink: "/r/openai/comments/reset/example/",
+            author: "tester",
+            score: 12,
+            createdAt: Date(timeIntervalSince1970: 1_700_000_000),
+            depth: 0,
+            rawMarkdown: "My **Banked Reset Credits** suddenly disappeared despite quota remaining.",
+            mediaURLs: [],
+            sourceOrder: 0
+        )
+        let shortenedID = "\(runID.uuidString):openai:t1_reset"
+        let payload = GroundedResearchPayload(
+            title: "Reset findings",
+            overview: "The saved discussion centers on unpredictable reset behavior.",
+            claims: [
+                .init(
+                    text: "One participant reported disappearing reset credits.",
+                    claimType: "first_community",
+                    citations: [
+                        .init(sourceID: shortenedID, quote: "words absent from the source"),
+                        .init(sourceID: shortenedID, quote: "My Banked Reset Credits suddenly disappeared")
+                    ],
+                    conflictingSourceIDs: [],
+                    missingData: nil
+                )
+            ],
+            conflicts: [],
+            missingData: []
+        )
+        let coverage = ResearchCoverageInput(
+            postsRequested: 1,
+            postsFetched: 1,
+            postsAnalyzed: 1,
+            commentsReported: 1,
+            commentsFetched: 1,
+            commentsAnalyzed: 1,
+            commentsOmitted: 0,
+            failureMessages: [],
+            truncationMessages: []
+        )
+
+        let result = try ResearchEvidenceValidator.validate(
+            payload,
+            sources: [savedSource],
+            coverage: coverage
+        )
+
+        XCTAssertEqual(result.overview, "The report below contains 1 finding verified against the saved posts and comments; each finding includes its supporting source links.")
+        XCTAssertEqual(result.claims.count, 1)
+        XCTAssertEqual(result.claims[0].citations.map(\.sourceID), [reference.encodedID])
+        XCTAssertEqual(result.claims[0].citations.first?.supportingQuote, "My Banked Reset Credits suddenly disappeared")
+    }
+
+    func testIncompleteCoverageCapsStrongEvidenceAtMediumConfidence() throws {
+        let coverage = ResearchCoverageInput(
+            postsRequested: 4,
+            postsFetched: 3,
+            postsAnalyzed: 3,
+            commentsReported: 8,
+            commentsFetched: 8,
+            commentsAnalyzed: 8,
+            commentsOmitted: 0,
+            failureMessages: ["Reddit returned 3 of 4 requested posts."],
+            truncationMessages: []
+        )
+
+        XCTAssertEqual(
+            ResearchEvidenceValidator.confidence(
+                citationCount: 3,
+                independentPostCount: 3,
+                hasConflict: false,
+                coverage: coverage
+            ),
+            .medium
+        )
+        XCTAssertEqual(
+            ResearchEvidenceValidator.confidence(
+                citationCount: 1,
+                independentPostCount: 1,
+                hasConflict: false,
+                coverage: coverage
+            ),
+            .low
+        )
+
+        let validation = try ResearchEvidenceValidator.validate(
+            GroundedResearchPayload(
+                title: "Incomplete batch",
+                overview: nil,
+                claims: [],
+                conflicts: [],
+                missingData: []
+            ),
+            sources: [],
+            coverage: coverage
+        )
+        XCTAssertTrue(validation.missingData.contains("Reddit returned 3 of 4 requested posts."))
+        XCTAssertFalse(validation.missingData.contains("Only 3 of 4 requested posts were analyzed."))
     }
 
     func testRepresentativeSourcesBalancePostsDeterministicallyWithinBudget() throws {
