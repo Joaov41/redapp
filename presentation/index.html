@@ -1,0 +1,677 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="redapp presentation — turn Reddit conversations into structured, verifiable research.">
+  <title>redapp — Reddit Intelligence, Reimagined</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%2310110f'/%3E%3Ccircle cx='32' cy='32' r='15' fill='%23ff4b19'/%3E%3C/svg%3E">
+  <style>
+    :root {
+      --ink: #10110f;
+      --ink-2: #171915;
+      --paper: #f3eee2;
+      --muted: #b8b2a6;
+      --orange: #ff4b19;
+      --lime: #d6ff46;
+      --cyan: #85e7e5;
+      --line: rgba(243, 238, 226, .18);
+      --display: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+      --body: "Avenir Next", Avenir, "Helvetica Neue", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: var(--ink);
+      color: var(--paper);
+      font-family: var(--body);
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      z-index: 20;
+      opacity: .23;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 180 180' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.92' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.22'/%3E%3C/svg%3E");
+      mix-blend-mode: soft-light;
+    }
+
+    button { font: inherit; }
+
+    .deck { width: 100%; height: 100%; }
+
+    .slide {
+      position: absolute;
+      inset: 0;
+      display: none;
+      width: 100vw;
+      height: 100vh;
+      min-height: 560px;
+      padding: clamp(58px, 6vw, 104px) clamp(62px, 7vw, 128px) clamp(54px, 5vw, 86px);
+      overflow: hidden;
+      background:
+        radial-gradient(circle at 78% 20%, rgba(255, 75, 25, .08), transparent 27%),
+        linear-gradient(135deg, #11120f 0%, #171914 100%);
+      isolation: isolate;
+    }
+
+    .slide.active { display: grid; animation: arrive .55s cubic-bezier(.2,.8,.2,1) both; }
+    .capture .slide.active { animation: none; }
+
+    @keyframes arrive {
+      from { opacity: 0; transform: scale(1.012); }
+      to { opacity: 1; transform: scale(1); }
+    }
+
+    .slide::after {
+      content: "";
+      position: absolute;
+      inset: 26px;
+      border: 1px solid rgba(243,238,226,.09);
+      pointer-events: none;
+      z-index: -1;
+    }
+
+    .grid-bg {
+      position: absolute;
+      inset: 0;
+      z-index: -2;
+      opacity: .32;
+      background-image:
+        linear-gradient(rgba(243,238,226,.055) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(243,238,226,.055) 1px, transparent 1px);
+      background-size: 78px 78px;
+      mask-image: linear-gradient(to bottom, black, transparent 84%);
+    }
+
+    .kicker {
+      display: flex;
+      align-items: center;
+      gap: 13px;
+      margin: 0 0 22px;
+      color: var(--lime);
+      font-size: clamp(11px, .92vw, 15px);
+      font-weight: 700;
+      letter-spacing: .16em;
+      text-transform: uppercase;
+    }
+
+    .kicker::before { content: ""; width: 36px; height: 3px; background: currentColor; }
+
+    h1, h2, h3, p { margin-top: 0; }
+    h1, h2 { font-family: var(--display); font-weight: 500; letter-spacing: -.035em; }
+    h1 { font-size: clamp(65px, 8.6vw, 150px); line-height: .88; margin-bottom: 30px; }
+    h2 { max-width: 900px; font-size: clamp(48px, 5.4vw, 94px); line-height: .96; margin-bottom: 28px; }
+    h3 { font-size: clamp(19px, 1.5vw, 27px); line-height: 1.15; margin-bottom: 9px; }
+    p { color: var(--muted); font-size: clamp(17px, 1.35vw, 24px); line-height: 1.46; }
+    .lead { max-width: 790px; font-size: clamp(20px, 1.72vw, 31px); color: var(--paper); }
+    .accent { color: var(--orange); }
+    .signal { color: var(--lime); }
+    .quiet { color: var(--muted); }
+
+    .slide-no {
+      position: absolute;
+      right: clamp(54px, 5vw, 92px);
+      top: clamp(45px, 4vw, 72px);
+      color: rgba(243,238,226,.35);
+      font-size: 14px;
+      letter-spacing: .2em;
+    }
+
+    .content-two {
+      display: grid;
+      grid-template-columns: minmax(0, 1.05fr) minmax(380px, .95fr);
+      gap: clamp(52px, 7vw, 130px);
+      align-items: center;
+      height: 100%;
+    }
+    .content-two > * { min-width: 0; }
+
+    .feature-list { display: grid; gap: 14px; margin-top: 34px; }
+    .feature {
+      display: grid;
+      grid-template-columns: 34px 1fr;
+      gap: 13px;
+      align-items: start;
+      color: var(--paper);
+      font-size: clamp(17px, 1.25vw, 22px);
+    }
+    .feature .mark { color: var(--orange); font-weight: 800; }
+
+    .chip-row { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 25px; }
+    .chip {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 9px 14px 8px;
+      color: var(--paper);
+      background: rgba(243,238,226,.035);
+      font-size: clamp(12px, .9vw, 15px);
+      letter-spacing: .04em;
+    }
+
+    .card-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .card {
+      position: relative;
+      min-height: 150px;
+      padding: 24px;
+      border: 1px solid var(--line);
+      background: rgba(243,238,226,.04);
+      overflow: hidden;
+    }
+    .card::before {
+      content: attr(data-index);
+      position: absolute;
+      right: 13px;
+      top: 8px;
+      color: rgba(243,238,226,.14);
+      font: 42px var(--display);
+    }
+    .card p { margin: 0; font-size: clamp(13px, 1vw, 17px); }
+    .icon { color: var(--orange); font-size: 26px; margin-bottom: 22px; }
+
+    /* Cover */
+    .cover { align-content: center; }
+    .cover h1 { max-width: 1040px; }
+    .cover .tagline { max-width: 720px; color: var(--paper); font-size: clamp(22px, 2vw, 34px); }
+    .app-mark {
+      position: absolute;
+      right: 8vw;
+      top: 50%;
+      width: min(25vw, 390px);
+      aspect-ratio: 1;
+      transform: translateY(-50%) rotate(5deg);
+      border: 1px solid rgba(255,75,25,.35);
+      border-radius: 28%;
+      background: rgba(255,75,25,.06);
+      box-shadow: 0 0 0 18px rgba(255,75,25,.025), 0 40px 100px rgba(0,0,0,.45);
+    }
+    .app-mark img { width: 100%; height: 100%; object-fit: cover; border-radius: 28%; filter: saturate(.9) contrast(1.08); }
+    .orbit { position: absolute; inset: -22%; border: 1px dashed rgba(214,255,70,.22); border-radius: 50%; animation: spin 24s linear infinite; }
+    .orbit::after { content: ""; position: absolute; width: 13px; height: 13px; top: 16%; left: 14%; border-radius: 50%; background: var(--lime); box-shadow: 0 0 22px var(--lime); }
+    .capture .orbit { animation: none; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Feed map */
+    .feed-map { position: relative; min-height: 570px; }
+    .phone {
+      position: absolute; right: 5%; top: 3%; width: 54%; height: 92%; padding: 18px;
+      border: 1px solid rgba(243,238,226,.26); border-radius: 38px; background: #0d0e0c;
+      box-shadow: -30px 35px 90px rgba(0,0,0,.48); transform: rotate(2deg);
+    }
+    .phone-top { display: flex; align-items: center; justify-content: space-between; padding: 8px 8px 18px; font-size: 13px; color: var(--muted); }
+    .post-mini { padding: 18px 16px; border-top: 1px solid var(--line); }
+    .post-mini small { color: var(--orange); font-weight: 700; }
+    .post-mini strong { display: block; margin: 6px 0 11px; font-size: 16px; }
+    .post-meta { color: var(--muted); font-size: 12px; }
+    .feed-label { position: absolute; left: 0; padding: 12px 16px; border-left: 4px solid var(--lime); background: var(--ink-2); box-shadow: 0 10px 30px rgba(0,0,0,.28); }
+    .feed-label:nth-of-type(2) { top: 14%; }
+    .feed-label:nth-of-type(3) { top: 43%; left: 8%; }
+    .feed-label:nth-of-type(4) { top: 70%; left: 1%; }
+
+    /* Real iPad app captures */
+    .actual-shot {
+      position: relative;
+      justify-self: center;
+      width: min(100%, 510px);
+      height: min(76vh, 690px);
+      margin: 0;
+      overflow: hidden;
+      border: 1px solid rgba(243,238,226,.25);
+      border-radius: 30px;
+      background: #000;
+      box-shadow: -28px 38px 90px rgba(0,0,0,.52), 0 0 0 8px rgba(243,238,226,.025);
+    }
+    .actual-shot img { width: 100%; height: 100%; display: block; object-fit: contain; background: #000; }
+    .actual-shot figcaption,
+    .shot-stack .capture-label {
+      position: absolute;
+      left: 18px;
+      bottom: 16px;
+      z-index: 3;
+      padding: 8px 11px;
+      border: 1px solid rgba(214,255,70,.32);
+      border-radius: 999px;
+      background: rgba(8,9,8,.84);
+      color: var(--lime);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+      backdrop-filter: blur(14px);
+    }
+    .actual-shot.home-shot { width: min(100%, 650px); height: min(72vh, 650px); border-radius: 24px; }
+    .actual-shot.home-shot img { object-fit: cover; object-position: left top; }
+    .actual-shot.library-shot { width: min(100%, 500px); }
+    .shot-stack { position: relative; justify-self: center; width: min(100%, 610px); height: min(78vh, 700px); }
+    .shot-stack img {
+      position: absolute;
+      display: block;
+      object-fit: contain;
+      background: #000;
+      border: 1px solid rgba(243,238,226,.25);
+      border-radius: 26px;
+      box-shadow: -22px 30px 75px rgba(0,0,0,.5);
+    }
+    .shot-stack .shot-main { left: 0; top: 0; width: 73%; height: 100%; }
+    .shot-stack .shot-detail { right: 0; bottom: 3%; width: 50%; height: 58%; }
+    .shot-stack .capture-label { left: auto; right: 15px; bottom: 13px; }
+
+    /* Analysis rings */
+    .rings { position: relative; height: 580px; }
+    .ring {
+      position: absolute; left: 50%; top: 50%; display: grid; place-items: center; border-radius: 50%; transform: translate(-50%,-50%);
+      border: 1px solid var(--line); color: var(--muted); text-transform: uppercase; letter-spacing: .12em; font-size: 12px;
+    }
+    .ring.r1 { width: 500px; height: 500px; border-color: rgba(255,75,25,.35); }
+    .ring.r2 { width: 360px; height: 360px; border-color: rgba(214,255,70,.34); }
+    .ring.r3 { width: 220px; height: 220px; background: var(--paper); color: var(--ink); border: none; text-align: center; padding: 45px; font: 30px/1.05 var(--display); text-transform: none; letter-spacing: -.02em; }
+    .ring-tag { position: absolute; padding: 9px 12px; background: var(--ink); border: 1px solid var(--line); }
+    .rt1 { top: 4%; left: 43%; }.rt2 { top: 34%; right: 0; }.rt3 { bottom: 8%; left: 15%; }.rt4 { top: 20%; left: 4%; }
+
+    /* Pipeline */
+    .pipeline { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-top: 58px; }
+    .stage { position: relative; min-height: 260px; padding: 25px 22px; border-top: 4px solid var(--orange); background: rgba(243,238,226,.045); }
+    .stage:not(:last-child)::after { content: "→"; position: absolute; right: -19px; top: 48%; z-index: 2; color: var(--lime); font-size: 27px; }
+    .stage .num { color: var(--orange); font: 45px var(--display); }
+    .stage p { font-size: clamp(14px, 1vw, 17px); }
+    .stage.final { border-color: var(--lime); }
+
+    /* Modes */
+    .mode-wall { display: grid; grid-template-columns: 1.08fr .96fr .96fr; grid-template-rows: 1fr 1fr; gap: 13px; width: 100%; min-width: 0; height: 590px; }
+    .mode { display: flex; min-width: 0; flex-direction: column; justify-content: flex-end; padding: 18px; border: 1px solid var(--line); background: rgba(243,238,226,.035); }
+    .mode:first-child { grid-row: span 2; background: var(--orange); color: var(--ink); }
+    .mode:first-child p { color: rgba(16,17,15,.72); }
+    .mode h3 { font-family: var(--display); font-size: clamp(22px, 1.55vw, 26px); font-weight: 500; }
+    .mode:first-child h3 { font-size: clamp(27px, 2vw, 34px); }
+    .mode p { font-size: clamp(13px, 1vw, 16px); margin-bottom: 0; }
+    .mode .glyph { margin: auto auto 20px 0; font-size: 42px; color: var(--lime); }
+    .mode:first-child .glyph { color: var(--ink); font-size: 84px; }
+
+    /* Evidence */
+    .evidence-map { position: relative; height: 600px; }
+    .claim { position: absolute; left: 50%; top: 50%; width: 240px; height: 240px; display: grid; place-items: center; padding: 35px; transform: translate(-50%,-50%); border-radius: 50%; background: var(--lime); color: var(--ink); text-align: center; font: 29px/1.05 var(--display); }
+    .source { position: absolute; width: 175px; padding: 15px; border: 1px solid var(--line); background: var(--ink-2); font-size: 14px; }
+    .source::after { content: ""; position: absolute; width: 120px; height: 1px; background: rgba(243,238,226,.23); transform-origin: left; }
+    .s1 { top: 8%; left: 6%; }.s1::after { right: -102px; bottom: -8px; transform: rotate(32deg); }
+    .s2 { top: 9%; right: 2%; }.s2::after { left: -95px; bottom: -10px; transform: rotate(148deg); }
+    .s3 { bottom: 10%; left: 2%; }.s3::after { right: -100px; top: 3px; transform: rotate(-29deg); }
+    .s4 { bottom: 8%; right: 7%; }.s4::after { left: -92px; top: 2px; transform: rotate(210deg); }
+    .badge { display: inline-block; margin-top: 8px; padding: 4px 8px; background: rgba(133,231,229,.12); color: var(--cyan); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
+
+    /* Library */
+    .shelves { display: grid; gap: 12px; }
+    .shelf { display: grid; grid-template-columns: 46px 1fr auto; align-items: center; gap: 16px; padding: 20px; border: 1px solid var(--line); background: rgba(243,238,226,.035); }
+    .shelf.pinned { border-color: rgba(214,255,70,.5); }
+    .shelf-index { color: var(--orange); font: 29px var(--display); }
+    .shelf strong { display: block; margin-bottom: 4px; font-size: 18px; }
+    .shelf span { color: var(--muted); font-size: 13px; }
+    .tag { padding: 7px 10px; border-radius: 999px; background: rgba(255,75,25,.12); color: #ff8b67; font-size: 11px; }
+
+    /* Voice */
+    .voice-slide { background: radial-gradient(circle at 62% 50%, rgba(214,255,70,.11), transparent 30%), linear-gradient(135deg,#11120f,#171914); }
+    .wave { display: flex; align-items: center; justify-content: center; gap: 9px; height: 420px; }
+    .bar { width: 11px; height: var(--h); background: var(--lime); border-radius: 10px; box-shadow: 0 0 18px rgba(214,255,70,.23); }
+    .bar:nth-child(3n) { background: var(--orange); }
+    .privacy-seal { position: absolute; right: 9%; bottom: 9%; width: 146px; height: 146px; display: grid; place-items: center; border: 1px dashed rgba(214,255,70,.55); border-radius: 50%; color: var(--lime); text-align: center; font-size: 12px; letter-spacing: .12em; text-transform: uppercase; transform: rotate(-8deg); }
+
+    /* Provider grid */
+    .providers { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-top: 36px; }
+    .provider { min-height: 150px; padding: 21px; border: 1px solid var(--line); display: flex; flex-direction: column; justify-content: space-between; background: rgba(243,238,226,.035); }
+    .provider.local { border-top: 4px solid var(--lime); }
+    .provider.cloud { border-top: 4px solid var(--cyan); }
+    .provider.bridge { border-top: 4px solid var(--orange); }
+    .provider small { color: var(--muted); text-transform: uppercase; letter-spacing: .1em; }
+    .provider strong { font: 24px/1.05 var(--display); }
+    .providers.compact { grid-template-columns: repeat(2, minmax(0,1fr)); gap: 9px; margin-top: 24px; }
+    .providers.compact .provider { min-height: 78px; padding: 13px 15px; }
+    .providers.compact .provider strong { font-size: 19px; }
+    .providers.compact .provider small { font-size: 9px; }
+
+    /* Participation */
+    .action-stack { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .action { min-height: 150px; padding: 23px; display: flex; flex-direction: column; justify-content: space-between; border: 1px solid var(--line); background: rgba(243,238,226,.04); }
+    .action:nth-child(1) { background: var(--paper); color: var(--ink); }
+    .action:nth-child(1) p { color: rgba(16,17,15,.65); }
+    .action p { font-size: 14px; margin: 0; }
+
+    /* Device */
+    .device-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin-top: 36px; }
+    .device-card { position: relative; min-height: 235px; padding: 25px; border: 1px solid var(--line); background: rgba(243,238,226,.035); }
+    .device-card.wide { grid-column: span 2; }
+    .device-card h3 { font-family: var(--display); font-size: 29px; font-weight: 500; }
+    .device-card p { max-width: 360px; font-size: 15px; }
+    .device-card .big-glyph { position: absolute; right: 22px; bottom: 12px; color: rgba(255,75,25,.4); font-size: 76px; }
+
+    /* Closing */
+    .close-slide { align-content: center; justify-items: center; text-align: center; }
+    .close-slide h2 { max-width: 1080px; font-size: clamp(65px, 7.5vw, 130px); }
+    .close-slide .lead { max-width: 940px; }
+    .close-line { width: min(620px, 58vw); height: 5px; margin: 32px 0; background: linear-gradient(90deg, transparent, var(--orange), var(--lime), transparent); }
+
+    .chrome {
+      position: fixed;
+      left: 50%; bottom: 22px;
+      z-index: 50;
+      display: flex; align-items: center; gap: 12px;
+      transform: translateX(-50%);
+      padding: 8px;
+      border: 1px solid rgba(243,238,226,.14);
+      border-radius: 999px;
+      background: rgba(12,13,11,.78);
+      backdrop-filter: blur(18px);
+    }
+    .capture .chrome { display: none; }
+    .chrome button { width: 38px; height: 38px; border: 0; border-radius: 50%; background: rgba(243,238,226,.08); color: var(--paper); cursor: pointer; }
+    .chrome button:hover { background: var(--orange); }
+    .counter { min-width: 76px; text-align: center; color: var(--muted); font-size: 13px; }
+
+    .speaker-notes {
+      position: fixed; left: 32px; right: 32px; bottom: 80px; z-index: 45; display: none;
+      max-width: 980px; margin: auto; padding: 22px 26px; border: 1px solid rgba(214,255,70,.35);
+      background: rgba(10,11,9,.94); color: var(--paper); box-shadow: 0 20px 70px rgba(0,0,0,.5); line-height: 1.45;
+    }
+    .speaker-notes.visible { display: block; }
+    .speaker-notes strong { color: var(--lime); }
+
+    @media (max-aspect-ratio: 4/3) {
+      .slide { padding: 66px; }
+      .content-two { grid-template-columns: 1fr; gap: 32px; align-content: center; }
+      .content-two > :last-child { max-height: 40vh; }
+      .app-mark { opacity: .25; right: -4vw; }
+      .pipeline { grid-template-columns: repeat(2,1fr); }
+      .stage { min-height: 170px; }
+      .providers { grid-template-columns: repeat(2,1fr); }
+    }
+
+    @media print {
+      html, body { overflow: visible; background: #11120f; }
+      body::before, .chrome, .speaker-notes { display: none !important; }
+      .deck { height: auto; }
+      .slide, .slide.active { position: relative; display: grid !important; width: 1600px; height: 900px; break-after: page; animation: none; }
+    }
+  </style>
+</head>
+<body>
+  <main class="deck" aria-label="redapp presentation">
+    <section class="slide cover active" data-title="Reddit Intelligence, Reimagined" data-notes="Reddit contains an enormous amount of real-world experience, discussion, and opinion—but extracting useful information can take hours. redapp transforms Reddit into an intelligent research workspace where users can explore communities, summarize conversations, ask questions, save evidence, and listen to insights using on-device AI voice technology.">
+      <div class="grid-bg"></div>
+      <p class="kicker">Reddit intelligence, reimagined</p>
+      <h1>Turn noise into<br><span class="accent">knowledge.</span></h1>
+      <p class="tagline">redapp transforms community conversations into structured, verifiable research.</p>
+      <div class="app-mark" aria-hidden="true">
+        <div class="orbit"></div>
+        <img src="../redapp/Assets.xcassets/AppIcon2.appiconset/image-1024.png" alt="">
+      </div>
+      <span class="slide-no">01 / 12</span>
+    </section>
+
+    <section class="slide" data-title="Explore Reddit Your Way" data-notes="redapp provides a complete Reddit browsing experience designed for focused discovery. Users can open their Home feed, search any subreddit, save favorites, choose different sorting options, and explore complete posts and comment threads without leaving the app.">
+      <div class="grid-bg"></div>
+      <div class="content-two">
+        <div>
+          <p class="kicker">Discover</p>
+          <h2>Explore Reddit<br>your way.</h2>
+          <p class="lead">Focused discovery without losing the texture of the original community.</p>
+          <div class="chip-row">
+            <span class="chip">Home feed</span><span class="chip">Subreddit search</span><span class="chip">Favorites</span><span class="chip">Hot</span><span class="chip">New</span><span class="chip">Rising</span><span class="chip">Top</span>
+          </div>
+        </div>
+        <figure class="actual-shot home-shot">
+          <img src="../output/ipad-app-screenshots/01-home.png" alt="Actual redapp home screen running on an iPad Pro simulator">
+          <figcaption>Actual app · iPad Pro 13‑inch</figcaption>
+        </figure>
+      </div>
+      <span class="slide-no">02 / 12</span>
+    </section>
+
+    <section class="slide" data-title="Understand Every Discussion" data-notes="For every post, redapp can summarize the original content, analyze the comments, identify important themes, and present the overall sentiment of the discussion. Users can choose a fast two-paragraph summary or request a more detailed analysis, then ask follow-up questions about what the community said.">
+      <div class="grid-bg"></div>
+      <div class="content-two">
+        <div>
+          <p class="kicker">Analyze</p>
+          <h2>Understand every<br>discussion.</h2>
+          <div class="feature-list">
+            <div class="feature"><span class="mark">01</span><span>Short or detailed post summaries</span></div>
+            <div class="feature"><span class="mark">02</span><span>Comment-thread summaries</span></div>
+            <div class="feature"><span class="mark">03</span><span>Deep thematic and sentiment analysis</span></div>
+            <div class="feature"><span class="mark">04</span><span>Follow-up questions and answers</span></div>
+          </div>
+        </div>
+        <div class="rings" aria-hidden="true">
+          <div class="ring r1"></div><div class="ring r2"></div><div class="ring r3">What does the community really think?</div>
+          <span class="ring-tag rt1">Themes</span><span class="ring-tag rt2">Sentiment</span><span class="ring-tag rt3">Evidence</span><span class="ring-tag rt4">Context</span>
+        </div>
+      </div>
+      <span class="slide-no">03 / 12</span>
+    </section>
+
+    <section class="slide" data-title="Analyze Entire Communities" data-notes="One of redapp’s most powerful capabilities is batch analysis. Instead of opening posts individually, users can analyze an entire selection of subreddit content. redapp collects the relevant posts and comments, creates individual summaries, and combines them into a clear overview of the community’s most important conversations.">
+      <div class="grid-bg"></div>
+      <p class="kicker">Batch intelligence</p>
+      <h2>From hundreds of voices<br>to one clear picture.</h2>
+      <div class="pipeline">
+        <div class="stage"><span class="num">01</span><h3>Select</h3><p>Choose the feed, number of posts, and analysis depth.</p></div>
+        <div class="stage"><span class="num">02</span><h3>Collect</h3><p>Gather posts and complete comment conversations.</p></div>
+        <div class="stage"><span class="num">03</span><h3>Synthesize</h3><p>Find recurring themes, challenges, and community signals.</p></div>
+        <div class="stage final"><span class="num signal">04</span><h3>Understand</h3><p>Receive a concise overview plus every supporting summary.</p></div>
+      </div>
+      <span class="slide-no">04 / 12</span>
+    </section>
+
+    <section class="slide" data-title="See Results Your Way" data-notes="Insights are presented in the format that best fits the user’s needs. Results can be viewed as a written overview, grouped by topic, organized into a structured table, transformed into an infographic, or displayed as a visual whiteboard. Every result can be copied, saved, or shared.">
+      <div class="grid-bg"></div>
+      <div class="content-two">
+        <div>
+          <p class="kicker">Communicate</p>
+          <h2>See the signal<br>your way.</h2>
+          <p class="lead">One research run. Multiple ways to understand and share it.</p>
+        </div>
+        <div class="mode-wall">
+          <div class="mode"><span class="glyph">≋</span><h3>Subreddit overview</h3><p>The complete story in a clear narrative.</p></div>
+          <div class="mode"><span class="glyph">⌗</span><h3>Topics</h3><p>Recurring themes grouped automatically.</p></div>
+          <div class="mode"><span class="glyph">▦</span><h3>Tables</h3><p>Structured comparison and evidence.</p></div>
+          <div class="mode"><span class="glyph">◉</span><h3>Infographic</h3><p>Copy or save a visual summary.</p></div>
+          <div class="mode"><span class="glyph">↗</span><h3>Whiteboard</h3><p>A visual map of the conversation.</p></div>
+        </div>
+      </div>
+      <span class="slide-no">05 / 12</span>
+    </section>
+
+    <section class="slide" data-title="Ground Every Answer" data-notes="redapp does more than summarize. Users can have a focused conversation with the collected research. Answers remain grounded in the original posts and comments, with citations showing where each claim came from. The app can also flag conflicting evidence and identify questions that the available sources cannot answer.">
+      <div class="grid-bg"></div>
+      <div class="content-two">
+        <div>
+          <p class="kicker">Evidence</p>
+          <h2>Ask freely.<br>Verify instantly.</h2>
+          <div class="feature-list">
+            <div class="feature"><span class="mark">✓</span><span>Claim-level citations</span></div>
+            <div class="feature"><span class="mark">✓</span><span>Confidence indicators</span></div>
+            <div class="feature"><span class="mark">✓</span><span>Conflicting evidence detection</span></div>
+            <div class="feature"><span class="mark">✓</span><span>Unanswered questions made visible</span></div>
+          </div>
+        </div>
+        <div class="evidence-map" aria-hidden="true">
+          <div class="claim">A grounded answer you can inspect.</div>
+          <div class="source s1"><b>Post 04</b><br>Direct experience<span class="badge">supporting</span></div>
+          <div class="source s2"><b>Comment 18</b><br>Alternative result<span class="badge">conflict</span></div>
+          <div class="source s3"><b>Post 09</b><br>Independent example<span class="badge">supporting</span></div>
+          <div class="source s4"><b>Comment 31</b><br>Missing context<span class="badge">uncertain</span></div>
+        </div>
+      </div>
+      <span class="slide-no">06 / 12</span>
+    </section>
+
+    <section class="slide" data-title="Build a Research Library" data-notes="Important discoveries do not disappear when the session ends. The Research Library preserves reports, sources, metadata, questions, and generated outputs. Users can organize research with tags, compare different revisions, export complete archives, and download supporting content for offline access.">
+      <div class="grid-bg"></div>
+      <div class="content-two">
+        <div>
+          <p class="kicker">Remember</p>
+          <h2>Your research,<br>built to last.</h2>
+          <p class="lead">Save the report, the sources, and the path that led to every conclusion.</p>
+          <div class="chip-row"><span class="chip">Search</span><span class="chip">Tags</span><span class="chip">Pin</span><span class="chip">Revision history</span><span class="chip">Compare</span><span class="chip">Offline packs</span><span class="chip">Markdown</span><span class="chip">JSON</span></div>
+        </div>
+        <figure class="actual-shot library-shot">
+          <img src="../output/ipad-app-screenshots/08-research-library.png" alt="Actual Research Library screen in redapp on iPad">
+          <figcaption>Actual app · Research Library</figcaption>
+        </figure>
+      </div>
+      <span class="slide-no">07 / 12</span>
+    </section>
+
+    <section class="slide voice-slide" data-title="Listen Anywhere" data-notes="The latest redapp feature introduces on-device neural text-to-speech. Users can listen to subreddit overviews, post summaries, AI answers, thematic analyses, and complete comment collections. Audio is generated directly on the device, improving privacy and allowing offline use after the required model assets have been downloaded.">
+      <div class="grid-bg"></div>
+      <div class="content-two">
+        <div>
+          <p class="kicker">New · On-device voice</p>
+          <h2>Read less.<br><span class="signal">Hear more.</span></h2>
+          <p class="lead">Turn summaries, answers, analyses, and comment threads into private, natural speech.</p>
+          <div class="chip-row"><span class="chip">Multiple voices</span><span class="chip">Chunked playback</span><span class="chip">Optional pre-cache</span><span class="chip">Offline after download</span><span class="chip">Cloud fallback</span></div>
+        </div>
+        <div class="shot-stack" aria-label="Actual redapp MLX text-to-speech settings and voice picker on iPad">
+          <img class="shot-main" src="../output/ipad-app-screenshots/06-mlx-tts-settings.png" alt="MLX TTS settings with voice, speed, and pre-cache controls">
+          <img class="shot-detail" src="../output/ipad-app-screenshots/07-mlx-voice-menu.png" alt="MLX TTS voice menu showing eight voices">
+          <span class="capture-label">Actual app · MLX TTS</span>
+        </div>
+      </div>
+      <div class="privacy-seal">Generated<br>on device</div>
+      <span class="slide-no">08 / 12</span>
+    </section>
+
+    <section class="slide" data-title="Choose the Right Intelligence" data-notes="redapp is not tied to a single AI provider. Users can prioritize privacy with local models, use cloud services for advanced capabilities, or connect to persistent ChatGPT and Gemini web sessions. This flexible architecture makes the app adaptable to different devices, workflows, privacy requirements, and budgets.">
+      <div class="grid-bg"></div>
+      <div class="content-two">
+        <div>
+          <p class="kicker">Flexible intelligence</p>
+          <h2>Use the right model<br>for the moment.</h2>
+          <div class="providers compact">
+            <div class="provider cloud"><small>Cloud</small><strong>Gemini</strong></div>
+            <div class="provider local"><small>On device</small><strong>Apple Local</strong></div>
+            <div class="provider local"><small>On device</small><strong>LiteRT</strong></div>
+            <div class="provider local"><small>On device</small><strong>CoreAI MLX</strong></div>
+            <div class="provider cloud"><small>Web session</small><strong>ChatGPT</strong></div>
+            <div class="provider cloud"><small>Web session</small><strong>Gemini Web</strong></div>
+            <div class="provider bridge"><small>Bridge</small><strong>Codex / Summarize</strong></div>
+            <div class="provider bridge"><small>Private cloud</small><strong>Apple PCC Gateway</strong></div>
+          </div>
+        </div>
+        <figure class="actual-shot">
+          <img src="../output/ipad-app-screenshots/02-settings-summary.png" alt="Actual redapp provider and persistent web session settings on iPad">
+          <figcaption>Actual app · Provider settings</figcaption>
+        </figure>
+      </div>
+      <span class="slide-no">09 / 12</span>
+    </section>
+
+    <section class="slide" data-title="Participate, Not Just Observe" data-notes="redapp remains a complete community experience. Authenticated users can vote, reply, attach images, and create new Reddit posts. The post composer supports text, links, images, galleries, GIFs, flair, and structured formatting.">
+      <div class="grid-bg"></div>
+      <div class="content-two">
+        <div>
+          <p class="kicker">Participate</p>
+          <h2>Research the conversation.<br>Then join it.</h2>
+          <p class="lead">redapp keeps the full community loop inside one focused workspace.</p>
+        </div>
+        <div class="action-stack">
+          <div class="action"><span class="icon">↑</span><div><h3>Vote & reply</h3><p>Respond directly and attach supporting images.</p></div></div>
+          <div class="action"><span class="icon">T</span><div><h3>Text posts</h3><p>Write with lists and rich formatting.</p></div></div>
+          <div class="action"><span class="icon">↗</span><div><h3>Links & media</h3><p>Share links, images, GIFs, and galleries.</p></div></div>
+          <div class="action"><span class="icon">#</span><div><h3>Community context</h3><p>Add flair and publish to the right audience.</p></div></div>
+        </div>
+      </div>
+      <span class="slide-no">10 / 12</span>
+    </section>
+
+    <section class="slide" data-title="Designed for Apple Devices" data-notes="The experience is designed specifically for Apple devices. redapp combines a modern interface with responsive iPhone and iPad layouts, readable Markdown, full-screen media, appearance controls, and detailed storage management. Widgets and Live Activities make it possible to follow long batch-analysis tasks without keeping the app open.">
+      <div class="grid-bg"></div>
+      <div class="content-two">
+        <div>
+          <p class="kicker">Experience</p>
+          <h2>Made for focus.<br>Built for Apple devices.</h2>
+          <div class="feature-list">
+            <div class="feature"><span class="mark">01</span><span>Responsive iPhone + iPad layouts</span></div>
+            <div class="feature"><span class="mark">02</span><span>Widgets and Live Activities for long tasks</span></div>
+            <div class="feature"><span class="mark">03</span><span>Markdown, full-screen media, sharing, and dark mode</span></div>
+            <div class="feature"><span class="mark">04</span><span>Precise model, cache, and offline storage controls</span></div>
+          </div>
+        </div>
+        <figure class="actual-shot">
+          <img src="../output/ipad-app-screenshots/03-settings-services.png" alt="Actual redapp account, media service, voice, and local TTS settings on iPad">
+          <figcaption>Actual app · iPad settings</figcaption>
+        </figure>
+      </div>
+      <span class="slide-no">11 / 12</span>
+    </section>
+
+    <section class="slide close-slide" data-title="Browse Less. Understand More." data-notes="redapp brings discovery, artificial intelligence, research management, visualization, and private voice playback into one experience. It helps users move beyond scrolling—turning thousands of Reddit conversations into knowledge they can understand, verify, save, share, and listen to.">
+      <div class="grid-bg"></div>
+      <p class="kicker">redapp</p>
+      <h2>Browse less.<br><span class="accent">Understand more.</span></h2>
+      <div class="close-line"></div>
+      <p class="lead">Discover it. Analyze it. Verify it. Save it. Share it. Hear it.</p>
+      <span class="slide-no">12 / 12</span>
+    </section>
+  </main>
+
+  <aside class="speaker-notes" aria-live="polite"><strong>Speaker notes</strong><br><span id="notesText"></span></aside>
+
+  <nav class="chrome" aria-label="Presentation controls">
+    <button id="prev" type="button" aria-label="Previous slide">←</button>
+    <span class="counter" id="counter">1 / 12</span>
+    <button id="notes" type="button" aria-label="Toggle speaker notes">N</button>
+    <button id="full" type="button" aria-label="Enter fullscreen">⛶</button>
+    <button id="next" type="button" aria-label="Next slide">→</button>
+  </nav>
+
+  <script>
+    const slides = [...document.querySelectorAll('.slide')];
+    const params = new URLSearchParams(location.search);
+    let current = Math.min(slides.length - 1, Math.max(0, Number(params.get('slide') || 1) - 1));
+    const capture = params.get('capture') === '1';
+    if (capture) document.body.classList.add('capture');
+
+    const counter = document.getElementById('counter');
+    const notesPanel = document.querySelector('.speaker-notes');
+    const notesText = document.getElementById('notesText');
+
+    function show(index, updateHash = true) {
+      current = (index + slides.length) % slides.length;
+      slides.forEach((slide, i) => slide.classList.toggle('active', i === current));
+      counter.textContent = `${current + 1} / ${slides.length}`;
+      notesText.textContent = slides[current].dataset.notes || '';
+      document.title = `${String(current + 1).padStart(2, '0')} — ${slides[current].dataset.title} | redapp`;
+      if (updateHash && !capture) history.replaceState(null, '', `#${current + 1}`);
+    }
+
+    document.getElementById('prev').addEventListener('click', () => show(current - 1));
+    document.getElementById('next').addEventListener('click', () => show(current + 1));
+    document.getElementById('notes').addEventListener('click', () => notesPanel.classList.toggle('visible'));
+    document.getElementById('full').addEventListener('click', () => document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen());
+
+    addEventListener('keydown', event => {
+      if (['ArrowRight', 'PageDown', ' '].includes(event.key)) { event.preventDefault(); show(current + 1); }
+      if (['ArrowLeft', 'PageUp'].includes(event.key)) { event.preventDefault(); show(current - 1); }
+      if (event.key.toLowerCase() === 'n') notesPanel.classList.toggle('visible');
+      if (event.key.toLowerCase() === 'f') document.documentElement.requestFullscreen?.();
+      if (event.key === 'Home') show(0);
+      if (event.key === 'End') show(slides.length - 1);
+    });
+
+    if (!params.has('slide') && location.hash) {
+      const hashSlide = Number(location.hash.slice(1));
+      if (Number.isFinite(hashSlide)) current = Math.min(slides.length - 1, Math.max(0, hashSlide - 1));
+    }
+    show(current, false);
+  </script>
+</body>
+</html>
