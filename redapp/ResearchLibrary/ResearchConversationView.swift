@@ -4,6 +4,8 @@ import SwiftUI
 struct ResearchConversationView: View {
     let runID: UUID
     let initialConversationID: UUID?
+    /// A question typed elsewhere (the briefing's Ask bar) to send on open.
+    let initialQuestion: String?
 
     @ObservedObject private var store = ResearchLibraryStore.shared
     @State private var conversationID: UUID?
@@ -16,9 +18,10 @@ struct ResearchConversationView: View {
     @State private var selectedSource: ResearchSourceRecord?
     @FocusState private var isInputFocused: Bool
 
-    init(runID: UUID, conversationID: UUID? = nil) {
+    init(runID: UUID, conversationID: UUID? = nil, initialQuestion: String? = nil) {
         self.runID = runID
         self.initialConversationID = conversationID
+        self.initialQuestion = initialQuestion
     }
 
     var body: some View {
@@ -27,9 +30,9 @@ struct ResearchConversationView: View {
                 LazyVStack(alignment: .leading, spacing: 14) {
                     if turns.isEmpty {
                         ContentUnavailableView(
-                            "Ask About This Batch",
+                            "Ask About This Report",
                             systemImage: "bubble.left.and.text.bubble.right",
-                            description: Text("Answers stay scoped to the saved posts and comments and retain claim-level citations.")
+                            description: Text("Answers use only the saved posts and comments, and each point links to the quotes behind it.")
                         )
                         .padding(.top, 60)
                     }
@@ -46,7 +49,7 @@ struct ResearchConversationView: View {
                     if isSending {
                         HStack(spacing: 8) {
                             ProgressView()
-                            Text("Checking the saved sources…")
+                            Text("Reading the saved posts and checking quotes…")
                                 .foregroundStyle(.secondary)
                         }
                         .padding(.horizontal)
@@ -63,7 +66,8 @@ struct ResearchConversationView: View {
                 withAnimation { proxy.scrollTo(lastID, anchor: .bottom) }
             }
         }
-        .navigationTitle("Saved Batch Q&A")
+        .background(RedappDesign.canvas)
+        .navigationTitle("Ask")
         .navigationBarTitleDisplayMode(.inline)
         .sheet(item: $selectedSource) { source in
             NavigationStack { ResearchSourceDetailView(source: source) }
@@ -71,7 +75,14 @@ struct ResearchConversationView: View {
         .task {
             conversationID = initialConversationID
             reload()
-            isInputFocused = turns.isEmpty
+            if let initialQuestion,
+               turns.isEmpty,
+               !initialQuestion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                draft = initialQuestion
+                send()
+            } else {
+                isInputFocused = turns.isEmpty
+            }
         }
         .alert("Couldn’t Answer", isPresented: Binding(
             get: { errorMessage != nil },
@@ -84,23 +95,18 @@ struct ResearchConversationView: View {
     }
 
     private var inputBar: some View {
-        HStack(alignment: .bottom, spacing: 10) {
-            TextField("Ask a follow-up about this saved batch", text: $draft, axis: .vertical)
-                .lineLimit(1...5)
-                .textFieldStyle(.roundedBorder)
-                .focused($isInputFocused)
-                .submitLabel(.send)
-                .onSubmit(send)
-            Button(action: send) {
-                Image(systemName: "arrow.up.circle.fill")
-                    .font(.title2)
-            }
-            .disabled(isSending || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            .accessibilityLabel("Send question")
-        }
-        .padding(.horizontal)
-        .padding(.vertical, 10)
-        .background(.bar)
+        RedappAskBar(
+            placeholder: "Ask a follow-up about this research…",
+            text: $draft,
+            isBusy: isSending,
+            onSubmit: send
+        )
+        .focused($isInputFocused)
+        .frame(maxWidth: RedappDesign.reportWidth)
+        .padding(.horizontal, 20)
+        .padding(.vertical, 12)
+        .frame(maxWidth: .infinity)
+        .background(RedappDesign.canvas.opacity(0.94))
     }
 
     private func send() {
@@ -111,6 +117,7 @@ struct ResearchConversationView: View {
         errorMessage = nil
 
         Task {
+            var askedTurnID: UUID?
             do {
                 let detail = try store.detail(runID: runID)
                 let activeConversation: ResearchConversationRecord
@@ -125,11 +132,11 @@ struct ResearchConversationView: View {
                     conversationID = activeConversation.id
                 }
 
-                _ = try store.appendTurn(
+                askedTurnID = try store.appendTurn(
                     conversationID: activeConversation.id,
                     role: .user,
                     text: question
-                )
+                ).id
                 reload()
 
                 let priorContext = turns.suffix(10).map {
@@ -161,6 +168,15 @@ struct ResearchConversationView: View {
                 )
                 reload()
             } catch {
+                // Don't leave a question without an answer; give it back to edit.
+                if let askedTurnID {
+                    try? store.deleteTurn(id: askedTurnID)
+                    if let conversationID, (try? store.conversation(id: conversationID)) == nil {
+                        self.conversationID = nil
+                    }
+                    reload()
+                }
+                if draft.isEmpty { draft = question }
                 errorMessage = error.localizedDescription
             }
             isSending = false
@@ -211,9 +227,8 @@ private struct ResearchConversationTurnView: View {
         HStack {
             if turn.role == .user { Spacer(minLength: 40) }
             VStack(alignment: .leading, spacing: 8) {
-                Text(turn.role == .user ? "You" : "Grounded answer")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                RedappEyebrow(turn.role == .user ? "You" : "Answer",
+                              color: turn.role == .user ? RedappDesign.accent : RedappDesign.inkSecondary)
                 if claims.isEmpty {
                     Text(turn.text)
                         .textSelection(.enabled)
@@ -227,10 +242,10 @@ private struct ResearchConversationTurnView: View {
                                     ResearchConfidenceBadge(confidence: claim.confidence)
                                     ForEach(citationsByClaim[claim.id] ?? []) { citation in
                                         if let source = sourceForID(citation.sourceID) {
-                                            Button(citation.sourceID) { openSource(source) }
-                                                .buttonStyle(.bordered)
-                                                .controlSize(.small)
-                                                .accessibilityLabel("Open supporting source \(citation.sourceID)")
+                                            let label = ResearchSourceLabel.text(for: source, quote: citation.supportingQuote)
+                                            Button(label) { openSource(source) }
+                                                .buttonStyle(RedappChipButtonStyle())
+                                                .accessibilityLabel("Open the quote from \(label)")
                                         }
                                     }
                                 }
@@ -238,15 +253,13 @@ private struct ResearchConversationTurnView: View {
                             if !claim.conflictingSourceIDs.isEmpty {
                                 ScrollView(.horizontal, showsIndicators: false) {
                                     HStack(spacing: 8) {
-                                        Label("Conflicting evidence", systemImage: "arrow.triangle.branch")
+                                        Label("Sources disagree", systemImage: "arrow.triangle.branch")
                                             .font(.caption)
                                             .foregroundStyle(.orange)
                                         ForEach(claim.conflictingSourceIDs, id: \.self) { sourceID in
                                             if let source = sourceForID(sourceID) {
-                                                Button(sourceID) { openSource(source) }
-                                                    .buttonStyle(.bordered)
-                                                    .controlSize(.small)
-                                                    .tint(.orange)
+                                                Button(ResearchSourceLabel.text(for: source)) { openSource(source) }
+                                                    .buttonStyle(RedappChipButtonStyle(isFilled: false))
                                             }
                                         }
                                     }
@@ -265,9 +278,16 @@ private struct ResearchConversationTurnView: View {
                     }
                 }
             }
-            .padding(12)
-            .background(turn.role == .user ? Color.accentColor.opacity(0.14) : Color.secondary.opacity(0.10))
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .padding(14)
+            .foregroundStyle(RedappDesign.ink)
+            .background(
+                RoundedRectangle(cornerRadius: RedappDesign.Radius.large, style: .continuous)
+                    .fill(turn.role == .user ? RedappDesign.accentSoft : RedappDesign.card)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: RedappDesign.Radius.large, style: .continuous)
+                    .strokeBorder(turn.role == .user ? Color.clear : RedappDesign.hairline, lineWidth: 1)
+            )
             if turn.role != .user { Spacer(minLength: 24) }
         }
     }

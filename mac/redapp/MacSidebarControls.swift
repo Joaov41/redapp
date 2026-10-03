@@ -300,6 +300,7 @@ struct MacSidebarControls: View {
                 Text(selectedFeedMode == .home ? "Home" : selectedPostType.displayName)
                     .frame(minWidth: 46)
             }
+            .tint(.gray)
             .accessibilityLabel("Sort posts")
         }
         .fixedSize()

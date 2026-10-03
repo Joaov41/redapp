@@ -1429,48 +1429,6 @@ private enum ResearchArtifactPresentation {
     case expanded
 }
 
-private enum ResearchSpeechActivity: Equatable {
-    case idle
-    case preparing(current: Int, total: Int)
-    case playing(current: Int, total: Int)
-    case saving(completed: Int, total: Int)
-
-    var isPlayback: Bool {
-        switch self {
-        case .preparing, .playing: true
-        case .idle, .saving: false
-        }
-    }
-
-    var isBusy: Bool { self != .idle }
-
-    var progress: Double? {
-        switch self {
-        case .idle:
-            nil
-        case let .preparing(current, total):
-            total > 0 ? Double(max(0, current - 1)) / Double(total) : 0
-        case let .playing(current, total):
-            total > 0 ? Double(current) / Double(total) : 0
-        case let .saving(completed, total):
-            total > 0 ? Double(completed) / Double(total) : 0
-        }
-    }
-
-    var statusText: String? {
-        switch self {
-        case .idle:
-            nil
-        case let .preparing(current, total):
-            "Preparing \(current) of \(total)"
-        case let .playing(current, total):
-            "Playing \(current) of \(total)"
-        case let .saving(completed, total):
-            "Saving \(completed) of \(total)"
-        }
-    }
-}
-
 @MainActor
 private struct ResearchArtifactView: View {
     let runID: UUID
@@ -1483,13 +1441,6 @@ private struct ResearchArtifactView: View {
     let onOfflineChange: () -> Void
     let presentation: ResearchArtifactPresentation
     let showsSourceLinkNotice: Bool
-    @State private var speechSaved = false
-    @State private var speechError: String?
-    @State private var offlineSpeechPlayer: AVAudioPlayer?
-    @State private var speechActivity: ResearchSpeechActivity = .idle
-    @State private var speechTask: Task<Void, Never>?
-    @State private var speechOperationID: UUID?
-
     var body: some View {
         Group {
             switch presentation {
@@ -1507,17 +1458,6 @@ private struct ResearchArtifactView: View {
                 }
                 .padding(.vertical, 4)
             }
-        }
-        .alert("Speech Unavailable", isPresented: Binding(
-            get: { speechError != nil },
-            set: { if !$0 { speechError = nil } }
-        )) {
-            Button("OK", role: .cancel) { speechError = nil }
-        } message: {
-            Text(speechError ?? "Unknown error")
-        }
-        .onDisappear {
-            stopSpeechOperation()
         }
     }
 
@@ -1686,235 +1626,15 @@ private struct ResearchArtifactView: View {
             }
             .layoutPriority(1)
             Spacer()
-            if SummaryService.shared.settings.localTTSEngine == .kokoro {
-                VStack(alignment: .trailing, spacing: 4) {
-                    HStack(spacing: 14) {
-                        Button {
-                            toggleSpeechPlayback()
-                        } label: {
-                            Image(systemName: speechActivity.isPlayback ? "stop.circle.fill" : "play.circle.fill")
-                        }
-                        .buttonStyle(.borderless)
-                        .disabled(speechActivity.isBusy && !speechActivity.isPlayback)
-                        .accessibilityLabel(speechActivity.isPlayback ? "Stop report speech" : "Play report with MLX speech")
-
-                        Button {
-                            saveSpeechOffline()
-                        } label: {
-                            Image(systemName: speechSaved || speechAsset != nil ? "checkmark.circle.fill" : "arrow.down.circle")
-                        }
-                        .buttonStyle(.borderless)
-                        .disabled(speechActivity.isBusy || speechSaved || speechAsset != nil)
-                        .accessibilityLabel(
-                            speechSaved || speechAsset != nil ? "Speech saved offline" : "Save speech offline"
-                        )
-                    }
-
-                    if let statusText = speechActivity.statusText,
-                       let progress = speechActivity.progress {
-                        VStack(alignment: .trailing, spacing: 2) {
-                            ProgressView(value: progress)
-                                .frame(width: 92)
-                            Text(statusText)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .monospacedDigit()
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    private func toggleSpeechPlayback() {
-        if speechActivity.isPlayback {
-            stopSpeechOperation()
-        } else {
-            startSpeechPlayback()
-        }
-    }
-
-    private func startSpeechPlayback() {
-        stopSpeechOperation()
-        let operationID = UUID()
-        speechOperationID = operationID
-        let settings = SummaryService.shared.settings
-        let plainText = MarkdownTextView.extractPlainText(from: displayBody)
-        let chunks = KokoroTTSService.shared.speechChunks(from: plainText)
-
-        guard !chunks.isEmpty else {
-            speechError = KokoroTTSServiceError.emptyText.localizedDescription
-            return
-        }
-
-        speechTask = Task {
-            do {
-                try configureResearchSpeechAudioSession()
-                let playbackToken = KokoroTTSService.shared.newPlaybackToken()
-
-                if let speechAsset {
-                    speechActivity = .preparing(current: 1, total: 1)
-                    let url = try await ResearchOfflinePackManager.shared.localURL(
-                        relativePath: speechAsset.relativePath
-                    )
-                    let data = try Data(contentsOf: url)
-                    try await playSpeechData(
-                        data,
-                        current: 1,
-                        total: 1,
-                        playbackToken: playbackToken
-                    )
-                } else {
-                    for (index, chunk) in chunks.enumerated() {
-                        try Task.checkCancellation()
-                        guard KokoroTTSService.shared.isPlaybackTokenCurrent(playbackToken) else {
-                            throw CancellationError()
-                        }
-                        speechActivity = .preparing(current: index + 1, total: chunks.count)
-                        let data = try await KokoroTTSService.shared.synthesize(
-                            text: chunk,
-                            voice: settings.kokoroVoice,
-                            speed: Float(settings.kokoroSpeed)
-                        )
-                        try await playSpeechData(
-                            data,
-                            current: index + 1,
-                            total: chunks.count,
-                            playbackToken: playbackToken
-                        )
-                    }
-                }
-            } catch is CancellationError {
-                // Stop is a normal user action.
-            } catch {
-                if speechOperationID == operationID {
-                    speechError = error.localizedDescription
-                }
-            }
-            finishSpeechOperation(operationID)
-        }
-    }
-
-    private func saveSpeechOffline() {
-        stopSpeechOperation()
-        let operationID = UUID()
-        speechOperationID = operationID
-        let settings = SummaryService.shared.settings
-        let plainText = MarkdownTextView.extractPlainText(from: displayBody)
-        let chunkCount = KokoroTTSService.shared.speechChunks(from: plainText).count
-
-        guard chunkCount > 0 else {
-            speechError = KokoroTTSServiceError.emptyText.localizedDescription
-            return
-        }
-
-        speechActivity = .saving(completed: 0, total: chunkCount)
-        speechTask = Task {
-            do {
-                let data = try await KokoroTTSService.shared.synthesizeChunked(
-                    text: plainText,
-                    voice: settings.kokoroVoice,
-                    speed: Float(settings.kokoroSpeed)
-                ) { completed, total in
-                    guard speechOperationID == operationID else { return }
-                    speechActivity = .saving(completed: completed, total: total)
-                }
-                try Task.checkCancellation()
-                _ = try await ResearchOfflinePackManager.shared.saveSpeech(
-                    data,
-                    runID: runID,
-                    artifactID: artifact.id,
-                    voice: settings.kokoroVoice,
-                    speed: settings.kokoroSpeed
-                )
-                guard speechOperationID == operationID else { return }
-                speechSaved = true
-                onOfflineChange()
-            } catch is CancellationError {
-                // Leaving the report or stopping the operation cancels a partial save.
-            } catch {
-                if speechOperationID == operationID {
-                    speechError = error.localizedDescription
-                }
-            }
-            finishSpeechOperation(operationID)
-        }
-    }
-
-    private func configureResearchSpeechAudioSession() throws {
-        #if os(iOS)
-        let audioSession = AVAudioSession.sharedInstance()
-        do {
-            try audioSession.setCategory(
-                .playback,
-                mode: .spokenAudio,
-                options: [.duckOthers, .allowBluetooth, .allowBluetoothA2DP]
-            )
-        } catch {
-            try audioSession.setCategory(
-                .playback,
-                mode: .spokenAudio,
-                options: [.duckOthers]
+            ResearchMLXSpeechControls(
+                text: displayBody,
+                runID: runID,
+                artifactID: artifact.id,
+                label: artifact.kind.displayName.lowercased(),
+                speechAsset: speechAsset,
+                onOfflineChange: onOfflineChange
             )
         }
-        try audioSession.setActive(true)
-        #endif
-    }
-
-    private func playSpeechData(
-        _ data: Data,
-        current: Int,
-        total: Int,
-        playbackToken: UUID
-    ) async throws {
-        try Task.checkCancellation()
-        guard KokoroTTSService.shared.isPlaybackTokenCurrent(playbackToken) else {
-            throw CancellationError()
-        }
-        let player = try AVAudioPlayer(data: data)
-        guard player.prepareToPlay() else {
-            throw NSError(
-                domain: "ResearchLibraryPlayback",
-                code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "The speech audio could not be prepared for playback."]
-            )
-        }
-        offlineSpeechPlayer = player
-        speechActivity = .playing(current: current, total: total)
-        guard player.play() else {
-            throw NSError(
-                domain: "ResearchLibraryPlayback",
-                code: 2,
-                userInfo: [NSLocalizedDescriptionKey: "The speech audio could not start playing."]
-            )
-        }
-
-        while player.isPlaying {
-            try Task.checkCancellation()
-            guard KokoroTTSService.shared.isPlaybackTokenCurrent(playbackToken) else {
-                player.stop()
-                throw CancellationError()
-            }
-            try await Task.sleep(for: .milliseconds(100))
-        }
-    }
-
-    private func stopSpeechOperation() {
-        speechOperationID = nil
-        speechTask?.cancel()
-        speechTask = nil
-        offlineSpeechPlayer?.stop()
-        offlineSpeechPlayer = nil
-        KokoroTTSService.shared.cancelPlayback()
-        speechActivity = .idle
-    }
-
-    private func finishSpeechOperation(_ operationID: UUID) {
-        guard speechOperationID == operationID else { return }
-        speechOperationID = nil
-        speechTask = nil
-        offlineSpeechPlayer = nil
-        speechActivity = .idle
     }
 }
 

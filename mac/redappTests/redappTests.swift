@@ -11,6 +11,19 @@ import XCTest
 
 final class redappTests: XCTestCase {
 
+    func testGeminiTextRequestsKeepStreamingEndpointsWithoutUnsupportedThinkingBudget() throws {
+        let source = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("redapp/ContentView.swift")
+        let implementation = try String(contentsOf: source, encoding: .utf8)
+
+        XCTAssertTrue(implementation.contains("gemini-flash-lite-latest:generateContent"))
+        XCTAssertTrue(implementation.contains("gemini-flash-lite-latest:streamGenerateContent"))
+        XCTAssertFalse(implementation.contains("thinkingConfig"))
+        XCTAssertFalse(implementation.contains("thinkingBudget"))
+    }
+
     func testPCCContextDetectionRecognizesNewTerminalRequirementMessage() {
         XCTAssertTrue(
             RedappPCCGatewayClient.isPCCContextUnavailable(

@@ -63,6 +63,13 @@ final class WebAISessionManager {
         return webView
     }
 
+    /// Wakes the hidden pages so a reply keeps streaming while the app is in the background.
+    func keepWebViewsAwake() {
+        for webView in webViews.values {
+            webView.evaluateJavaScript("0", completionHandler: nil)
+        }
+    }
+
     func reconfigure(
         _ webView: WKWebView,
         coordinator: WKNavigationDelegate & WKScriptMessageHandler & WKUIDelegate,
@@ -196,7 +203,7 @@ struct WebAIHandoffView: View {
                         Spacer()
                         Text(request.provider.displayName)
                             .font(.subheadline)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(RedappDesign.inkSecondary)
                         if isLoading {
                             ProgressView()
                                 .scaleEffect(0.8)
@@ -205,7 +212,7 @@ struct WebAIHandoffView: View {
                             appState.dismissActiveWebAIHandoff(userInitiated: true)
                             dismiss()
                         }
-                        .buttonStyle(.bordered)
+                        .buttonStyle(RedappSecondaryButtonStyle())
                     }
                     .padding()
 
@@ -236,12 +243,13 @@ struct WebAIHandoffView: View {
             if isLoading && !didInject {
                 VStack(spacing: 12) {
                     ProgressView()
-                    Text("Loading \(request.provider.displayName)...")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .tint(RedappDesign.accent)
+                    Text("Loading \(request.provider.displayName)…")
+                        .font(.subheadline)
+                        .foregroundStyle(RedappDesign.inkSecondary)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(.ultraThinMaterial)
+                .background(RedappDesign.canvas)
             }
         }
         .overlay(alignment: .bottom) {
@@ -249,10 +257,10 @@ struct WebAIHandoffView: View {
                 Text(fallbackMessage)
                     .font(.caption)
                     .multilineTextAlignment(.center)
-                    .foregroundStyle(.white)
+                    .foregroundStyle(RedappDesign.toastText)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
-                    .background(Color.black.opacity(0.78))
+                    .background(RedappDesign.toast)
                     .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                     .padding()
                     .transition(.move(edge: .bottom).combined(with: .opacity))
@@ -344,15 +352,18 @@ struct WebAIHandoffIOSPresenterModifier: ViewModifier {
                 HStack(spacing: 12) {
                     Image(systemName: "globe")
                         .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(RedappDesign.accent)
+                        .frame(width: 32, height: 32)
+                        .background(RedappDesign.accentSoft, in: RoundedRectangle(cornerRadius: RedappDesign.Radius.small, style: .continuous))
 
                     VStack(alignment: .leading, spacing: 2) {
                         Text(request.title)
                             .font(.headline)
+                            .foregroundStyle(RedappDesign.ink)
                             .lineLimit(1)
                         Text(request.provider.displayName)
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(RedappDesign.inkSecondary)
                     }
                 }
 
@@ -360,7 +371,7 @@ struct WebAIHandoffIOSPresenterModifier: ViewModifier {
 
                 Image(systemName: "line.3.horizontal")
                     .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(RedappDesign.inkSecondary)
                     .frame(width: 16, height: 16)
                     .contentShape(Rectangle())
                     .gesture(panelDragGesture(containerSize: containerSize))
@@ -374,7 +385,8 @@ struct WebAIHandoffIOSPresenterModifier: ViewModifier {
                 }
                 .frame(width: 56, height: 56)
                 .buttonStyle(.plain)
-                .background(.thinMaterial, in: Circle())
+                .background(RedappDesign.elevated, in: Circle())
+                .foregroundStyle(RedappDesign.ink)
                 .contentShape(Rectangle())
                 .accessibilityLabel("Minimize")
 
@@ -387,7 +399,8 @@ struct WebAIHandoffIOSPresenterModifier: ViewModifier {
                 }
                 .frame(width: 56, height: 56)
                 .buttonStyle(.plain)
-                .background(.thinMaterial, in: Circle())
+                .background(RedappDesign.elevated, in: Circle())
+                .foregroundStyle(RedappDesign.ink)
                 .contentShape(Rectangle())
                 .accessibilityLabel("Close")
             }
@@ -395,7 +408,9 @@ struct WebAIHandoffIOSPresenterModifier: ViewModifier {
             .padding(.top, 16)
             .padding(.bottom, 14)
 
-            Divider()
+            Rectangle()
+                .fill(RedappDesign.hairline)
+                .frame(height: 1)
 
             WebAIHandoffView(request: request, showsChrome: false)
                 .environmentObject(appState)
@@ -404,16 +419,16 @@ struct WebAIHandoffIOSPresenterModifier: ViewModifier {
         }
         .background(
             RoundedRectangle(cornerRadius: 28, style: .continuous)
-                .fill(.ultraThickMaterial)
+                .fill(RedappDesign.panel)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 28, style: .continuous)
-                .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
+                .strokeBorder(RedappDesign.hairline, lineWidth: 1)
         )
         .overlay(alignment: .bottomTrailing) {
             Image(systemName: "arrow.up.left.and.arrow.down.right")
                 .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(RedappDesign.inkSecondary)
                 .frame(width: 38, height: 38)
                 .contentShape(Rectangle())
                 .padding(12)
@@ -430,15 +445,18 @@ struct WebAIHandoffIOSPresenterModifier: ViewModifier {
             HStack(spacing: 12) {
                 Image(systemName: "globe")
                     .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(RedappDesign.accent)
+                    .frame(width: 32, height: 32)
+                    .background(RedappDesign.accentSoft, in: RoundedRectangle(cornerRadius: RedappDesign.Radius.small, style: .continuous))
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(request.title)
                         .font(.headline)
+                        .foregroundStyle(RedappDesign.ink)
                         .lineLimit(1)
                     Text(request.provider.displayName)
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(RedappDesign.inkSecondary)
                 }
 
                 Spacer()
@@ -452,7 +470,8 @@ struct WebAIHandoffIOSPresenterModifier: ViewModifier {
                 }
                 .frame(width: 56, height: 56)
                 .buttonStyle(.plain)
-                .background(.thinMaterial, in: Circle())
+                .background(RedappDesign.elevated, in: Circle())
+                .foregroundStyle(RedappDesign.ink)
                 .contentShape(Rectangle())
                 .accessibilityLabel("Minimize")
 
@@ -465,7 +484,8 @@ struct WebAIHandoffIOSPresenterModifier: ViewModifier {
                 }
                 .frame(width: 56, height: 56)
                 .buttonStyle(.plain)
-                .background(.thinMaterial, in: Circle())
+                .background(RedappDesign.elevated, in: Circle())
+                .foregroundStyle(RedappDesign.ink)
                 .contentShape(Rectangle())
                 .accessibilityLabel("Close")
             }
@@ -473,7 +493,9 @@ struct WebAIHandoffIOSPresenterModifier: ViewModifier {
             .padding(.top, 14)
             .padding(.bottom, 12)
 
-            Divider()
+            Rectangle()
+                .fill(RedappDesign.hairline)
+                .frame(height: 1)
 
             WebAIHandoffView(request: request, showsChrome: false)
                 .environmentObject(appState)
@@ -483,11 +505,11 @@ struct WebAIHandoffIOSPresenterModifier: ViewModifier {
         .frame(width: max(0, containerSize.width - 16), height: panelHeight, alignment: .top)
         .background(
             RoundedRectangle(cornerRadius: 28, style: .continuous)
-                .fill(.ultraThickMaterial)
+                .fill(RedappDesign.panel)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 28, style: .continuous)
-                .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
+                .strokeBorder(RedappDesign.hairline, lineWidth: 1)
         )
         .shadow(color: .black.opacity(0.22), radius: 20, y: 10)
         .padding(.horizontal, 8)
@@ -504,19 +526,22 @@ struct WebAIHandoffIOSPresenterModifier: ViewModifier {
                         .controlSize(.small)
                 } else {
                     Image(systemName: "globe")
+                        .foregroundStyle(RedappDesign.accent)
                 }
                 VStack(alignment: .leading, spacing: 2) {
                     Text(request.title)
                         .lineLimit(1)
                     Text(request.shouldAutoCapture ? "\(request.provider.displayName) working · Tap to open" : "\(request.provider.displayName) ready · Tap to open")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(RedappDesign.inkSecondary)
                 }
             }
             .font(.subheadline.weight(.medium))
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
-            .background(.ultraThickMaterial, in: Capsule())
+            .foregroundStyle(RedappDesign.ink)
+            .background(RedappDesign.panel, in: Capsule())
+            .overlay(Capsule().strokeBorder(RedappDesign.hairline, lineWidth: 1))
         }
         .buttonStyle(.plain)
         .shadow(color: .black.opacity(0.18), radius: 10, y: 4)
@@ -642,15 +667,18 @@ struct WebAIHandoffFloatingPanelModifier: ViewModifier {
                 HStack(spacing: 12) {
                     Image(systemName: "globe")
                         .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(RedappDesign.accent)
+                        .frame(width: 32, height: 32)
+                        .background(RedappDesign.accentSoft, in: RoundedRectangle(cornerRadius: RedappDesign.Radius.small, style: .continuous))
 
                     VStack(alignment: .leading, spacing: 2) {
                         Text(request.title)
                             .font(.headline)
+                            .foregroundStyle(RedappDesign.ink)
                             .lineLimit(1)
                         Text(request.provider.displayName)
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(RedappDesign.inkSecondary)
                     }
                 }
 
@@ -658,7 +686,7 @@ struct WebAIHandoffFloatingPanelModifier: ViewModifier {
 
                 Image(systemName: "line.3.horizontal")
                     .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(RedappDesign.inkSecondary)
                     .frame(width: 28, height: 28)
                     .contentShape(Rectangle())
                     .gesture(panelDragGesture(containerSize: containerSize))
@@ -669,7 +697,7 @@ struct WebAIHandoffFloatingPanelModifier: ViewModifier {
                 } label: {
                     ZStack {
                         Circle()
-                            .fill(.thinMaterial)
+                            .fill(RedappDesign.elevated)
                             .frame(width: 32, height: 32)
                         Image(systemName: "minus")
                             .font(.system(size: 12, weight: .bold))
@@ -687,7 +715,7 @@ struct WebAIHandoffFloatingPanelModifier: ViewModifier {
                 } label: {
                     ZStack {
                         Circle()
-                            .fill(.thinMaterial)
+                            .fill(RedappDesign.elevated)
                             .frame(width: 32, height: 32)
                         Image(systemName: "xmark")
                             .font(.system(size: 11, weight: .bold))
@@ -707,7 +735,9 @@ struct WebAIHandoffFloatingPanelModifier: ViewModifier {
             .contentShape(Rectangle())
             .zIndex(2)
 
-            Divider()
+            Rectangle()
+                .fill(RedappDesign.hairline)
+                .frame(height: 1)
 
             WebAIHandoffView(request: request, showsChrome: false)
                 .environmentObject(appState)
@@ -717,16 +747,16 @@ struct WebAIHandoffFloatingPanelModifier: ViewModifier {
         }
         .background(
             RoundedRectangle(cornerRadius: 26, style: .continuous)
-                .fill(.ultraThickMaterial)
+                .fill(RedappDesign.panel)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 26, style: .continuous)
-                .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
+                .strokeBorder(RedappDesign.hairline, lineWidth: 1)
         )
         .overlay(alignment: .bottomTrailing) {
             Image(systemName: "arrow.up.left.and.arrow.down.right")
                 .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(RedappDesign.inkSecondary)
                 .frame(width: 34, height: 34)
                 .contentShape(Rectangle())
                 .padding(12)
@@ -746,19 +776,22 @@ struct WebAIHandoffFloatingPanelModifier: ViewModifier {
                         .controlSize(.small)
                 } else {
                     Image(systemName: "globe")
+                        .foregroundStyle(RedappDesign.accent)
                 }
                 VStack(alignment: .leading, spacing: 1) {
                     Text(request.title)
                         .lineLimit(1)
                     Text(request.shouldAutoCapture ? "\(request.provider.displayName) working · Tap to open" : "\(request.provider.displayName) ready · Tap to open")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(RedappDesign.inkSecondary)
                 }
             }
             .font(.subheadline.weight(.medium))
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
-            .background(.ultraThickMaterial, in: Capsule())
+            .foregroundStyle(RedappDesign.ink)
+            .background(RedappDesign.panel, in: Capsule())
+            .overlay(Capsule().strokeBorder(RedappDesign.hairline, lineWidth: 1))
         }
         .buttonStyle(.plain)
         .shadow(color: .black.opacity(0.18), radius: 12, y: 6)

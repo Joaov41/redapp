@@ -275,20 +275,14 @@ struct ResearchCommunitySummaryDocument: Hashable, Sendable {
 
 enum ResearchCommunityComparisonError: LocalizedError {
     case cloudProviderRequired(String)
-    case insufficientGroundedFindings(total: Int, first: Int, second: Int)
-    case insufficientThemeGroups(found: Int)
     case invalidThemePlan
 
     var errorDescription: String? {
         switch self {
         case .cloudProviderRequired(let provider):
-            return "Community comparisons use a remote summary provider. \(provider) is local; choose Gemini, Codex / Summarize, Apple Cloud, Apple PCC, or Web AI in Settings."
-        case .insufficientGroundedFindings(let total, let first, let second):
-            return "The draft verified only \(total) findings (\(first) supported by the first community and \(second) by the second). A broad comparison needs at least 6 verified findings, including 2 from each community, so no shallow partial report was saved."
-        case .insufficientThemeGroups(let found):
-            return "The draft produced only \(found) complete comparative \(found == 1 ? "theme" : "themes"). At least 3 themes must each explain the shared subject, both community perspectives, and the supported divergence, so the flat partial report was not saved."
+            return "Comparing communities needs an online model. \(provider) runs on this device; choose Gemini, Codex / Summarize, Apple Cloud, Apple PCC or Web AI in Settings."
         case .invalidThemePlan:
-            return "The comparison could not identify at least 3 concrete, non-overlapping themes supported by both communities. No vague fallback report was saved."
+            return "These two communities don’t seem to discuss this subject in a comparable way. Try a more specific subject."
         }
     }
 }
@@ -517,29 +511,48 @@ actor ResearchCommunityComparisonService {
                 Self.enforceTwoSidedComparisons(planned)
             )
         )
-        let polished = Self.cleanedComparisonResponse(
+        // Notes the app wrote while checking the draft stay visible even when
+        // model-written limitations are dropped for broad theme reports.
+        let appNotes = checked.missingData.filter { note in
+            ResearchEvidenceValidator.isValidationNote(note)
+                || !generated.response.missingData.contains(note)
+        }
+        let cleaned = Self.cleanedComparisonResponse(
             checked,
             coverage: coverage,
             includeModelLimitations: !broadThemeRequest
         )
-        if broadThemeRequest {
-            let sideCounts = Self.supportedSideCounts(in: polished.claims)
-            guard polished.claims.count >= 6,
-                  sideCounts.first >= 2,
-                  sideCounts.second >= 2 else {
-                throw ResearchCommunityComparisonError.insufficientGroundedFindings(
-                    total: polished.claims.count,
-                    first: sideCounts.first,
-                    second: sideCounts.second
-                )
-            }
-            let completeThemes = Self.completeThemeCount(in: polished.claims)
-            guard completeThemes >= 3 else {
-                throw ResearchCommunityComparisonError.insufficientThemeGroups(found: completeThemes)
-            }
-        } else if polished.claims.isEmpty {
+        guard !cleaned.claims.isEmpty else {
             throw GroundedResearchError.noSupportedClaims
         }
+        // The specific quote-selection note below replaces the generic one.
+        var notes = cleaned.missingData.filter { $0 != Self.selectionLimitationNote }
+        for note in appNotes where !notes.contains(note) && note != Self.selectionLimitationNote {
+            notes.append(note)
+        }
+        notes.append(
+            Self.quoteSelectionNote(
+                firstName: firstName,
+                firstSources: firstSources,
+                first: first,
+                secondName: secondName,
+                secondSources: secondSources,
+                second: second
+            )
+        )
+        if let limitedEvidence = Self.limitedEvidenceNote(
+            claims: cleaned.claims,
+            broadThemeRequest: broadThemeRequest
+        ) {
+            notes.insert(limitedEvidence, at: 0)
+        }
+        let polished = ValidatedGroundedResponse(
+            title: cleaned.title,
+            overview: cleaned.overview,
+            claims: cleaned.claims,
+            conflicts: cleaned.conflicts,
+            missingData: notes
+        )
         await progress?(0.92, "Verified source links; saving the comparison…")
         return ResearchCommunityComparisonGenerationResult(
             response: polished,
@@ -550,11 +563,56 @@ actor ResearchCommunityComparisonService {
         )
     }
 
+    static let limitedEvidencePrefix = "Limited evidence:"
+
+    /// A short comparison is shown with this warning instead of being thrown
+    /// away, so the person can judge it or try a narrower subject.
+    static func limitedEvidenceNote(
+        claims: [ResearchClaimInput],
+        broadThemeRequest: Bool
+    ) -> String? {
+        let sideCounts = supportedSideCounts(in: claims)
+        let isThin: Bool
+        if broadThemeRequest {
+            isThin = claims.count < 6
+                || sideCounts.first < 2
+                || sideCounts.second < 2
+                || completeThemeCount(in: claims) < 3
+        } else {
+            isThin = sideCounts.first == 0 || sideCounts.second == 0
+        }
+        guard isThin else { return nil }
+        return "\(limitedEvidencePrefix) only \(claims.count) \(claims.count == 1 ? "finding" : "findings") could be linked to quotes (\(sideCounts.first) from the first community, \(sideCounts.second) from the second). Treat this as a rough first look, or try a narrower subject."
+    }
+
+    static func isLimitedEvidenceNote(_ note: String) -> Bool {
+        note.hasPrefix(limitedEvidencePrefix)
+    }
+
+    /// States plainly that quotes come from a selection of each saved batch.
+    private static func quoteSelectionNote(
+        firstName: String,
+        firstSources: [ResearchSourceInput],
+        first: ResearchRunDetail,
+        secondName: String,
+        secondSources: [ResearchSourceInput],
+        second: ResearchRunDetail
+    ) -> String {
+        func postCounts(_ selected: [ResearchSourceInput], _ detail: ResearchRunDetail) -> (Int, Int) {
+            let selectedPosts = Set(selected.map(\.postSourceID)).count
+            let savedPosts = Set(detail.sources.map(\.postSourceID)).count
+            return (selectedPosts, max(savedPosts, selectedPosts))
+        }
+        let (firstSelected, firstSaved) = postCounts(firstSources, first)
+        let (secondSelected, secondSaved) = postCounts(secondSources, second)
+        return "Every saved post summary was read, but quotes were picked from \(firstSelected) of \(firstSaved) saved posts in \(firstName) and \(secondSelected) of \(secondSaved) in \(secondName)."
+    }
+
     static func isCloudComparisonProvider(_ provider: SummaryProvider) -> Bool {
         switch provider {
         case .appleLocal, .mlxLocal, .coreAIMLXLocal:
             return false
-        case .gemini, .appleCloud, .webAI, .summarizeDaemon, .applePCCGateway:
+        case .gemini, .appleCloud, .webAI, .summarizeDaemon, .applePCCGateway, .chatGPT:
             return true
         }
     }
@@ -1294,8 +1352,10 @@ actor ResearchCommunityComparisonService {
     static func removingCitationSelectionLimitations(
         _ response: ValidatedGroundedResponse
     ) -> ValidatedGroundedResponse {
+        // The model often describes the quote selection in confusing terms
+        // ("snippets", "subset of the corpus"). Those notes are replaced with one
+        // plain statement written by the app, never silently dropped.
         let misleadingTerms = [
-            "unverified model claim omitted",
             "available snippets",
             "provided snippets",
             "only snippets",
@@ -1325,22 +1385,15 @@ actor ResearchCommunityComparisonService {
             "short or truncated content",
             "very short or truncated",
             "supplied original sources",
-            "digest-guided themes",
-            "source search considered material from",
-            "links shown are selected examples",
-            "links shown are the strongest matching examples"
+            "digest-guided themes"
         ]
         let pseudoSelectionPatterns = [
             #"(?i)\b(?:provided|supplied|available)\b.{0,80}\b(?:extracts?|excerpts?|snippets?)\b.{0,80}\b(?:quotable|quoteable|quotations?|quotes?)\b"#,
             #"(?i)\bonly\s+used\b.{0,80}\b(?:extracts?|excerpts?|snippets?)\b"#,
             #"(?i)\b(?:selected|supplied|provided)\s+(?:citation\s+)?sources?\b.{0,80}\b(?:complete\s+context|corpus\s+coverage)\b"#
         ]
-        let rejectedCount = response.missingData.reduce(into: 0) { count, note in
-            if note.lowercased().hasPrefix("unverified model claim omitted:") {
-                count += 1
-            }
-        }
         let limitations = response.missingData.filter { note in
+            guard !ResearchEvidenceValidator.isValidationNote(note) else { return true }
             let normalized = note
                 .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
                 .lowercased()
@@ -1349,17 +1402,17 @@ actor ResearchCommunityComparisonService {
                 normalized.range(of: pattern, options: .regularExpression) != nil
             }
         }
-        let validationSummary: [String] = rejectedCount == 0
-            ? []
-            : ["\(rejectedCount) draft \(rejectedCount == 1 ? "finding was" : "findings were") omitted because the supporting quotes could not be verified against the saved sources."]
+        let replacedSelectionNotes = limitations.count < response.missingData.count
         return ValidatedGroundedResponse(
             title: response.title,
             overview: response.overview,
             claims: response.claims,
             conflicts: response.conflicts,
-            missingData: limitations + validationSummary
+            missingData: limitations + (replacedSelectionNotes ? [selectionLimitationNote] : [])
         )
     }
+
+    static let selectionLimitationNote = "Quotes come from a selection of the saved posts and comments, so some saved discussion isn’t quoted here."
 
     /// Returns only prose before the generated claim list. This lets callers show
     /// the stored overview alongside structured claims without rendering claims twice.
@@ -1410,89 +1463,6 @@ actor ResearchCommunityComparisonService {
 }
 
 @MainActor
-struct ResearchCommunityComparisonPickerView: View {
-    let baseRunID: UUID
-    @ObservedObject private var store = ResearchLibraryStore.shared
-    @State private var baseRun: ResearchRunRecord?
-    @State private var candidates: [ResearchRunRecord] = []
-    @State private var errorMessage: String?
-
-    var body: some View {
-        List {
-            if let baseRun {
-                Section("First community") { snapshotRow(baseRun, compatibility: nil) }
-                Section {
-                    if candidates.isEmpty {
-                        ContentUnavailableView(
-                            "No Other Communities Saved",
-                            systemImage: "person.2.slash",
-                            description: Text("Save a batch from another subreddit, then return here to compare it.")
-                        )
-                    } else {
-                        ForEach(candidates) { candidate in
-                            NavigationLink(value: ResearchLibraryRoute.communitySetup(
-                                firstRunID: baseRun.id,
-                                secondRunID: candidate.id
-                            )) {
-                                snapshotRow(
-                                    candidate,
-                                    compatibility: ResearchCommunityCompatibility.evaluate(
-                                        base: baseRun,
-                                        candidate: candidate
-                                    )
-                                )
-                            }
-                        }
-                    }
-                } header: {
-                    Text("Choose another community")
-                } footer: {
-                    Text("Best-matched saved batches appear first. You can still use a comparison with caveats.")
-                }
-            } else { ProgressView() }
-        }
-        .navigationTitle("Compare Communities")
-        .task { load() }
-        .alert("Comparison unavailable", isPresented: Binding(
-            get: { errorMessage != nil },
-            set: { if !$0 { errorMessage = nil } }
-        )) { Button("OK", role: .cancel) {} } message: {
-            Text(errorMessage ?? "Unknown error")
-        }
-    }
-
-    private func snapshotRow(
-        _ run: ResearchRunRecord,
-        compatibility: ResearchCommunityCompatibility?
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack {
-                Text("r/\(run.subreddit)").font(.headline)
-                Spacer()
-                if let compatibility {
-                    Text(compatibility.label)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(compatibility.score >= 82 ? .green : .orange)
-                }
-            }
-            Text(ResearchCaptureLabel.displayName(sortMode: run.sortMode, timeRange: run.timeRange))
-                .font(.subheadline)
-            Text("\(run.capturedAt.formatted(date: .abbreviated, time: .shortened)) · \(run.coverage.postsAnalyzed) posts · \(run.coverage.commentsAnalyzed) comments")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-        .padding(.vertical, 3)
-    }
-
-    private func load() {
-        do {
-            baseRun = try store.run(id: baseRunID)
-            candidates = try store.communityComparisonRuns(for: baseRunID)
-        } catch { errorMessage = error.localizedDescription }
-    }
-}
-
-@MainActor
 struct ResearchCommunityComparisonSetupView: View {
     let firstRunID: UUID
     let secondRunID: UUID
@@ -1505,6 +1475,12 @@ struct ResearchCommunityComparisonSetupView: View {
 
     private var trimmedSubject: String {
         subject.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var hasOnlineModel: Bool {
+        ResearchCommunityComparisonService.isCloudComparisonProvider(
+            SummaryService.shared.settings.selectedSummaryProvider
+        )
     }
 
     var body: some View {
@@ -1547,7 +1523,7 @@ struct ResearchCommunityComparisonSetupView: View {
             VStack(alignment: .leading, spacing: 7) {
                 Text("What should we compare?")
                     .font(.title2.weight(.semibold))
-                Text("Choose one subject. The report will trace that subject through both saved discussions.")
+                Text("Pick one subject, like a product, a problem or a decision. The comparison shows how each community talks about it.")
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -1597,7 +1573,7 @@ struct ResearchCommunityComparisonSetupView: View {
                 .fixedSize(horizontal: false, vertical: true)
 
                 if !compatibility.warnings.isEmpty {
-                    DisclosureGroup("Comparison notes") {
+                    DisclosureGroup("Why this match isn’t perfect") {
                         VStack(alignment: .leading, spacing: 6) {
                             ForEach(compatibility.warnings, id: \.self) { warning in
                                 Label(warning, systemImage: "info.circle")
@@ -1611,6 +1587,14 @@ struct ResearchCommunityComparisonSetupView: View {
                 }
             }
 
+            if !hasOnlineModel {
+                RedappInlineMessage(
+                    title: "Needs an online model",
+                    message: "Comparing subreddits reads every saved summary from both feeds, which on-device models can’t handle. Choose Gemini, Codex / Summarize, Apple Cloud, Apple PCC or Web AI in Settings.",
+                    kind: .warning
+                )
+            }
+
             HStack {
                 Spacer()
                 Button {
@@ -1619,9 +1603,8 @@ struct ResearchCommunityComparisonSetupView: View {
                     Text("Create comparison")
                         .frame(minWidth: 120)
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-                .disabled(trimmedSubject.count < 3)
+                .buttonStyle(RedappPrimaryButtonStyle(isCapsule: true))
+                .disabled(trimmedSubject.count < 3 || !hasOnlineModel)
                 .keyboardShortcut(.defaultAction)
             }
         }
@@ -1727,6 +1710,19 @@ struct ResearchCommunityComparisonView: View {
                             }
                         }
                     }
+                    if let limitedEvidence = artifact.missingData.first(where: ResearchCommunityComparisonService.isLimitedEvidenceNote) {
+                        Section {
+                            RedappInlineMessage(
+                                title: "Limited evidence",
+                                message: String(limitedEvidence.dropFirst(ResearchCommunityComparisonService.limitedEvidencePrefix.count))
+                                    .trimmingCharacters(in: .whitespaces)
+                                    .capitalizingFirstLetter(),
+                                kind: .warning
+                            )
+                        }
+                        .listRowBackground(Color.clear)
+                        .listRowInsets(EdgeInsets())
+                    }
                     if (artifact.generationReceipt?.promptVersion ?? 0) < 8 {
                         comparisonUpgradeSection(record: record, first: first, second: second)
                     }
@@ -1793,18 +1789,14 @@ struct ResearchCommunityComparisonView: View {
         first: ResearchRunDetail,
         second: ResearchRunDetail
     ) -> some View {
-        Section("Improved analysis available") {
-            Label(
-                "This report predates the grouped comparative-theme format.",
-                systemImage: "sparkles"
-            )
-            Text("Regenerate it to preselect concrete shared themes, remove forced umbrella topics, and use a more concise evidence layout.")
+        Section("A clearer version is available") {
+            Text("Update this comparison to group its findings into a few clear shared themes.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Button {
                 startGeneration(record: record, first: first, second: second)
             } label: {
-                Label("Regenerate with planned themes", systemImage: "arrow.triangle.2.circlepath")
+                Label("Update comparison", systemImage: "arrow.triangle.2.circlepath")
             }
             .disabled(job?.phase == .running || isAskingQuestion)
         }
@@ -1826,12 +1818,12 @@ struct ResearchCommunityComparisonView: View {
                         ProgressView().controlSize(.small)
                         Text(
                             ResearchCommunityComparisonStoredState.decode(record.compatibilityJSON).digestCache == nil
-                                ? "Preparing complete context from both batches…"
-                                : "Using the saved complete comparison context…"
+                                ? "Reading both saved feeds…"
+                                : "Finding the answer…"
                         )
                     }
                 } else {
-                    Label("Ask using the same saved evidence", systemImage: "bubble.left.and.text.bubble.right")
+                    Label("Ask", systemImage: "bubble.left.and.text.bubble.right")
                 }
             }
             .disabled(isAskingQuestion || question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
@@ -1842,7 +1834,7 @@ struct ResearchCommunityComparisonView: View {
         } header: {
             Text("Ask about both communities")
         } footer: {
-            Text("Answers reuse the complete saved comparison context, stay limited to these two batches, and select fresh supporting links for each question.")
+            Text("Answers use only these two saved feeds and link each point to quotes.")
         }
     }
 
@@ -1858,11 +1850,6 @@ struct ResearchCommunityComparisonView: View {
             claimTexts: answerClaims.map(\.text)
         )
         return DisclosureGroup(answer.title.replacingOccurrences(of: prefix, with: "")) {
-            if (answer.generationReceipt?.promptVersion ?? 0) < 5 {
-                Label("Created with the previous representative-source method", systemImage: "clock.arrow.circlepath")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
             HStack {
                 Spacer()
                 ResearchMLXSpeechControls(
@@ -1918,7 +1905,7 @@ struct ResearchCommunityComparisonView: View {
                 }
             }
             if !answer.missingData.isEmpty {
-                Text("What this answer could not establish")
+                Text("What the saved posts can’t tell you")
                     .font(.headline)
                 ForEach(answer.missingData, id: \.self) { note in
                     Label(note, systemImage: "questionmark.circle")
@@ -1942,11 +1929,14 @@ struct ResearchCommunityComparisonView: View {
             let secondCount = ResearchCommunityComparisonService.postSummaryCount(
                 in: ResearchCommunityComparisonService.summaryDocuments(from: second)
             )
-            Section("Coverage") {
-                Text("All \(firstCount) available saved post summaries from r/\(first.run.subreddit) and all \(secondCount) from r/\(second.run.subreddit) were considered. Those summaries were created from \(first.run.coverage.commentsAnalyzed + second.run.coverage.commentsAnalyzed) analyzed comments.")
-                Text("Supporting links are representative original posts and comments selected to verify the findings.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            Section {
+                DisclosureGroup("About this data") {
+                    Text("Every saved post summary was read: \(firstCount) from r/\(first.run.subreddit) and \(secondCount) from r/\(second.run.subreddit), written from \(first.run.coverage.commentsAnalyzed + second.run.coverage.commentsAnalyzed) comments.")
+                        .font(.caption)
+                    Text("Quotes come from a selection of the original posts and comments, and each quote is checked to make sure it supports its point.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
         }
         if let overview = ResearchCommunityComparisonService.overviewPrefix(
@@ -1960,7 +1950,7 @@ struct ResearchCommunityComparisonView: View {
         }
         Section("Listen") {
             HStack {
-                Text("Read this comparison aloud with MLX TTS")
+                Text("Read this comparison aloud")
                     .foregroundStyle(.secondary)
                 Spacer()
                 ResearchMLXSpeechControls(
@@ -1997,9 +1987,10 @@ struct ResearchCommunityComparisonView: View {
                 ForEach(artifact.conflicts, id: \.self) { Text($0) }
             }
         }
-        if !artifact.missingData.isEmpty {
-            Section("What this comparison could not establish") {
-                ForEach(artifact.missingData, id: \.self) { Text($0) }
+        let notes = artifact.missingData.filter { !ResearchCommunityComparisonService.isLimitedEvidenceNote($0) }
+        if !notes.isEmpty {
+            Section("What the saved posts can’t tell you") {
+                ForEach(notes, id: \.self) { Text($0) }
             }
         }
     }
@@ -2114,14 +2105,17 @@ struct ResearchCommunityComparisonView: View {
         switch confidence {
         case .high: return "Supported by several saved sources"
         case .medium: return "Supported by more than one saved source"
-        case .low: return "Limited saved evidence"
-        case .unverified: return "Not enough saved evidence"
+        case .low: return "Thin support"
+        case .unverified: return "Not checked"
         }
     }
 
     private func sourceLabel(_ encodedID: String) -> String {
-        guard let reference = ResearchCommunitySourceReference.parse(encodedID) else { return encodedID }
-        return "r/\(reference.subreddit) · \(reference.sourceID)"
+        guard let reference = ResearchCommunitySourceReference.parse(encodedID) else { return "Saved source" }
+        guard let source = try? store.source(runID: reference.runID, sourceID: reference.sourceID) else {
+            return "r/\(reference.subreddit)"
+        }
+        return "r/\(reference.subreddit) · \(ResearchSourceLabel.text(for: source))"
     }
 
     private func openSource(_ encodedID: String) {
@@ -2440,6 +2434,10 @@ struct ResearchCommunityComparisonView: View {
 }
 
 private extension String {
+    func capitalizingFirstLetter() -> String {
+        prefix(1).uppercased() + dropFirst()
+    }
+
     var nilIfBlank: String? {
         let value = trimmingCharacters(in: .whitespacesAndNewlines)
         return value.isEmpty ? nil : value

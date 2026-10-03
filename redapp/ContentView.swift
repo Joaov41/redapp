@@ -36,14 +36,12 @@ func normalizeRedditPermalink(_ permalink: String) -> String {
     
     // If permalink already contains full URL, return as is
     if trimmedPermalink.hasPrefix("https://reddit.com") || trimmedPermalink.hasPrefix("https://www.reddit.com") {
-        print("DEBUG normalizeRedditPermalink: Already full URL - '\(trimmedPermalink)'")
         return trimmedPermalink
     }
     
     // If it starts with http:// (not https), update to https
     if trimmedPermalink.hasPrefix("http://reddit.com") || trimmedPermalink.hasPrefix("http://www.reddit.com") {
         let result = trimmedPermalink.replacingOccurrences(of: "http://", with: "https://")
-        print("DEBUG normalizeRedditPermalink: Converted http to https - '\(trimmedPermalink)' -> '\(result)'")
         return result
     }
     
@@ -52,7 +50,6 @@ func normalizeRedditPermalink(_ permalink: String) -> String {
     
     // Otherwise, prepend the domain
     let result = "https://reddit.com\(cleanedPermalink)"
-    print("DEBUG normalizeRedditPermalink: Added domain - '\(trimmedPermalink)' -> '\(result)'")
     return result
 }
 
@@ -91,7 +88,23 @@ private func redditTextWithMarkdownLinks(from text: String) -> String {
     return textWithMarkdownLinks
 }
 
+/// Parsed Reddit text, keyed by the source string. Views ask for this on every
+/// redraw, so parsing once and reusing the result keeps taps and scrolling snappy.
+private final class RedditAttributedTextBox {
+    let value: AttributedString
+    init(_ value: AttributedString) { self.value = value }
+}
+private let redditAttributedTextCache: NSCache<NSString, RedditAttributedTextBox> = {
+    let cache = NSCache<NSString, RedditAttributedTextBox>()
+    cache.countLimit = 2_000
+    return cache
+}()
+
 private func makeRedditAttributedText(from text: String, debugContext: String? = nil) -> AttributedString? {
+    let key = text as NSString
+    if let cached = redditAttributedTextCache.object(forKey: key) {
+        return cached.value
+    }
     do {
         let textWithMarkdownLinks = redditTextWithMarkdownLinks(from: text)
 #if os(iOS)
@@ -100,9 +113,7 @@ private func makeRedditAttributedText(from text: String, debugContext: String? =
 #else
         let attributedText = try AttributedString(markdown: textWithMarkdownLinks)
 #endif
-        if let debugContext {
-            print("Attributed String Created Successfully for \(debugContext)")
-        }
+        redditAttributedTextCache.setObject(RedditAttributedTextBox(attributedText), forKey: key)
         return attributedText
     } catch {
         if let debugContext {
@@ -113,7 +124,7 @@ private func makeRedditAttributedText(from text: String, debugContext: String? =
 }
 
 #if os(iOS)
-private func configureBackgroundAudioSession() {
+func configureBackgroundAudioSession() {
     let audioSession = AVAudioSession.sharedInstance()
 
     do {
@@ -251,12 +262,13 @@ struct AppColors {
 // MARK: - Data Models
 
 struct MediaMetadata: Codable {
+    // Reddit omits most fields while an upload is still processing or has failed.
     let status: String
-    let e: String
+    let e: String?
     let m: String?
     let p: [MediaImage]?
     let s: MediaImage?
-    let id: String
+    let id: String?
 
     struct MediaImage: Codable {
         let y: Int?
@@ -297,7 +309,31 @@ struct SubredditResponse: Codable {
 struct SubredditDataContainer: Codable {
     let children: [SubredditPostContainer]
     let after: String?  // For pagination
+
+    enum CodingKeys: String, CodingKey {
+        case children, after
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        after = try container.decodeIfPresent(String.self, forKey: .after)
+        // Decode posts one by one so a single unusual post can't fail the whole feed.
+        var list = try container.nestedUnkeyedContainer(forKey: .children)
+        var decoded: [SubredditPostContainer] = []
+        while !list.isAtEnd {
+            do {
+                decoded.append(try list.decode(SubredditPostContainer.self))
+            } catch {
+                print("⚠️ Skipping a post that couldn't be decoded: \(error)")
+                _ = try? list.decode(SkippedListingItem.self)
+            }
+        }
+        children = decoded
+    }
 }
+
+/// Consumes one listing element that failed to decode, so decoding can continue.
+private struct SkippedListingItem: Decodable {}
 
 struct SubredditPostContainer: Codable {
     let data: SubredditPostData
@@ -354,6 +390,8 @@ struct SubredditPostData: Codable, Identifiable {
     let stickied: Bool?
     let author: String?
     let subreddit: String?
+    let over_18: Bool?
+    let spoiler: Bool?
     
     // Processed content fields (not encoded/decoded)
     var processedSelftext: String = ""
@@ -361,7 +399,39 @@ struct SubredditPostData: Codable, Identifiable {
     var links: [(String, URL)] = []
     
     enum CodingKeys: String, CodingKey {
-        case id, title, selftext, ups, num_comments, created_utc, permalink, thumbnail, url, preview, media_metadata, gallery_data, stickied, author, subreddit
+        case id, title, selftext, ups, num_comments, created_utc, permalink, thumbnail, url, preview, media_metadata, gallery_data, stickied, author, subreddit, over_18, spoiler
+    }
+
+    /// Small image for the feed row: the smallest preview that is still sharp at
+    /// ~64 pt, then a gallery preview, then Reddit's own thumbnail.
+    var feedThumbnailURL: URL? {
+        func clean(_ string: String) -> URL? {
+            URL(string: string.replacingOccurrences(of: "&amp;", with: "&"))
+        }
+        if let image = preview?.images.first {
+            let sharp = image.resolutions.first(where: { $0.width >= 140 }) ?? image.resolutions.last
+            let candidate = sharp ?? image.source
+            if let url = clean(candidate.url) {
+                return url
+            }
+        }
+        if let media = media_metadata, !media.isEmpty {
+            let orderedIDs = gallery_data?.items.map(\.media_id) ?? Array(media.keys)
+            for id in orderedIDs {
+                guard let item = media[id], item.status == "valid" else { continue }
+                let small = item.p?.first(where: { ($0.x ?? 0) >= 140 }) ?? item.p?.last ?? item.s
+                if let u = small?.u, let url = clean(u) { return url }
+            }
+        }
+        if let thumb = thumbnail, thumb.hasPrefix("http"), let url = clean(thumb) {
+            return url
+        }
+        return nil
+    }
+
+    /// NSFW or spoiler images are blurred in the feed.
+    var hidesThumbnail: Bool {
+        (over_18 ?? false) || (spoiler ?? false)
     }
 
     var previewText: String {
@@ -464,7 +534,7 @@ struct GalleryData: Codable {
 
 struct GalleryItem: Codable {
     let media_id: String
-    let id: Int
+    let id: Int?
 }
 
 struct MediaImage: Codable {
@@ -848,9 +918,40 @@ final class AppState: ObservableObject {
         let onFailure: (String) -> Void
     }
 
-    private var pendingWebAIRequests: [UUID: PendingWebAIRequest] = [:]
+    private var pendingWebAIRequests: [UUID: PendingWebAIRequest] = [:] {
+        didSet { syncWebAIBackgroundWork() }
+    }
+
+    #if os(iOS)
+    /// Each Web AI request runs under the continued-processing task, released however the request ends.
+    private var webAIBackgroundHandles: [UUID: GeminiBackgroundTaskHandle] = [:]
+    private var webAIKeepAliveTimer: Timer?
+    #endif
 
     private init() {}
+
+    private func syncWebAIBackgroundWork() {
+        #if os(iOS)
+        for (requestID, handle) in webAIBackgroundHandles where pendingWebAIRequests[requestID] == nil {
+            handle.finish(success: true)
+            webAIBackgroundHandles.removeValue(forKey: requestID)
+        }
+
+        if pendingWebAIRequests.isEmpty {
+            webAIKeepAliveTimer?.invalidate()
+            webAIKeepAliveTimer = nil
+        } else if webAIKeepAliveTimer == nil {
+            // Off screen, WebKit puts the page to sleep and the reply stops streaming in.
+            // Each script call wakes it briefly, so ping it while a reply is pending.
+            webAIKeepAliveTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
+                MainActor.assumeIsolated {
+                    guard UIApplication.shared.applicationState != .active else { return }
+                    WebAISessionManager.shared.keepWebViewsAwake()
+                }
+            }
+        }
+        #endif
+    }
 
     func setStatus(_ status: SubredditStatus, for subreddit: String) {
         let key = subreddit.lowercased()
@@ -935,6 +1036,12 @@ final class AppState: ObservableObject {
             shouldStartMinimized: true
         )
 
+        #if os(iOS)
+        webAIBackgroundHandles[request.id] = GeminiBackgroundTaskManager.shared.beginLongRunningTask(
+            identifier: .geminiProcessing,
+            title: "\(selectedProvider.displayName): \(title)"
+        )
+        #endif
         pendingWebAIRequests[request.id] = PendingWebAIRequest(
             title: title,
             responseFormat: responseFormat,
@@ -1223,6 +1330,8 @@ enum SummaryProvider: String, CaseIterable, Codable {
     case webAI = "Web AI"
     case summarizeDaemon = "Codex / Summarize"
     case applePCCGateway = "Apple PCC Gateway"
+    /// The user's own ChatGPT plan via Sign in with ChatGPT. Local builds only.
+    case chatGPT = "ChatGPT"
 
     var displayName: String {
         switch self {
@@ -1456,6 +1565,11 @@ struct AppSettings: Codable {
     var pccGatewayHost: String = "127.0.0.1"
     var pccGatewayPort: Int = AppSettings.defaultPCCGatewayPort
     var pccGatewayModel: String = AppSettings.defaultPCCGatewayModel
+    // ChatGPT plan model slug; empty picks the first model in the account's catalog.
+    var chatGPTModel: String = ""
+    // Empty means the model's default reasoning effort.
+    var chatGPTReasoningEffort: String = ""
+    var chatGPTFastMode: Bool = false
 
     enum CodingKeys: String, CodingKey {
         case geminiApiKey
@@ -1487,6 +1601,9 @@ struct AppSettings: Codable {
         case pccGatewayHost
         case pccGatewayPort
         case pccGatewayModel
+        case chatGPTModel
+        case chatGPTReasoningEffort
+        case chatGPTFastMode
     }
 
     init() { }
@@ -1512,6 +1629,9 @@ struct AppSettings: Codable {
         } else {
             selectedSummaryProvider = .gemini
         }
+        if selectedSummaryProvider == .chatGPT && !ChatGPTPlanAvailability.isEnabled {
+            selectedSummaryProvider = .gemini
+        }
         selectedWebAIProvider = try container.decodeIfPresent(WebAIProvider.self, forKey: .selectedWebAIProvider) ?? .chatgpt
 
         appleCloudShortcutName = try container.decodeIfPresent(String.self, forKey: .appleCloudShortcutName) ?? "redapp"
@@ -1529,6 +1649,9 @@ struct AppSettings: Codable {
         pccGatewayHost = try container.decodeIfPresent(String.self, forKey: .pccGatewayHost) ?? "127.0.0.1"
         pccGatewayPort = try container.decodeIfPresent(Int.self, forKey: .pccGatewayPort) ?? AppSettings.defaultPCCGatewayPort
         pccGatewayModel = try container.decodeIfPresent(String.self, forKey: .pccGatewayModel) ?? AppSettings.defaultPCCGatewayModel
+        chatGPTModel = try container.decodeIfPresent(String.self, forKey: .chatGPTModel) ?? ""
+        chatGPTReasoningEffort = try container.decodeIfPresent(String.self, forKey: .chatGPTReasoningEffort) ?? ""
+        chatGPTFastMode = try container.decodeIfPresent(Bool.self, forKey: .chatGPTFastMode) ?? false
 
         if !LocalTTSEngine.availableEngines.contains(localTTSEngine) {
             localTTSEngine = .system
@@ -1591,6 +1714,9 @@ struct AppSettings: Codable {
         try container.encode(pccGatewayHost, forKey: .pccGatewayHost)
         try container.encode(pccGatewayPort, forKey: .pccGatewayPort)
         try container.encode(pccGatewayModel, forKey: .pccGatewayModel)
+        try container.encode(chatGPTModel, forKey: .chatGPTModel)
+        try container.encode(chatGPTReasoningEffort, forKey: .chatGPTReasoningEffort)
+        try container.encode(chatGPTFastMode, forKey: .chatGPTFastMode)
     }
     
     static func load() -> AppSettings {
@@ -2094,6 +2220,7 @@ class SummaryService: ObservableObject {
     }
 
     func setSummaryProvider(_ provider: SummaryProvider) {
+        if provider == .chatGPT && !ChatGPTPlanAvailability.isEnabled { return }
         settings.selectedSummaryProvider = provider
         switch provider {
         case .mlxLocal:
@@ -2111,6 +2238,32 @@ class SummaryService: ObservableObject {
 
     func setWebAIProvider(_ provider: WebAIProvider) {
         settings.selectedWebAIProvider = provider
+    }
+
+    @MainActor
+    func setChatGPTModel(_ slug: String) {
+        settings.chatGPTModel = slug
+        // Keep the effort only if the new model offers it.
+        let effort = settings.chatGPTReasoningEffort
+        if !effort.isEmpty, !ChatGPTPlanService.shared.reasoningEfforts(forModel: slug).contains(effort) {
+            settings.chatGPTReasoningEffort = ""
+        }
+    }
+
+    func setChatGPTReasoningEffort(_ effort: String) {
+        settings.chatGPTReasoningEffort = effort
+    }
+
+    func setChatGPTFastMode(_ isFast: Bool) {
+        settings.chatGPTFastMode = isFast
+    }
+
+    /// Picks the account's first catalog model when none is saved. A saved slug
+    /// that is not listed is kept, so a model entered by name stays selected.
+    @MainActor
+    func normalizeChatGPTModelSelection(available models: [ChatGPTPlanModel]) {
+        guard let first = models.first, settings.chatGPTModel.isEmpty else { return }
+        setChatGPTModel(first.slug)
     }
 
     func setSummarizeDaemonHost(_ host: String) {
@@ -2763,11 +2916,11 @@ class SummaryService: ObservableObject {
 
         switch settings.selectedSummaryProvider {
         case .gemini:
-            return try await summarizeWithGemini(text: text, onPartial: onPartial)
+            return try await summarizeWithGemini(text: text)
         case .appleLocal:
             return try await summarizeWithAppleLocal(prompt: text, onPartial: onPartial)
         case .appleCloud:
-            return try await summarizeWithAppleCloud(prompt: text)
+            return try await summarizeWithAppleCloud(prompt: text, onPartial: onPartial)
         case .mlxLocal:
             return try await summarizeWithMLXLocal(prompt: text, onPartial: onPartial)
         case .coreAIMLXLocal:
@@ -2778,6 +2931,8 @@ class SummaryService: ObservableObject {
             return try await summarizeWithSummarizeDaemon(prompt: text, onPartial: onPartial)
         case .applePCCGateway:
             return try await summarizeWithApplePCCGateway(prompt: text, onPartial: onPartial)
+        case .chatGPT:
+            return try await summarizeWithChatGPT(prompt: text, onPartial: onPartial)
         }
     }
 
@@ -2882,6 +3037,62 @@ class SummaryService: ObservableObject {
         }
     }
 
+    private func summarizeWithChatGPT(
+        prompt: String,
+        onPartial: (@MainActor @Sendable (String) -> Void)? = nil
+    ) async throws -> String {
+        let sessionID = UUID()
+        let throughputCounter = MLXThroughputCounter(startTime: Date())
+        await MainActor.run {
+            beginMLXThroughputSession(sessionID, provider: .chatGPT)
+        }
+
+        // ChatGPT streams many tiny deltas; pass them on in batches so views
+        // re-render a few times a second instead of on every token.
+        let coalescer = await MainActor.run { ChatGPTStreamCoalescer { onPartial?($0) } }
+        let streamingPartialHandler: @MainActor @Sendable (String) -> Void = { chunk in
+            let chunkTokens = self.approximateTokenCount(from: chunk)
+            if let update = throughputCounter.recordUnits(chunkTokens, now: Date()) {
+                SummaryService.shared.updateMLXThroughputSession(
+                    sessionID,
+                    tokens: update.tokens,
+                    elapsed: update.elapsed,
+                    provider: .chatGPT
+                )
+            }
+            coalescer.append(chunk)
+        }
+
+        do {
+            let generatedText = try await ChatGPTPlanService.shared.generate(
+                prompt: prompt,
+                settings: settings,
+                onPartial: streamingPartialHandler
+            )
+            await MainActor.run { coalescer.flush() }
+            let finalSnapshot = throughputCounter.snapshot(now: Date())
+            let finalTokens = finalSnapshot.tokens > 0 ? finalSnapshot.tokens : approximateTokenCount(from: generatedText)
+            await MainActor.run {
+                finishMLXThroughputSession(
+                    sessionID,
+                    tokens: finalTokens,
+                    elapsed: finalSnapshot.elapsed,
+                    provider: .chatGPT
+                )
+            }
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 6_000_000_000)
+                clearMLXThroughputIfSessionMatches(sessionID)
+            }
+            return generatedText
+        } catch {
+            await MainActor.run {
+                clearMLXThroughputIfSessionMatches(sessionID)
+            }
+            throw error
+        }
+    }
+
     private func summarizeWithApplePCCGateway(
         prompt: String,
         onPartial: (@MainActor @Sendable (String) -> Void)? = nil
@@ -2953,19 +3164,9 @@ class SummaryService: ObservableObject {
         return BatchSummarizeResult(summary: result, didSwitchToAppleCloud: false)
     }
 
-    private func summarizeWithGemini(
-        text: String,
-        onPartial: (@MainActor @Sendable (String) -> Void)? = nil
-    ) async throws -> String {
+    private func summarizeWithGemini(text: String) async throws -> String {
         guard !settings.geminiApiKey.isEmpty else {
             throw NSError(domain: "SummaryService", code: 1, userInfo: [NSLocalizedDescriptionKey: "Gemini API key is missing."])
-        }
-        if let onPartial {
-            return try await summarizeWithGeminiStreaming(
-                text: text,
-                apiKey: settings.geminiApiKey,
-                onPartial: onPartial
-            )
         }
         return try await summarizeWithGeminiNonStreaming(text: text, apiKey: settings.geminiApiKey)
     }
@@ -2987,11 +3188,6 @@ class SummaryService: ObservableObject {
                         ["text": text]
                     ]
                 ]
-            ],
-            "generationConfig": [
-                "thinkingConfig": [
-                    "thinkingBudget": 0
-                ]
             ]
         ]
 
@@ -3011,136 +3207,6 @@ class SummaryService: ObservableObject {
         return try extractGeminiText(from: data)
     }
 
-    private func summarizeWithGeminiStreaming(
-        text: String,
-        apiKey: String,
-        onPartial: @MainActor @Sendable @escaping (String) -> Void
-    ) async throws -> String {
-        let sessionID = UUID()
-        let throughputCounter = MLXThroughputCounter(startTime: Date())
-        await MainActor.run {
-            beginMLXThroughputSession(sessionID, provider: .gemini)
-        }
-
-        let streamingPartialHandler: @MainActor @Sendable (String) -> Void = { chunk in
-            let chunkTokens = self.approximateTokenCount(from: chunk)
-            if let update = throughputCounter.recordUnits(chunkTokens, now: Date()) {
-                Task { @MainActor in
-                    SummaryService.shared.updateMLXThroughputSession(
-                        sessionID,
-                        tokens: update.tokens,
-                        elapsed: update.elapsed,
-                        provider: .gemini
-                    )
-                }
-            }
-            onPartial(chunk)
-        }
-
-        do {
-        guard let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:streamGenerateContent?alt=sse&key=\(apiKey)") else {
-            throw NSError(domain: "SummaryService", code: 2, userInfo: [NSLocalizedDescriptionKey: "Invalid Gemini streaming URL."])
-        }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
-
-        let requestBody: [String: Any] = [
-            "contents": [
-                [
-                    "parts": [
-                        ["text": text]
-                    ]
-                ]
-            ],
-            "generationConfig": [
-                "thinkingConfig": [
-                    "thinkingBudget": 0
-                ]
-            ]
-        ]
-
-        guard let httpBody = try? JSONSerialization.data(withJSONObject: requestBody, options: []) else {
-            throw NSError(domain: "SummaryService", code: 3, userInfo: [NSLocalizedDescriptionKey: "Failed to serialize request body."])
-        }
-        request.httpBody = httpBody
-
-        let (bytes, response) = try await NetworkService.shared.responsiveSession.bytes(for: request)
-        guard let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode) else {
-            throw NSError(
-                domain: "SummaryService",
-                code: 4,
-                userInfo: [NSLocalizedDescriptionKey: "Gemini streaming request failed with status \((response as? HTTPURLResponse)?.statusCode ?? -1)."]
-            )
-        }
-
-        var output = ""
-        for try await rawLine in bytes.lines {
-            if Task.isCancelled { throw CancellationError() }
-
-            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !line.isEmpty else { continue }
-            guard line.hasPrefix("data:") else { continue }
-
-            let payload = String(line.dropFirst(5)).trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !payload.isEmpty, payload != "[DONE]" else { continue }
-            guard let data = payload.data(using: .utf8) else { continue }
-
-            if let chunk = extractGeminiTextIfPresent(from: data), !chunk.isEmpty {
-                output += chunk
-                await MainActor.run {
-                    streamingPartialHandler(chunk)
-                }
-            }
-        }
-
-        let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty {
-            let finalSnapshot = throughputCounter.snapshot(now: Date())
-            let finalTokens = finalSnapshot.tokens > 0 ? finalSnapshot.tokens : self.approximateTokenCount(from: trimmed)
-            await MainActor.run {
-                finishMLXThroughputSession(
-                    sessionID,
-                    tokens: finalTokens,
-                    elapsed: finalSnapshot.elapsed,
-                    provider: .gemini
-                )
-            }
-            Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 6_000_000_000)
-                clearMLXThroughputIfSessionMatches(sessionID)
-            }
-            return trimmed
-        }
-
-        // Fallback for environments where streaming endpoint yields no chunks.
-        let fallback = try await summarizeWithGeminiNonStreaming(text: text, apiKey: apiKey)
-        await emitTextInChunks(fallback, chunkSize: 48, delayNanoseconds: 12_000_000, onPartial: streamingPartialHandler)
-        let finalSnapshot = throughputCounter.snapshot(now: Date())
-        let finalTokens = finalSnapshot.tokens > 0 ? finalSnapshot.tokens : self.approximateTokenCount(from: fallback)
-        await MainActor.run {
-            finishMLXThroughputSession(
-                sessionID,
-                tokens: finalTokens,
-                elapsed: finalSnapshot.elapsed,
-                provider: .gemini
-            )
-        }
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 6_000_000_000)
-            clearMLXThroughputIfSessionMatches(sessionID)
-        }
-        return fallback
-        } catch {
-            await MainActor.run {
-                clearMLXThroughputIfSessionMatches(sessionID)
-            }
-            throw error
-        }
-    }
-
     private func extractGeminiText(from data: Data) throws -> String {
         guard let json = try JSONSerialization.jsonObject(with: data, options: []) as? [String: Any],
               let candidates = json["candidates"] as? [[String: Any]],
@@ -3153,17 +3219,6 @@ class SummaryService: ObservableObject {
         }
 
         return generatedText
-    }
-
-    private func extractGeminiTextIfPresent(from data: Data) -> String? {
-        guard let json = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any],
-              let candidates = json["candidates"] as? [[String: Any]],
-              let firstCandidate = candidates.first,
-              let content = firstCandidate["content"] as? [String: Any],
-              let parts = content["parts"] as? [[String: Any]] else {
-            return nil
-        }
-        return parts.compactMap { $0["text"] as? String }.joined()
     }
 
     private func summarizeWithAppleLocal(
@@ -3417,7 +3472,50 @@ class SummaryService: ObservableObject {
         return generatedText
     }
 
-		    private func summarizeWithAppleCloud(prompt: String, maxRetries: Int = 2) async throws -> String {
+	    private func summarizeWithAppleCloud(
+	        prompt: String,
+	        maxRetries: Int = 2,
+	        onPartial: (@MainActor @Sendable (String) -> Void)? = nil
+	    ) async throws -> String {
+	        #if canImport(FoundationModels)
+	        if #available(iOS 27.0, macOS 27.0, *) {
+	            return try await summarizeWithPrivateCloudCompute(prompt: prompt, onPartial: onPartial)
+	        }
+	        #endif
+
+	        return try await summarizeWithAppleCloudShortcut(prompt: prompt, maxRetries: maxRetries)
+	    }
+
+	    #if canImport(FoundationModels)
+	    @available(iOS 27.0, macOS 27.0, *)
+	    private func summarizeWithPrivateCloudCompute(
+	        prompt: String,
+	        onPartial: (@MainActor @Sendable (String) -> Void)? = nil
+	    ) async throws -> String {
+	        print("☁️ [AppleCloud] Using Apple Private Cloud Compute (prompt: \(prompt.count) chars)")
+        let model = PrivateCloudComputeLanguageModel()
+        guard model.isAvailable else {
+            throw NSError(
+                domain: "SummaryService.AppleCloud",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Apple Private Cloud Compute is unavailable: \(model.availability)"]
+            )
+        }
+
+        let session = LanguageModelSession(model: model)
+        let response = try await session.respond(
+            to: prompt,
+            contextOptions: ContextOptions(reasoningLevel: .moderate)
+        )
+        let content = response.content.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let onPartial, !content.isEmpty {
+            await emitTextInChunks(content, chunkSize: 56, delayNanoseconds: 10_000_000, onPartial: onPartial)
+        }
+        return content
+    }
+    #endif
+
+	    private func summarizeWithAppleCloudShortcut(prompt: String, maxRetries: Int = 2) async throws -> String {
 		        // On Mac (iOS-on-Mac), use RSS shortcut which copies to clipboard
 		        // On iPad, use the configured shortcut which uses callback URL
 		        #if os(iOS)
@@ -4348,6 +4446,7 @@ class SummaryService: ObservableObject {
 
 // MARK: - Settings View
 struct SettingsView: View {
+    @AppStorage("FeedShowsThumbnails") private var feedShowsThumbnails = true
     @ObservedObject var summaryService = SummaryService.shared
     @ObservedObject var authManager = RedditAuthManager.shared
     @Environment(\.dismiss) private var dismiss
@@ -4384,6 +4483,7 @@ struct SettingsView: View {
     @State private var modelStorageStatus: String? = nil
     @State private var pendingModelStorageDelete: LocalModelStorageItem? = nil
     @State private var showModelStorageDeleteConfirm: Bool = false
+    @State private var showAdvancedSettings = false
     @AppStorage("experimentalSettingsGlassEnabled") private var experimentalSettingsGlassEnabled = true
     @AppStorage("experimentalSettingsGlassVariant") private var experimentalSettingsGlassVariant = 11
 
@@ -4422,7 +4522,7 @@ struct SettingsView: View {
     }
 
     private var settingsSurfaceBackground: Color {
-        settingsBackground
+        RedappDesign.canvas
     }
 
     private func launchWebAILogin(_ provider: WebAIProvider) {
@@ -4433,1148 +4533,14 @@ struct SettingsView: View {
     }
     
     var body: some View {
-        NavigationView {
+        NavigationStack {
             ZStack {
                 settingsSurfaceBackground
                     .ignoresSafeArea()
                 
                 Form {
-                Section {
-                    VStack(alignment: .leading, spacing: 10) {
-                        if useCompactSummaryProviderPicker {
-                            Picker("Summary Provider", selection: Binding(
-                                get: { summaryService.settings.selectedSummaryProvider },
-                                set: { summaryService.setSummaryProvider($0) }
-                            )) {
-                                ForEach(SummaryProvider.allCases, id: \.self) { provider in
-                                    Text(provider.displayName).tag(provider)
-                                }
-                            }
-                            .pickerStyle(.menu)
-                        } else {
-                            Picker("Summary Provider", selection: Binding(
-                                get: { summaryService.settings.selectedSummaryProvider },
-                                set: { summaryService.setSummaryProvider($0) }
-                            )) {
-                                ForEach(SummaryProvider.allCases, id: \.self) { provider in
-                                    Text(provider.displayName).tag(provider)
-                                }
-                            }
-                            .pickerStyle(SegmentedPickerStyle())
-                        }
-
-                        Picker("Web AI Destination", selection: Binding(
-                            get: { summaryService.settings.selectedWebAIProvider },
-                            set: { summaryService.setWebAIProvider($0) }
-                        )) {
-                            ForEach(WebAIProvider.allCases) { provider in
-                                Text(provider.displayName).tag(provider)
-                            }
-                        }
-                        .pickerStyle(.menu)
-
-                        VStack(alignment: .leading, spacing: 10) {
-                            Text("Persistent Web AI Sessions")
-                                .font(.subheadline)
-                                .fontWeight(.semibold)
-
-                            Text("Log in inside redapp so ChatGPT and Gemini sessions are reused by the in-app WebAI browser.")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-
-                            HStack(spacing: 10) {
-                                Button("Log In to ChatGPT") {
-                                    launchWebAILogin(.chatgpt)
-                                }
-                                .buttonStyle(LiquidGlassButtonStyle())
-
-                                Button("Reset ChatGPT") {
-                                    AppState.shared.resetWebAISession(for: .chatgpt)
-                                }
-                                .buttonStyle(LiquidGlassButtonStyle())
-                            }
-
-                            HStack(spacing: 10) {
-                                Button("Log In to Gemini") {
-                                    launchWebAILogin(.gemini)
-                                }
-                                .buttonStyle(LiquidGlassButtonStyle())
-
-                                Button("Reset Gemini") {
-                                    AppState.shared.resetWebAISession(for: .gemini)
-                                }
-                                .buttonStyle(LiquidGlassButtonStyle())
-                            }
-                        }
-                        
-                        if summaryService.settings.selectedSummaryProvider == .appleCloud {
-                            VStack(alignment: .leading, spacing: 8) {
-                                TextField("Apple Cloud Shortcut Name", text: Binding(
-                                    get: { summaryService.settings.appleCloudShortcutName },
-                                    set: { summaryService.setAppleCloudShortcutName($0) }
-                                ))
-                                .textFieldStyle(LiquidGlassTextFieldStyle())
-                                
-                                Button("Shortcut Setup Help") {
-                                    showAppleShortcutHelp = true
-                                }
-                                .buttonStyle(LiquidGlassButtonStyle())
-                            }
-                        }
-
-                        if summaryService.settings.selectedSummaryProvider == .summarizeDaemon {
-                            VStack(alignment: .leading, spacing: 10) {
-                                Text("Summarize Bridge")
-                                    .font(.subheadline)
-                                    .fontWeight(.semibold)
-
-                                Text("On iPad, redapp tries to find the Mac bridge automatically. If discovery is blocked, use your Mac's current LAN IP, bridge port, and bridge secret/pass. Do not use 127.0.0.1 on iPad.")
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
-
-                                TextField("Mac host or IP", text: Binding(
-                                    get: { summaryService.settings.summarizeBridgeHost },
-                                    set: { summaryService.setSummarizeBridgeHost($0) }
-                                ))
-                                .textFieldStyle(LiquidGlassTextFieldStyle())
-                                #if os(iOS)
-                                .textInputAutocapitalization(.never)
-                                .autocorrectionDisabled()
-                                #endif
-
-                                Stepper(
-                                    value: Binding(
-                                        get: { summaryService.settings.summarizeBridgePort },
-                                        set: { summaryService.setSummarizeBridgePort($0) }
-                                    ),
-                                    in: 1...65535,
-                                    step: 1
-                                ) {
-                                    Text("Bridge port: \(String(summaryService.settings.summarizeBridgePort))")
-                                }
-
-                                SecureField("Bridge secret/pass", text: Binding(
-                                    get: { summaryService.settings.summarizeBridgeSecret },
-                                    set: { summaryService.setSummarizeBridgeSecret($0) }
-                                ))
-                                .textFieldStyle(LiquidGlassTextFieldStyle())
-                                #if os(iOS)
-                                .textInputAutocapitalization(.never)
-                                .autocorrectionDisabled()
-                                #endif
-
-                                #if os(macOS)
-                                SecureField("Daemon token (Mac)", text: Binding(
-                                    get: { summaryService.settings.summarizeDaemonToken },
-                                    set: { summaryService.setSummarizeDaemonToken($0) }
-                                ))
-                                .textFieldStyle(LiquidGlassTextFieldStyle())
-                                #endif
-
-                                HStack(spacing: 10) {
-                                    Button {
-                                        testSummarizeDaemonConnection()
-                                    } label: {
-                                        HStack(spacing: 6) {
-                                            if isTestingSummarizeDaemon {
-                                                ProgressView()
-                                                    .scaleEffect(0.8)
-                                            }
-                                            Text("Test Connection")
-                                        }
-                                    }
-                                    .buttonStyle(LiquidGlassButtonStyle())
-                                    .disabled(isTestingSummarizeDaemon)
-
-                                    if let summarizeDaemonConnectionStatus {
-                                        Text(summarizeDaemonConnectionStatus)
-                                            .font(.caption)
-                                            .foregroundColor(summarizeDaemonConnectionStatus.hasPrefix("Connected") ? .green : .red)
-                                    }
-                                }
-                            }
-                        }
-
-                        if summaryService.settings.selectedSummaryProvider == .applePCCGateway {
-                            VStack(alignment: .leading, spacing: 10) {
-                                Text("Apple PCC Gateway")
-                                    .font(.subheadline)
-                                    .fontWeight(.semibold)
-
-                                Text("Run scripts/start-fm-pcc-gateway.command on your Mac, then use this Mac IP from iPhone/iPad. Use 127.0.0.1 in Simulator.")
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
-
-                                TextField("Mac host or IP", text: Binding(
-                                    get: { summaryService.settings.pccGatewayHost },
-                                    set: { summaryService.setPCCGatewayHost($0) }
-                                ))
-                                .textFieldStyle(LiquidGlassTextFieldStyle())
-                                #if os(iOS)
-                                .textInputAutocapitalization(.never)
-                                .autocorrectionDisabled()
-                                #endif
-
-                                Stepper(
-                                    value: Binding(
-                                        get: { summaryService.settings.pccGatewayPort },
-                                        set: { summaryService.setPCCGatewayPort($0) }
-                                    ),
-                                    in: 1...65535,
-                                    step: 1
-                                ) {
-                                    Text("Gateway port: \(String(summaryService.settings.pccGatewayPort))")
-                                }
-
-                                TextField("Model", text: Binding(
-                                    get: { summaryService.settings.pccGatewayModel },
-                                    set: { summaryService.setPCCGatewayModel($0) }
-                                ))
-                                .textFieldStyle(LiquidGlassTextFieldStyle())
-                                #if os(iOS)
-                                .textInputAutocapitalization(.never)
-                                .autocorrectionDisabled()
-                                #endif
-
-                                SecureField("Gateway token", text: Binding(
-                                    get: { summaryService.settings.pccGatewayToken },
-                                    set: { summaryService.setPCCGatewayToken($0) }
-                                ))
-                                .textFieldStyle(LiquidGlassTextFieldStyle())
-                                #if os(iOS)
-                                .textInputAutocapitalization(.never)
-                                .autocorrectionDisabled()
-                                #endif
-
-                                HStack(spacing: 10) {
-                                    Button {
-                                        testPCCGatewayConnection()
-                                    } label: {
-                                        HStack(spacing: 6) {
-                                            if isTestingPCCGateway {
-                                                ProgressView()
-                                                    .scaleEffect(0.8)
-                                            }
-                                            Text("Test Connection")
-                                        }
-                                    }
-                                    .buttonStyle(LiquidGlassButtonStyle())
-                                    .disabled(isTestingPCCGateway)
-
-                                    if let pccGatewayConnectionStatus {
-                                        Text(pccGatewayConnectionStatus)
-                                            .font(.caption)
-                                            .foregroundColor(pccGatewayConnectionStatus.hasPrefix("Connected") ? .green : .red)
-                                    }
-                                }
-                            }
-                        }
-
-                        if summaryService.settings.selectedSummaryProvider == .mlxLocal {
-	                            VStack(alignment: .leading, spacing: 10) {
-	                                TextField("LiteRT Hugging Face Repo", text: Binding(
-	                                    get: { summaryService.settings.mlxModelID },
-	                                    set: { summaryService.setMLXModelID($0) }
-	                                ))
-	                                .textFieldStyle(LiquidGlassTextFieldStyle())
-
-	                                Stepper(
-	                                    value: Binding(
-	                                        get: { summaryService.settings.mlxMaxContextTokens },
-	                                        set: { summaryService.setMLXMaxContextTokens($0) }
-	                                    ),
-	                                    in: 0...LiteRTLocalService.maxContextTokens,
-	                                    step: 1024
-	                                ) {
-                                    Text(
-                                        "Context tokens: " + (summaryService.settings.mlxMaxContextTokens == 0
-                                            ? "Auto"
-                                            : "\(summaryService.settings.mlxMaxContextTokens)")
-                                    )
-                                }
-
-	                                Stepper(
-	                                    value: Binding(
-	                                        get: { summaryService.settings.mlxMaxOutputTokens },
-	                                        set: { summaryService.setMLXMaxOutputTokens($0) }
-	                                    ),
-	                                    in: 64...512,
-	                                    step: 64
-	                                ) {
-                                    Text("Max output tokens: \(summaryService.settings.mlxMaxOutputTokens)")
-                                }
-
-	                                Button(action: {
-	                                    downloadLiteRTModel()
-	                                }) {
-	                                    HStack {
-	                                        if isLoadingMLXModel {
-                                            ProgressView()
-                                                .scaleEffect(0.8)
-	                                        } else {
-	                                            Image(systemName: "arrow.down.circle")
-	                                        }
-	                                        Text("Download LiteRT Model")
-	                                    }
-	                                }
-                                .buttonStyle(LiquidGlassButtonStyle())
-                                .disabled(isLoadingMLXModel)
-
-                                if let progress = mlxDownloadProgress {
-                                    ProgressView(progress)
-                                }
-
-                                if let mlxLoadStatus {
-                                    Text(mlxLoadStatus)
-                                        .font(.caption)
-                                        .foregroundColor(.secondary)
-                                }
-
-                                if let mlxLoadError {
-                                    Text(mlxLoadError)
-                                        .font(.caption)
-                                        .foregroundColor(.red)
-                                }
-
-	                                Button(action: {
-	                                    isPresentingMLXModelManager = true
-	                                }) {
-	                                    HStack {
-	                                        Image(systemName: "folder")
-	                                        Text("Manage LiteRT Models")
-	                                    }
-	                                }
-                                .buttonStyle(LiquidGlassButtonStyle())
-                            }
-                        }
-
-                        if summaryService.settings.selectedSummaryProvider == .coreAIMLXLocal {
-                            VStack(alignment: .leading, spacing: 10) {
-                                TextField("CoreAI MLX Hugging Face Repo", text: Binding(
-                                    get: { summaryService.settings.coreAIMLXModelID },
-                                    set: { summaryService.setCoreAIMLXModelID($0) }
-                                ))
-                                .textFieldStyle(LiquidGlassTextFieldStyle())
-
-                                Stepper(
-                                    value: Binding(
-                                        get: { summaryService.settings.coreAIMLXMaxContextTokens },
-                                        set: { summaryService.setCoreAIMLXMaxContextTokens($0) }
-                                    ),
-                                    in: 0...CoreAIMLXLocalService.maxContextTokens,
-                                    step: 1024
-                                ) {
-                                    Text(
-                                        "Context tokens: " + (summaryService.settings.coreAIMLXMaxContextTokens == 0
-                                            ? "Auto"
-                                            : "\(summaryService.settings.coreAIMLXMaxContextTokens)")
-                                    )
-                                }
-
-                                Stepper(
-                                    value: Binding(
-                                        get: { summaryService.settings.coreAIMLXMaxOutputTokens },
-                                        set: { summaryService.setCoreAIMLXMaxOutputTokens($0) }
-                                    ),
-                                    in: 64...512,
-                                    step: 64
-                                ) {
-                                    Text("Max output tokens: \(summaryService.settings.coreAIMLXMaxOutputTokens)")
-                                }
-
-                                Button(action: {
-                                    downloadCoreAIMLXModel()
-                                }) {
-                                    HStack {
-                                        if isLoadingMLXModel {
-                                            ProgressView()
-                                                .scaleEffect(0.8)
-                                        } else {
-                                            Image(systemName: "arrow.down.circle")
-                                        }
-                                        Text("Download CoreAI MLX Model")
-                                    }
-                                }
-                                .buttonStyle(LiquidGlassButtonStyle())
-                                .disabled(isLoadingMLXModel)
-
-                                if let progress = mlxDownloadProgress {
-                                    ProgressView(progress)
-                                }
-
-                                if let mlxLoadStatus {
-                                    Text(mlxLoadStatus)
-                                        .font(.caption)
-                                        .foregroundColor(.secondary)
-                                }
-
-                                if let mlxLoadError {
-                                    Text(mlxLoadError)
-                                        .font(.caption)
-                                        .foregroundColor(.red)
-                                }
-
-                                Text("Uses an MLX-format Gemma 4 E2B model for closest-family comparison with the LiteRT Gemma 4 E2B .litertlm model.")
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
-                            }
-                        }
-                        
-                        Text(summaryProviderDescription)
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                } header: {
-                    Text("Summary Provider")
-                }
-
-                Section {
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            SecureField("OpenAI API Key", text: Binding(
-                                get: { summaryService.settings.openaiApiKey },
-                                set: { summaryService.setOpenAIApiKey($0) }
-                            ))
-                            .textFieldStyle(LiquidGlassTextFieldStyle())
-                            
-                            // Status indicator
-                            Image(systemName: summaryService.settings.openaiApiKey.isEmpty ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
-                                .foregroundColor(summaryService.settings.openaiApiKey.isEmpty ? .orange : .green)
-                        }
-                        
-                        Text("Required for OpenAI TTS (cloud)")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                    
-                    Button("API Key Help") {
-                        showApiKeyHelp = true
-                    }
-                    .buttonStyle(LiquidGlassButtonStyle())
-                } header: {
-                    Text("OpenAI API Key")
-                }
-                
-                Section {
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            SecureField("Gemini API Key", text: Binding(
-                                get: { summaryService.settings.geminiApiKey },
-                                set: { summaryService.setGeminiApiKey($0) }
-                            ))
-                            .textFieldStyle(LiquidGlassTextFieldStyle())
-                            
-                            // Status indicator
-                            Image(systemName: summaryService.settings.geminiApiKey.isEmpty ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
-                                .foregroundColor(summaryService.settings.geminiApiKey.isEmpty ? .orange : .green)
-                        }
-                        
-                        Text("Required when using Gemini for summaries and Q&A")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                } header: {
-                    Text("Gemini API Key")
-                }
-                
-                Section {
-                    VStack(alignment: .leading, spacing: 12) {
-                        HStack {
-                            TextField("Reddit App Client ID", text: $redditClientId)
-                                .textFieldStyle(LiquidGlassTextFieldStyle())
-                                .onChange(of: redditClientId) { newValue in
-                                    if !newValue.isEmpty {
-                                        authManager.setRedditCredentials(clientId: newValue, clientSecret: redditClientSecret)
-                                    }
-                                }
-                            
-                            // Status indicator
-                            Image(systemName: authManager.hasStoredCredentials() ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                                .foregroundColor(authManager.hasStoredCredentials() ? .green : .orange)
-                        }
-                        
-                        HStack {
-                            SecureField("Reddit App Client Secret (optional for installed apps)", text: $redditClientSecret)
-                                .textFieldStyle(LiquidGlassTextFieldStyle())
-                                .onChange(of: redditClientSecret) { newValue in
-                                    if !redditClientId.isEmpty {
-                                        authManager.setRedditCredentials(clientId: redditClientId, clientSecret: newValue)
-                                    }
-                                }
-                        }
-                        
-                        Text("Leave empty for 'installed app' type apps")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                        
-                        Button("How to get Reddit API credentials") {
-                            showRedditCredentialHelp = true
-                        }
-                        .buttonStyle(LiquidGlassButtonStyle())
-                        .font(.caption)
-                    }
-                } header: {
-                    Text("Reddit API Credentials")
-                } footer: {
-                    Text("Your Reddit app credentials are stored securely in the Keychain")
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
-                }
-                
-                Section {
-                    if authManager.isAuthenticated {
-                        HStack {
-                            Image(systemName: "person.circle.fill")
-                                .foregroundColor(.green)
-                            Text("Logged in as: \(authManager.username ?? "")")
-                                .foregroundColor(.primary)
-                            Spacer()
-                        }
-
-                        Button(action: {
-                            Task {
-                                isRefreshingRedditToken = true
-                                defer { isRefreshingRedditToken = false }
-                                do {
-                                    try await authManager.refreshAccessTokenManually()
-                                } catch {
-                                    authError = error.localizedDescription
-                                    showAuthError = true
-                                }
-                            }
-                        }) {
-                            HStack {
-                                if isRefreshingRedditToken {
-                                    ProgressView()
-                                        .scaleEffect(0.8)
-                                } else {
-                                    Image(systemName: "arrow.clockwise")
-                                }
-                                Text("Refresh Token")
-                            }
-                        }
-                        .buttonStyle(LiquidGlassButtonStyle())
-                        .disabled(isRefreshingRedditToken)
-                        
-                        Button(action: {
-                            authManager.logout()
-                        }) {
-                            HStack {
-                                Image(systemName: "arrow.right.square")
-                                Text("Logout")
-                            }
-                        }
-                        .buttonStyle(LiquidGlassButtonStyle())
-                        .tint(.red)
-                    } else {
-                        VStack(alignment: .leading, spacing: 12) {
-                            if !authManager.hasStoredCredentials() {
-                                Text("Please enter your Reddit API credentials above before logging in")
-                                    .font(.caption)
-                                    .foregroundColor(.orange)
-                            } else {
-                                Text("Login to enable replies, voting, and other interactions")
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
-                            }
-                            
-                            Button(action: {
-                                Task {
-                                    isAuthenticating = true
-                                    do {
-                                        try await authManager.authenticate()
-                                    } catch {
-                                        authError = error.localizedDescription
-                                        showAuthError = true
-                                    }
-                                    isAuthenticating = false
-                                }
-                            }) {
-                                HStack {
-                                    if isAuthenticating {
-                                        ProgressView()
-                                            .scaleEffect(0.8)
-                                    } else {
-                                        Image(systemName: "person.badge.plus")
-                                    }
-                                    Text("Login with Reddit")
-                                }
-                                .frame(maxWidth: .infinity)
-                            }
-                            .buttonStyle(LiquidGlassButtonStyle(isProminent: true))
-                            .disabled(isAuthenticating || !authManager.hasStoredCredentials())
-                        }
-                    }
-                } header: {
-                    Text("Reddit Account")
-                }
-                
-                Section {
-                    HStack {
-                        Image(systemName: "info.circle")
-                            .foregroundColor(.blue)
-                        Text("Image uploads use Catbox.moe (free, no account needed)")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                    .padding(.vertical, 4)
-                } header: {
-                    Text("Image Upload Service")
-                } footer: {
-                    Text("Images are uploaded anonymously to Catbox.moe before posting to Reddit")
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
-                }
-                
-                Section {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Picker("Voice", selection: Binding(
-                            get: { summaryService.settings.ttsVoice },
-                            set: { summaryService.setTTSVoice($0) }
-                        )) {
-                            ForEach(TTSProvider.openai.availableVoices, id: \.self) { voice in
-                                Text(voice).tag(voice)
-                            }
-                        }
-                        
-                        Text("Choose your preferred OpenAI TTS voice")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                    
-                    VStack(alignment: .leading, spacing: 8) {
-                        Picker("Model", selection: Binding(
-                            get: { summaryService.settings.ttsModel },
-                            set: { summaryService.setTTSModel($0) }
-                        )) {
-                            ForEach(TTSProvider.openai.availableModels, id: \.self) { model in
-                                Text(model).tag(model)
-                            }
-                        }
-                        
-                        Text("tts-1: Faster, lower latency • tts-1-hd: Higher quality")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                } header: {
-                    Text("Voice & Model Settings")
-                }
-
-                Section {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Picker("Local Engine", selection: Binding(
-                            get: { summaryService.settings.localTTSEngine },
-                            set: { summaryService.setLocalTTSEngine($0) }
-                        )) {
-                            ForEach(LocalTTSEngine.availableEngines) { engine in
-                                Text(engine.displayName).tag(engine)
-                            }
-                        }
-                        
-                        Text(localTTSEngineDescription)
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-
-                        if summaryService.settings.localTTSEngine == .kokoro && !KokoroTTSService.shared.isAvailable {
-                            Text("MLX TTS requires the MLXAudio package and model access.")
-                                .font(.caption)
-                                .foregroundColor(.orange)
-                        }
-                    }
-                } header: {
-                    Text("Local TTS Engine")
-                }
-                
-                #if os(iOS)
-                Section {
-                    if summaryService.settings.localTTSEngine == .system {
-                        if iosVoices.isEmpty {
-                            Text("No voices available. Install voices in System Settings → Accessibility → Spoken Content → System Voice")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        } else {
-                            VStack(alignment: .leading, spacing: 12) {
-                                Picker("Local Voice", selection: $localVoiceID) {
-                                    ForEach(iosVoices, id: \.id) { v in
-                                        Text(v.title).tag(v.id)
-                                    }
-                                }
-                                .onChange(of: localVoiceID) { newID in
-                                    UserDefaults.standard.set(newID, forKey: voiceKey)
-                                }
-                                
-                                HStack(spacing: 12) {
-                                    Button("Test Voice") {
-                                        testSelectedVoice()
-                                    }
-                                    .buttonStyle(LiquidGlassButtonStyle(isProminent: true))
-                                    
-                                    Button("Reset to Default") {
-                                        resetToDefaultVoice()
-                                    }
-                                    .buttonStyle(LiquidGlassButtonStyle())
-                                }
-                                
-                                Text("Premium voices provide the best quality for local TTS")
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
-                            }
-                        }
-                    } else {
-                        #if canImport(MLXAudioCore) && canImport(MLXAudioTTS)
-                        VStack(alignment: .leading, spacing: 12) {
-                            Picker("MLX Voice", selection: Binding(
-                                get: { summaryService.settings.kokoroVoice },
-                                set: { summaryService.setKokoroVoice($0) }
-                            )) {
-                                ForEach(KokoroVoice.allCases) { voice in
-                                    Text(voice.displayName).tag(voice.rawValue)
-                                }
-                            }
-                            
-                            VStack(alignment: .leading, spacing: 6) {
-                                HStack {
-                                    Text("Speed")
-                                    Spacer()
-                                    Text(String(format: "%.1fx", summaryService.settings.kokoroSpeed))
-                                        .foregroundColor(.secondary)
-                                }
-                                Slider(
-                                    value: Binding(
-                                        get: { summaryService.settings.kokoroSpeed },
-                                        set: { summaryService.setKokoroSpeed($0) }
-                                    ),
-                                    in: 0.5...2.0,
-                                    step: 0.1
-                                )
-                            }
-
-                            VStack(alignment: .leading, spacing: 8) {
-                                Button(action: {
-                                    isKokoroPrewarming = true
-                                    kokoroPrewarmError = nil
-                                    kokoroPrewarmStatus = nil
-                                    Task {
-                                        do {
-                                            try await summaryService.precacheKokoroNow()
-                                            await MainActor.run {
-                                                isKokoroPrewarming = false
-                                                kokoroPrewarmStatus = "MLX pre-cache complete"
-                                            }
-                                        } catch {
-                                            await MainActor.run {
-                                                isKokoroPrewarming = false
-                                                kokoroPrewarmError = error.localizedDescription
-                                            }
-                                        }
-                                    }
-                                }) {
-                                    HStack {
-                                        if isKokoroPrewarming {
-                                            ProgressView()
-                                                .scaleEffect(0.8)
-                                        } else {
-                                            Image(systemName: "bolt.circle")
-                                        }
-                                        Text("Pre-cache MLX TTS")
-                                    }
-                                }
-                                .buttonStyle(LiquidGlassButtonStyle(isProminent: true))
-                                .disabled(isKokoroPrewarming || !KokoroTTSService.shared.isAvailable)
-
-                                if summaryService.settings.kokoroPrecacheEnabled {
-                                    Text("Pre-cache enabled (loads models at launch).")
-                                        .font(.caption)
-                                        .foregroundColor(.secondary)
-
-                                    Button("Disable Pre-cache") {
-                                        summaryService.setKokoroPrecacheEnabled(false)
-                                        kokoroPrewarmStatus = "Pre-cache disabled and MLX memory released"
-                                    }
-                                    .buttonStyle(LiquidGlassButtonStyle())
-                                }
-
-                                if let status = kokoroPrewarmStatus {
-                                    Text(status)
-                                        .font(.caption)
-                                        .foregroundColor(.green)
-                                }
-
-                                if let error = kokoroPrewarmError {
-                                    Text(error)
-                                        .font(.caption)
-                                        .foregroundColor(.red)
-                                }
-                            }
-                            
-                            Text("MLX TTS runs fully on device. First use may download large model assets.")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                        #else
-                        Text("MLX TTS requires the MLXAudio package.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                        #endif
-                    }
-                } header: {
-                    Text(summaryService.settings.localTTSEngine == .kokoro ? "MLX Voice" : "Local TTS Voice")
-                } footer: {
-                    if summaryService.settings.localTTSEngine == .system {
-                        Text("Download premium voices from Settings → Accessibility → Spoken Content → Voices for the best experience")
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
-                    } else {
-                        Text("MLX voices are bundled or downloaded as model assets.")
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
-                    }
-                }
-                #endif
-                
-                Section {
-                    VStack(alignment: .leading, spacing: 12) {
-                        HStack {
-                            Text("Removable Cache Size:")
-                                .foregroundColor(.secondary)
-                            Spacer()
-                            Text(removableCacheSizeDisplay)
-                                .fontWeight(.semibold)
-                        }
-
-                        Button(action: {
-                            isClearingCaches = true
-                            summaryService.clearAllCaches {
-                                updateStorageDisplays()
-                                isClearingCaches = false
-                            }
-                        }) {
-                            HStack {
-                                if isClearingCaches {
-                                    ProgressView()
-                                        .scaleEffect(0.8)
-                                    Text("Clearing…")
-                                } else {
-                                    Image(systemName: "trash.fill")
-                                    Text("Clear All Caches")
-                                }
-                            }
-                            .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(LiquidGlassButtonStyle())
-                        .disabled(isClearingCaches)
-                        .tint(.red)
-
-                        Text("Clears removable disk caches and preserves downloaded LiteRT and MLX models.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-
-                        Divider()
-
-                        Button("Clear TTS Memory Cache") {
-                            summaryService.clearCache()
-                            updateStorageDisplays()
-                        }
-                        .buttonStyle(LiquidGlassButtonStyle())
-
-                        Text("Clears only the in-memory audio dictionary used for replay.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-
-                        Divider()
-
-                        Button(action: {
-                            isCleaningFailedModelDownloads = true
-                            failedModelDownloadCleanupStatus = nil
-                            summaryService.clearFailedModelDownloads { message in
-                                failedModelDownloadCleanupStatus = message
-                                updateStorageDisplays()
-                                isCleaningFailedModelDownloads = false
-                            }
-                        }) {
-                            HStack {
-                                if isCleaningFailedModelDownloads {
-                                    ProgressView()
-                                        .scaleEffect(0.8)
-                                    Text("Cleaning…")
-                                } else {
-                                    Image(systemName: "arrow.down.doc.fill")
-                                    Text("Clean Failed Model Downloads")
-                                }
-                            }
-                            .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(LiquidGlassButtonStyle())
-                        .disabled(isCleaningFailedModelDownloads)
-
-                        Text("Removes only incomplete .download, .partial, and .dl-bits files. Completed models are kept.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-
-                        if let failedModelDownloadCleanupStatus {
-                            Text(failedModelDownloadCleanupStatus)
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                    }
-                    .padding(.vertical, 4)
-                } header: {
-                    Text("Cache Management")
-                }
-
-                Section {
-                    VStack(alignment: .leading, spacing: 12) {
-                        HStack {
-                            Text("App Container")
-                                .foregroundColor(.secondary)
-                            Spacer()
-                            if isLoadingStorageBreakdown {
-                                ProgressView()
-                                    .scaleEffect(0.8)
-                            } else {
-                                Button {
-                                    refreshStorageBreakdown()
-                                } label: {
-                                    Image(systemName: "arrow.clockwise")
-                                }
-                                .buttonStyle(.borderless)
-                            }
-                        }
-
-                        if storageBreakdownItems.isEmpty {
-                            Text(isLoadingStorageBreakdown ? "Scanning storage…" : "No storage details found.")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        } else {
-                            ForEach(storageBreakdownItems) { item in
-                                HStack(alignment: .top, spacing: 10) {
-                                    Image(systemName: item.isModelStorage ? "cube.box.fill" : "folder.fill")
-                                        .foregroundStyle(.secondary)
-                                        .frame(width: 22)
-
-                                    VStack(alignment: .leading, spacing: 3) {
-                                        Text(item.name)
-                                            .font(.subheadline)
-                                            .fontWeight(.semibold)
-                                        Text(item.detail)
-                                            .font(.caption2)
-                                            .foregroundColor(.secondary)
-                                            .lineLimit(2)
-                                    }
-
-                                    Spacer()
-
-                                    Text(item.sizeText)
-                                        .font(.caption)
-                                        .fontWeight(.semibold)
-                                        .foregroundColor(.secondary)
-
-                                    if item.cleanupKind != nil || item.isModelStorage {
-                                        Button(role: .destructive) {
-                                            pendingStorageBreakdownDelete = item
-                                            showStorageBreakdownDeleteConfirm = true
-                                        } label: {
-                                            Image(systemName: "trash")
-                                        }
-                                        .buttonStyle(.borderless)
-                                        .disabled(isDeletingStorageBreakdown)
-                                    }
-                                }
-                                .padding(.vertical, 3)
-                            }
-                        }
-
-                        if let storageBreakdownStatus {
-                            Text(storageBreakdownStatus)
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-
-                        Text("Removable cache rows exclude local models. Use model rows or Local Model Storage to delete downloaded models.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                    .padding(.vertical, 4)
-                } header: {
-                    Text("Storage Breakdown")
-                }
-
-                Section {
-                    VStack(alignment: .leading, spacing: 12) {
-                        HStack {
-                            Text("Downloaded Models")
-                                .foregroundColor(.secondary)
-                            Spacer()
-                            if isLoadingModelStorage {
-                                ProgressView()
-                                    .scaleEffect(0.8)
-                            } else {
-                                Button {
-                                    refreshModelStorage()
-                                } label: {
-                                    Image(systemName: "arrow.clockwise")
-                                }
-                                .buttonStyle(.borderless)
-                            }
-                        }
-
-                        if modelStorageItems.isEmpty {
-                            Text(isLoadingModelStorage ? "Scanning model storage…" : "No local models found.")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        } else {
-                            ForEach(modelStorageItems) { item in
-                                HStack(alignment: .top, spacing: 10) {
-                                    Image(systemName: item.kind == .liteRT ? "cube.box.fill" : "cpu.fill")
-                                        .foregroundStyle(.secondary)
-                                        .frame(width: 22)
-
-                                    VStack(alignment: .leading, spacing: 3) {
-                                        HStack(spacing: 6) {
-                                            Text(item.name)
-                                                .font(.subheadline)
-                                                .fontWeight(.semibold)
-                                                .lineLimit(2)
-                                            if item.isCurrentSelection {
-                                                Text("Current")
-                                                    .font(.caption2)
-                                                    .padding(.horizontal, 6)
-                                                    .padding(.vertical, 2)
-                                                    .background(.blue.opacity(0.18))
-                                                    .clipShape(Capsule())
-                                            }
-                                        }
-                                        Text("\(item.kind.rawValue) • \(item.detail)")
-                                            .font(.caption)
-                                            .foregroundColor(.secondary)
-                                        Text(item.sizeText)
-                                            .font(.caption)
-                                            .foregroundColor(.secondary)
-                                    }
-
-                                    Spacer()
-
-                                    Button(role: .destructive) {
-                                        pendingModelStorageDelete = item
-                                        showModelStorageDeleteConfirm = true
-                                    } label: {
-                                        Image(systemName: "trash")
-                                    }
-                                    .buttonStyle(.borderless)
-                                    .disabled(isDeletingModelStorage)
-                                }
-                                .padding(.vertical, 4)
-                            }
-                        }
-
-                        if let modelStorageStatus {
-                            Text(modelStorageStatus)
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-
-                        Text("Deleting a model removes only that selected model. Other caches and models are left alone.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                    .padding(.vertical, 4)
-                } header: {
-                    Text("Local Model Storage")
-                }
-                
-                Section {
-                    Toggle("Force Dark Mode", isOn: Binding(
-                        get: { summaryService.settings.isDarkMode },
-                        set: { summaryService.setDarkMode($0) }
-                    ))
-                    
-                    Text("When enabled, app will always use dark mode. When disabled, app follows system setting.")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-
-                    Divider()
-
-                    Toggle("Experimental Glass Everywhere", isOn: $experimentalSettingsGlassEnabled)
-
-                    VStack(alignment: .leading, spacing: 7) {
-                        HStack {
-                            Text("Glass Variant")
-                            Spacer()
-                            Text("\(experimentalSettingsGlassVariant)")
-                                .monospacedDigit()
-                                .foregroundStyle(.secondary)
-                        }
-
-                        Slider(
-                            value: Binding(
-                                get: { Double(experimentalSettingsGlassVariant) },
-                                set: { experimentalSettingsGlassVariant = Int($0.rounded()) }
-                            ),
-                            in: 0...19,
-                            step: 1
-                        )
-
-                        HStack {
-                            Text("0")
-                            Spacer()
-                            Button("Reset to 11") {
-                                experimentalSettingsGlassVariant = 11
-                            }
-                            .buttonStyle(.borderless)
-                            Spacer()
-                            Text("19")
-                        }
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    }
-
-                    if experimentalSettingsGlassEnabled {
-                        ExperimentalAppGlassSurface(
-                            enabled: true,
-                            variant: experimentalSettingsGlassVariant,
-                            cornerRadius: 14
-                        ) {
-                            HStack(spacing: 12) {
-                                Image(systemName: "sparkles.rectangle.stack")
-                                    .font(.system(size: 26, weight: .medium))
-                                VStack(alignment: .leading, spacing: 3) {
-                                    Text("Glass Variant \(experimentalSettingsGlassVariant)")
-                                        .font(.headline)
-                                    Text("Native iOS Liquid Glass preview")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                                Spacer()
-                            }
-                            .padding(16)
-                        }
-                        .frame(height: 78)
-                    }
-
-                    Text("Experimental appearance. Disable this switch to restore the complete standard iOS interface instantly.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } header: {
-                    Text("Appearance")
-                }
-                
-                Section {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Label("Fast-Start Technology", systemImage: "bolt.fill")
-                            .foregroundColor(.blue)
-                            .font(.headline)
-                        
-                        Text("• Audio starts playing in 1-3 seconds instead of 15-20 seconds")
-                        Text("• Processes first 800 characters immediately for instant playback")
-                        Text("• Generates remaining audio in background while you listen")
-                        Text("• Smart caching for instant replay")
-                        Text("• High-quality OpenAI TTS voices")
-                    }
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                } header: {
-                    Text("Performance Features")
-                }
+                    settingsOverviewSections
+                        .listRowBackground(RedappDesign.card)
                 }
                 .formStyle(.grouped)
                 .scrollContentBackground(.hidden)
@@ -5582,8 +4548,7 @@ struct SettingsView: View {
             }
             .navigationTitle("Settings")
             #if os(iOS)
-            .toolbarBackground(.visible, for: .navigationBar)
-            .toolbarBackground(settingsSurfaceBackground, for: .navigationBar)
+            .navigationBarTitleDisplayMode(.inline)
             .toolbarColorScheme(colorScheme == .dark ? .dark : .light, for: .navigationBar)
             #endif
             .toolbar {
@@ -5700,6 +4665,1189 @@ struct SettingsView: View {
         }
     }
 
+
+    // MARK: - Settings navigation
+
+    /// Settings opens on a short overview; each area lives on its own page so
+    /// the sheet never becomes one endless scroll of unrelated controls.
+    @ViewBuilder
+    private var settingsOverviewSections: some View {
+        Section {
+            HStack(spacing: 14) {
+                Image(systemName: authManager.isAuthenticated ? "person.crop.circle.fill.badge.checkmark" : "person.crop.circle.badge.exclamationmark")
+                    .font(.system(size: 34))
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(authManager.isAuthenticated ? RedappDesign.positive : Color.orange)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(settingsAccountTitle)
+                        .font(.headline)
+                    Text("Summaries by \(summaryService.settings.selectedSummaryProvider.displayName)")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.vertical, 4)
+            .accessibilityElement(children: .combine)
+        }
+
+        Section {
+            NavigationLink {
+                settingsPage("Reddit") { redditSettingsSections }
+            } label: {
+                settingsCategoryLabel("Reddit", subtitle: settingsAccountSubtitle, systemImage: "person.crop.circle", color: .orange)
+            }
+
+            NavigationLink {
+                settingsPage("AI Models") { aiSettingsSections }
+            } label: {
+                settingsCategoryLabel(
+                    "AI Models",
+                    subtitle: "\(summaryService.settings.selectedSummaryProvider.displayName) · Web: \(summaryService.settings.selectedWebAIProvider.displayName)",
+                    systemImage: "sparkles",
+                    color: .teal
+                )
+            }
+
+            NavigationLink {
+                settingsPage("Voice & Speech") { voiceSettingsSections }
+            } label: {
+                settingsCategoryLabel(
+                    "Voice & Speech",
+                    subtitle: summaryService.settings.localTTSEngine.displayName,
+                    systemImage: "waveform",
+                    color: .pink
+                )
+            }
+
+            NavigationLink {
+                settingsPage("Appearance") { appearanceSettingsSections }
+            } label: {
+                settingsCategoryLabel(
+                    "Appearance",
+                    subtitle: summaryService.settings.isDarkMode ? "Always Dark" : "Match System",
+                    systemImage: "circle.lefthalf.filled",
+                    color: .blue
+                )
+            }
+
+            NavigationLink {
+                settingsPage("Storage") { storageSettingsSections }
+            } label: {
+                settingsCategoryLabel(
+                    "Storage",
+                    subtitle: "\(removableCacheSizeDisplay) removable cache",
+                    systemImage: "internaldrive",
+                    color: .gray
+                )
+            }
+        }
+    }
+
+    private var settingsAccountTitle: String {
+        if authManager.isAuthenticated {
+            return "u/\(authManager.username ?? "")"
+        }
+        return authManager.hasStoredCredentials() ? "Not logged in to Reddit" : "Reddit isn’t set up yet"
+    }
+
+    private var settingsAccountSubtitle: String {
+        if authManager.isAuthenticated {
+            return "Logged in"
+        }
+        return authManager.hasStoredCredentials() ? "Credentials saved · Log in" : "Add API credentials"
+    }
+
+    private func settingsCategoryLabel(_ title: String, subtitle: String, systemImage: String, color: Color) -> some View {
+        HStack(spacing: 14) {
+            // One accent for every category, as in the rest of the app.
+            Image(systemName: systemImage)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(RedappDesign.accent)
+                .frame(width: 32, height: 32)
+                .background(RedappDesign.accentSoft, in: RoundedRectangle(cornerRadius: RedappDesign.Radius.small, style: .continuous))
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .foregroundStyle(RedappDesign.ink)
+                Text(subtitle)
+                    .font(.footnote)
+                    .foregroundStyle(RedappDesign.inkSecondary)
+                    .lineLimit(1)
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func settingsPage<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        Form {
+            content()
+                .listRowBackground(RedappDesign.card)
+        }
+        .formStyle(.grouped)
+        .scrollContentBackground(.hidden)
+        .background(settingsSurfaceBackground)
+        .navigationTitle(title)
+        #if os(iOS)
+        .navigationBarTitleDisplayMode(.inline)
+        #endif
+    }
+
+    private func webAISessionRow(_ provider: WebAIProvider, name: String) -> some View {
+        HStack(spacing: 10) {
+            Text(name)
+            Spacer()
+            Button("Log In") {
+                launchWebAILogin(provider)
+            }
+            .buttonStyle(RedappSecondaryButtonStyle())
+            Button("Reset", role: .destructive) {
+                AppState.shared.resetWebAISession(for: provider)
+            }
+            .buttonStyle(RedappSecondaryButtonStyle(foreground: RedappDesign.negative))
+            .accessibilityLabel("Reset \(name) session")
+        }
+    }
+
+    // MARK: Reddit page
+
+    @ViewBuilder
+    private var redditSettingsSections: some View {
+        Section {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    TextField("Reddit App Client ID", text: $redditClientId)
+                        .textFieldStyle(LiquidGlassTextFieldStyle())
+                        .onChange(of: redditClientId) { newValue in
+                            if !newValue.isEmpty {
+                                authManager.setRedditCredentials(clientId: newValue, clientSecret: redditClientSecret)
+                            }
+                        }
+
+                    // Status indicator
+                    Image(systemName: authManager.hasStoredCredentials() ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                        .foregroundColor(authManager.hasStoredCredentials() ? .green : .orange)
+                }
+
+                HStack {
+                    SecureField("Reddit App Client Secret (optional for installed apps)", text: $redditClientSecret)
+                        .textFieldStyle(LiquidGlassTextFieldStyle())
+                        .onChange(of: redditClientSecret) { newValue in
+                            if !redditClientId.isEmpty {
+                                authManager.setRedditCredentials(clientId: redditClientId, clientSecret: newValue)
+                            }
+                        }
+                }
+
+                Text("Leave empty for 'installed app' type apps")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                Button("How to get Reddit API credentials") {
+                    showRedditCredentialHelp = true
+                }
+                .buttonStyle(LiquidGlassButtonStyle())
+                .font(.caption)
+            }
+        } header: {
+            Text("Reddit API Credentials")
+        } footer: {
+            Text("Your Reddit app credentials are stored securely in the Keychain")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+        }
+
+        Section {
+            if authManager.isAuthenticated {
+                HStack {
+                    Image(systemName: "person.circle.fill")
+                        .foregroundColor(RedappDesign.positive)
+                    Text("Logged in as: \(authManager.username ?? "")")
+                        .foregroundColor(.primary)
+                    Spacer()
+                }
+
+                Button(action: {
+                    Task {
+                        isRefreshingRedditToken = true
+                        defer { isRefreshingRedditToken = false }
+                        do {
+                            try await authManager.refreshAccessTokenManually()
+                        } catch {
+                            authError = error.localizedDescription
+                            showAuthError = true
+                        }
+                    }
+                }) {
+                    HStack {
+                        if isRefreshingRedditToken {
+                            ProgressView()
+                                .scaleEffect(0.8)
+                        } else {
+                            Image(systemName: "arrow.clockwise")
+                        }
+                        Text("Refresh Token")
+                    }
+                }
+                .buttonStyle(LiquidGlassButtonStyle())
+                .disabled(isRefreshingRedditToken)
+
+                Button(action: {
+                    authManager.logout()
+                }) {
+                    HStack {
+                        Image(systemName: "rectangle.portrait.and.arrow.right")
+                        Text("Log Out")
+                    }
+                    .foregroundStyle(.red)
+                }
+                .buttonStyle(LiquidGlassButtonStyle())
+            } else {
+                VStack(alignment: .leading, spacing: 12) {
+                    if !authManager.hasStoredCredentials() {
+                        Text("Add your Reddit app credentials above, then log in.")
+                            .font(.caption)
+                            .foregroundColor(.orange)
+                    } else {
+                        Text("Login to enable replies, voting, and other interactions")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+
+                    Button(action: {
+                        Task {
+                            isAuthenticating = true
+                            do {
+                                try await authManager.authenticate()
+                            } catch {
+                                authError = error.localizedDescription
+                                showAuthError = true
+                            }
+                            isAuthenticating = false
+                        }
+                    }) {
+                        HStack {
+                            if isAuthenticating {
+                                ProgressView()
+                                    .scaleEffect(0.8)
+                            } else {
+                                Image(systemName: "person.badge.plus")
+                            }
+                            Text("Login with Reddit")
+                        }
+                        .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(LiquidGlassButtonStyle(isProminent: true))
+                    .disabled(isAuthenticating || !authManager.hasStoredCredentials())
+                }
+            }
+        } header: {
+            Text("Reddit Account")
+        }
+    }
+
+    // MARK: AI Models page
+
+    /// Providers no longer offered in Settings. A hidden provider still shows
+    /// while it is the current selection, so the picker never appears blank
+    /// and the user can switch away from it.
+    private static let hiddenSummaryProviders: Set<SummaryProvider> = [
+        .mlxLocal,          // LiteRT
+        .coreAIMLXLocal,    // CoreAI MLX
+        .applePCCGateway    // Apple PCC Gateway
+    ]
+
+    private var settingsSummaryProviders: [SummaryProvider] {
+        SummaryProvider.allCases.filter { provider in
+            if provider == .chatGPT && !ChatGPTPlanAvailability.isEnabled {
+                return false
+            }
+            return !Self.hiddenSummaryProviders.contains(provider)
+                || provider == summaryService.settings.selectedSummaryProvider
+        }
+    }
+
+    @ViewBuilder
+    private var aiSettingsSections: some View {
+        Section {
+            Picker("Provider", selection: Binding(
+                get: { summaryService.settings.selectedSummaryProvider },
+                set: { summaryService.setSummaryProvider($0) }
+            )) {
+                ForEach(settingsSummaryProviders, id: \.self) { provider in
+                    Text(provider.displayName).tag(provider)
+                }
+            }
+            .pickerStyle(.menu)
+
+            // The description belongs next to the picker it explains.
+            Text(summaryProviderDescription)
+                .font(.caption)
+                .foregroundColor(.secondary)
+
+            if summaryService.settings.selectedSummaryProvider == .appleCloud {
+                VStack(alignment: .leading, spacing: 8) {
+                    TextField("Apple Cloud Shortcut Name", text: Binding(
+                        get: { summaryService.settings.appleCloudShortcutName },
+                        set: { summaryService.setAppleCloudShortcutName($0) }
+                    ))
+                    .textFieldStyle(LiquidGlassTextFieldStyle())
+                    
+                    Button("Shortcut Setup Help") {
+                        showAppleShortcutHelp = true
+                    }
+                    .buttonStyle(LiquidGlassButtonStyle())
+                }
+            }
+
+            if summaryService.settings.selectedSummaryProvider == .summarizeDaemon {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Summarize Bridge")
+                        .font(.subheadline)
+                        .fontWeight(.semibold)
+
+                    Text("On iPad, redapp tries to find the Mac bridge automatically. If discovery is blocked, use your Mac's current LAN IP, bridge port, and bridge secret/pass. Do not use 127.0.0.1 on iPad.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+
+                    TextField("Mac host or IP", text: Binding(
+                        get: { summaryService.settings.summarizeBridgeHost },
+                        set: { summaryService.setSummarizeBridgeHost($0) }
+                    ))
+                    .textFieldStyle(LiquidGlassTextFieldStyle())
+                    #if os(iOS)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    #endif
+
+                    Stepper(
+                        value: Binding(
+                            get: { summaryService.settings.summarizeBridgePort },
+                            set: { summaryService.setSummarizeBridgePort($0) }
+                        ),
+                        in: 1...65535,
+                        step: 1
+                    ) {
+                        Text("Bridge port: \(String(summaryService.settings.summarizeBridgePort))")
+                    }
+
+                    SecureField("Bridge secret/pass", text: Binding(
+                        get: { summaryService.settings.summarizeBridgeSecret },
+                        set: { summaryService.setSummarizeBridgeSecret($0) }
+                    ))
+                    .textFieldStyle(LiquidGlassTextFieldStyle())
+                    #if os(iOS)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    #endif
+
+                    #if os(macOS)
+                    SecureField("Daemon token (Mac)", text: Binding(
+                        get: { summaryService.settings.summarizeDaemonToken },
+                        set: { summaryService.setSummarizeDaemonToken($0) }
+                    ))
+                    .textFieldStyle(LiquidGlassTextFieldStyle())
+                    #endif
+
+                    HStack(spacing: 10) {
+                        Button {
+                            testSummarizeDaemonConnection()
+                        } label: {
+                            HStack(spacing: 6) {
+                                if isTestingSummarizeDaemon {
+                                    ProgressView()
+                                        .scaleEffect(0.8)
+                                }
+                                Text("Test Connection")
+                            }
+                        }
+                        .buttonStyle(LiquidGlassButtonStyle())
+                        .disabled(isTestingSummarizeDaemon)
+
+                        if let summarizeDaemonConnectionStatus {
+                            Text(summarizeDaemonConnectionStatus)
+                                .font(.caption)
+                                .foregroundColor(summarizeDaemonConnectionStatus.hasPrefix("Connected") ? .green : .red)
+                        }
+                    }
+                }
+            }
+
+            if summaryService.settings.selectedSummaryProvider == .chatGPT {
+                ChatGPTPlanSettingsView(summaryService: summaryService)
+            }
+
+            if summaryService.settings.selectedSummaryProvider == .applePCCGateway {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Apple PCC Gateway")
+                        .font(.subheadline)
+                        .fontWeight(.semibold)
+
+                    Text("Run scripts/start-fm-pcc-gateway.command on your Mac, then use this Mac IP from iPhone/iPad. Use 127.0.0.1 in Simulator.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+
+                    TextField("Mac host or IP", text: Binding(
+                        get: { summaryService.settings.pccGatewayHost },
+                        set: { summaryService.setPCCGatewayHost($0) }
+                    ))
+                    .textFieldStyle(LiquidGlassTextFieldStyle())
+                    #if os(iOS)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    #endif
+
+                    Stepper(
+                        value: Binding(
+                            get: { summaryService.settings.pccGatewayPort },
+                            set: { summaryService.setPCCGatewayPort($0) }
+                        ),
+                        in: 1...65535,
+                        step: 1
+                    ) {
+                        Text("Gateway port: \(String(summaryService.settings.pccGatewayPort))")
+                    }
+
+                    TextField("Model", text: Binding(
+                        get: { summaryService.settings.pccGatewayModel },
+                        set: { summaryService.setPCCGatewayModel($0) }
+                    ))
+                    .textFieldStyle(LiquidGlassTextFieldStyle())
+                    #if os(iOS)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    #endif
+
+                    SecureField("Gateway token", text: Binding(
+                        get: { summaryService.settings.pccGatewayToken },
+                        set: { summaryService.setPCCGatewayToken($0) }
+                    ))
+                    .textFieldStyle(LiquidGlassTextFieldStyle())
+                    #if os(iOS)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    #endif
+
+                    HStack(spacing: 10) {
+                        Button {
+                            testPCCGatewayConnection()
+                        } label: {
+                            HStack(spacing: 6) {
+                                if isTestingPCCGateway {
+                                    ProgressView()
+                                        .scaleEffect(0.8)
+                                }
+                                Text("Test Connection")
+                            }
+                        }
+                        .buttonStyle(LiquidGlassButtonStyle())
+                        .disabled(isTestingPCCGateway)
+
+                        if let pccGatewayConnectionStatus {
+                            Text(pccGatewayConnectionStatus)
+                                .font(.caption)
+                                .foregroundColor(pccGatewayConnectionStatus.hasPrefix("Connected") ? .green : .red)
+                        }
+                    }
+                }
+            }
+
+            if summaryService.settings.selectedSummaryProvider == .mlxLocal {
+	                            VStack(alignment: .leading, spacing: 10) {
+	                                TextField("LiteRT Hugging Face Repo", text: Binding(
+	                                    get: { summaryService.settings.mlxModelID },
+	                                    set: { summaryService.setMLXModelID($0) }
+	                                ))
+	                                .textFieldStyle(LiquidGlassTextFieldStyle())
+
+	                                Stepper(
+	                                    value: Binding(
+	                                        get: { summaryService.settings.mlxMaxContextTokens },
+	                                        set: { summaryService.setMLXMaxContextTokens($0) }
+	                                    ),
+	                                    in: 0...LiteRTLocalService.maxContextTokens,
+	                                    step: 1024
+	                                ) {
+                        Text(
+                            "Context tokens: " + (summaryService.settings.mlxMaxContextTokens == 0
+                                ? "Auto"
+                                : "\(summaryService.settings.mlxMaxContextTokens)")
+                        )
+                    }
+
+	                                Stepper(
+	                                    value: Binding(
+	                                        get: { summaryService.settings.mlxMaxOutputTokens },
+	                                        set: { summaryService.setMLXMaxOutputTokens($0) }
+	                                    ),
+	                                    in: 64...512,
+	                                    step: 64
+	                                ) {
+                        Text("Max output tokens: \(summaryService.settings.mlxMaxOutputTokens)")
+                    }
+
+	                                Button(action: {
+	                                    downloadLiteRTModel()
+	                                }) {
+	                                    HStack {
+	                                        if isLoadingMLXModel {
+                                ProgressView()
+                                    .scaleEffect(0.8)
+	                                        } else {
+	                                            Image(systemName: "arrow.down.circle")
+	                                        }
+	                                        Text("Download LiteRT Model")
+	                                    }
+	                                }
+                    .buttonStyle(LiquidGlassButtonStyle())
+                    .disabled(isLoadingMLXModel)
+
+                    if let progress = mlxDownloadProgress {
+                        ProgressView(progress)
+                    }
+
+                    if let mlxLoadStatus {
+                        Text(mlxLoadStatus)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+
+                    if let mlxLoadError {
+                        Text(mlxLoadError)
+                            .font(.caption)
+                            .foregroundColor(RedappDesign.negative)
+                    }
+
+	                                Button(action: {
+	                                    isPresentingMLXModelManager = true
+	                                }) {
+	                                    HStack {
+	                                        Image(systemName: "folder")
+	                                        Text("Manage LiteRT Models")
+	                                    }
+	                                }
+                    .buttonStyle(LiquidGlassButtonStyle())
+                }
+            }
+
+            if summaryService.settings.selectedSummaryProvider == .coreAIMLXLocal {
+                VStack(alignment: .leading, spacing: 10) {
+                    TextField("CoreAI MLX Hugging Face Repo", text: Binding(
+                        get: { summaryService.settings.coreAIMLXModelID },
+                        set: { summaryService.setCoreAIMLXModelID($0) }
+                    ))
+                    .textFieldStyle(LiquidGlassTextFieldStyle())
+
+                    Stepper(
+                        value: Binding(
+                            get: { summaryService.settings.coreAIMLXMaxContextTokens },
+                            set: { summaryService.setCoreAIMLXMaxContextTokens($0) }
+                        ),
+                        in: 0...CoreAIMLXLocalService.maxContextTokens,
+                        step: 1024
+                    ) {
+                        Text(
+                            "Context tokens: " + (summaryService.settings.coreAIMLXMaxContextTokens == 0
+                                ? "Auto"
+                                : "\(summaryService.settings.coreAIMLXMaxContextTokens)")
+                        )
+                    }
+
+                    Stepper(
+                        value: Binding(
+                            get: { summaryService.settings.coreAIMLXMaxOutputTokens },
+                            set: { summaryService.setCoreAIMLXMaxOutputTokens($0) }
+                        ),
+                        in: 64...512,
+                        step: 64
+                    ) {
+                        Text("Max output tokens: \(summaryService.settings.coreAIMLXMaxOutputTokens)")
+                    }
+
+                    Button(action: {
+                        downloadCoreAIMLXModel()
+                    }) {
+                        HStack {
+                            if isLoadingMLXModel {
+                                ProgressView()
+                                    .scaleEffect(0.8)
+                            } else {
+                                Image(systemName: "arrow.down.circle")
+                            }
+                            Text("Download CoreAI MLX Model")
+                        }
+                    }
+                    .buttonStyle(LiquidGlassButtonStyle())
+                    .disabled(isLoadingMLXModel)
+
+                    if let progress = mlxDownloadProgress {
+                        ProgressView(progress)
+                    }
+
+                    if let mlxLoadStatus {
+                        Text(mlxLoadStatus)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+
+                    if let mlxLoadError {
+                        Text(mlxLoadError)
+                            .font(.caption)
+                            .foregroundColor(RedappDesign.negative)
+                    }
+
+                    Text("Uses an MLX-format Gemma 4 E2B model for closest-family comparison with the LiteRT Gemma 4 E2B .litertlm model.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+        } header: {
+            Text("Summaries")
+        }
+
+        Section {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    SecureField("Gemini API Key", text: Binding(
+                        get: { summaryService.settings.geminiApiKey },
+                        set: { summaryService.setGeminiApiKey($0) }
+                    ))
+                    .textFieldStyle(LiquidGlassTextFieldStyle())
+                    
+                    // Status indicator
+                    Image(systemName: summaryService.settings.geminiApiKey.isEmpty ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                        .foregroundColor(summaryService.settings.geminiApiKey.isEmpty ? .orange : .green)
+                }
+                
+                Text("Required when using Gemini for summaries and Q&A")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+        } header: {
+            Text("Gemini API Key")
+        }
+
+        Section {
+            Picker("Destination", selection: Binding(
+                get: { summaryService.settings.selectedWebAIProvider },
+                set: { summaryService.setWebAIProvider($0) }
+            )) {
+                ForEach(WebAIProvider.allCases) { provider in
+                    Text(provider.displayName).tag(provider)
+                }
+            }
+            .pickerStyle(.menu)
+
+            webAISessionRow(.chatgpt, name: "ChatGPT")
+            webAISessionRow(.gemini, name: "Gemini")
+        } header: {
+            Text("Web AI")
+        } footer: {
+            Text("Log in inside redapp so ChatGPT and Gemini sessions are reused by the in-app WebAI browser. Reset signs that service out.")
+        }
+    }
+
+    // MARK: Voice page
+
+    @ViewBuilder
+    private var voiceSettingsSections: some View {
+        Section {
+            VStack(alignment: .leading, spacing: 8) {
+                Picker("Local Engine", selection: Binding(
+                    get: { summaryService.settings.localTTSEngine },
+                    set: { summaryService.setLocalTTSEngine($0) }
+                )) {
+                    ForEach(LocalTTSEngine.availableEngines) { engine in
+                        Text(engine.displayName).tag(engine)
+                    }
+                }
+                
+                Text(localTTSEngineDescription)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                if summaryService.settings.localTTSEngine == .kokoro && !KokoroTTSService.shared.isAvailable {
+                    Text("MLX TTS requires the MLXAudio package and model access.")
+                        .font(.caption)
+                        .foregroundColor(.orange)
+                }
+            }
+        } header: {
+            Text("Local TTS Engine")
+        }
+
+        #if os(iOS)
+        Section {
+            if summaryService.settings.localTTSEngine == .system {
+                if iosVoices.isEmpty {
+                    Text("No voices available. Install voices in System Settings → Accessibility → Spoken Content → System Voice")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                } else {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Picker("Local Voice", selection: $localVoiceID) {
+                            ForEach(iosVoices, id: \.id) { v in
+                                Text(v.title).tag(v.id)
+                            }
+                        }
+                        .onChange(of: localVoiceID) { newID in
+                            UserDefaults.standard.set(newID, forKey: voiceKey)
+                        }
+                        
+                        HStack(spacing: 12) {
+                            Button("Test Voice") {
+                                testSelectedVoice()
+                            }
+                            .buttonStyle(LiquidGlassButtonStyle(isProminent: true))
+                            
+                            Button("Reset to Default") {
+                                resetToDefaultVoice()
+                            }
+                            .buttonStyle(LiquidGlassButtonStyle())
+                        }
+                        
+                        Text("Premium voices provide the best quality for local TTS")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+            } else {
+                #if canImport(MLXAudioCore) && canImport(MLXAudioTTS)
+                VStack(alignment: .leading, spacing: 12) {
+                    Picker("MLX Voice", selection: Binding(
+                        get: { summaryService.settings.kokoroVoice },
+                        set: { summaryService.setKokoroVoice($0) }
+                    )) {
+                        ForEach(KokoroVoice.allCases) { voice in
+                            Text(voice.displayName).tag(voice.rawValue)
+                        }
+                    }
+                    
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Text("Speed")
+                            Spacer()
+                            Text(String(format: "%.1fx", summaryService.settings.kokoroSpeed))
+                                .foregroundColor(.secondary)
+                        }
+                        Slider(
+                            value: Binding(
+                                get: { summaryService.settings.kokoroSpeed },
+                                set: { summaryService.setKokoroSpeed($0) }
+                            ),
+                            in: 0.5...2.0,
+                            step: 0.1
+                        )
+                    }
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Button(action: {
+                            isKokoroPrewarming = true
+                            kokoroPrewarmError = nil
+                            kokoroPrewarmStatus = nil
+                            Task {
+                                do {
+                                    try await summaryService.precacheKokoroNow()
+                                    await MainActor.run {
+                                        isKokoroPrewarming = false
+                                        kokoroPrewarmStatus = "MLX pre-cache complete"
+                                    }
+                                } catch {
+                                    await MainActor.run {
+                                        isKokoroPrewarming = false
+                                        kokoroPrewarmError = error.localizedDescription
+                                    }
+                                }
+                            }
+                        }) {
+                            HStack {
+                                if isKokoroPrewarming {
+                                    ProgressView()
+                                        .scaleEffect(0.8)
+                                } else {
+                                    Image(systemName: "bolt.circle")
+                                }
+                                Text("Pre-cache MLX TTS")
+                            }
+                        }
+                        .buttonStyle(LiquidGlassButtonStyle(isProminent: true))
+                        .disabled(isKokoroPrewarming || !KokoroTTSService.shared.isAvailable)
+
+                        if summaryService.settings.kokoroPrecacheEnabled {
+                            Text("Pre-cache enabled (loads models at launch).")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+
+                            Button("Disable Pre-cache") {
+                                summaryService.setKokoroPrecacheEnabled(false)
+                                kokoroPrewarmStatus = "Pre-cache disabled and MLX memory released"
+                            }
+                            .buttonStyle(LiquidGlassButtonStyle())
+                        }
+
+                        if let status = kokoroPrewarmStatus {
+                            Text(status)
+                                .font(.caption)
+                                .foregroundColor(RedappDesign.positive)
+                        }
+
+                        if let error = kokoroPrewarmError {
+                            Text(error)
+                                .font(.caption)
+                                .foregroundColor(RedappDesign.negative)
+                        }
+                    }
+                    
+                    Text("MLX TTS runs fully on device. First use may download large model assets.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                #else
+                Text("MLX TTS requires the MLXAudio package.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                #endif
+            }
+        } header: {
+            Text(summaryService.settings.localTTSEngine == .kokoro ? "MLX Voice" : "Local TTS Voice")
+        } footer: {
+            if summaryService.settings.localTTSEngine == .system {
+                Text("Download premium voices from Settings → Accessibility → Spoken Content → Voices for the best experience")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            } else {
+                Text("MLX voices are bundled or downloaded as model assets.")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+        }
+        #endif
+
+        Section {
+            VStack(alignment: .leading, spacing: 8) {
+                Picker("Voice", selection: Binding(
+                    get: { summaryService.settings.ttsVoice },
+                    set: { summaryService.setTTSVoice($0) }
+                )) {
+                    ForEach(TTSProvider.openai.availableVoices, id: \.self) { voice in
+                        Text(voice).tag(voice)
+                    }
+                }
+                
+                Text("Choose your preferred OpenAI TTS voice")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            
+            VStack(alignment: .leading, spacing: 8) {
+                Picker("Model", selection: Binding(
+                    get: { summaryService.settings.ttsModel },
+                    set: { summaryService.setTTSModel($0) }
+                )) {
+                    ForEach(TTSProvider.openai.availableModels, id: \.self) { model in
+                        Text(model).tag(model)
+                    }
+                }
+                
+                Text("tts-1: Faster, lower latency • tts-1-hd: Higher quality")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+        } header: {
+            Text("OpenAI Voice")
+        }
+
+        Section {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    SecureField("OpenAI API Key", text: Binding(
+                        get: { summaryService.settings.openaiApiKey },
+                        set: { summaryService.setOpenAIApiKey($0) }
+                    ))
+                    .textFieldStyle(LiquidGlassTextFieldStyle())
+                    
+                    // Status indicator
+                    Image(systemName: summaryService.settings.openaiApiKey.isEmpty ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                        .foregroundColor(summaryService.settings.openaiApiKey.isEmpty ? .orange : .green)
+                }
+                
+                Text("Required for OpenAI TTS (cloud)")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            
+            Button("API Key Help") {
+                showApiKeyHelp = true
+            }
+            .buttonStyle(LiquidGlassButtonStyle())
+        } header: {
+            Text("OpenAI API Key")
+        }
+    }
+
+    // MARK: Appearance page
+
+    @ViewBuilder
+    private var appearanceSettingsSections: some View {
+        Section {
+            Picker("Appearance", selection: Binding(
+                get: { summaryService.settings.isDarkMode },
+                set: { summaryService.setDarkMode($0) }
+            )) {
+                Text("Match System").tag(false)
+                Text("Dark").tag(true)
+            }
+            .pickerStyle(.inline)
+            .labelsHidden()
+        } header: {
+            Text("Appearance")
+        } footer: {
+            Text("Match System switches between the light and dark design with your iPad or iPhone. Dark keeps redapp dark all the time.")
+        }
+
+        Section {
+            Toggle("Show thumbnails in feed", isOn: $feedShowsThumbnails)
+            .tint(RedappDesign.accent)
+        } footer: {
+            Text("A small image next to posts that have one. NSFW and spoiler images are blurred.")
+        }
+    }
+
+    // MARK: Storage page
+
+    @ViewBuilder
+    private var storageSettingsSections: some View {
+        Section {
+            LabeledContent("Removable cache", value: removableCacheSizeDisplay)
+
+            Button(role: .destructive) {
+                isClearingCaches = true
+                summaryService.clearAllCaches {
+                    updateStorageDisplays()
+                    isClearingCaches = false
+                }
+            } label: {
+                HStack {
+                    if isClearingCaches {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Clearing…")
+                    } else {
+                        Label("Clear All Caches", systemImage: "trash")
+                    }
+                }
+            }
+            .disabled(isClearingCaches)
+
+            Button {
+                summaryService.clearCache()
+                updateStorageDisplays()
+            } label: {
+                Label("Clear TTS Memory Cache", systemImage: "speaker.slash")
+            }
+
+            Button {
+                isCleaningFailedModelDownloads = true
+                failedModelDownloadCleanupStatus = nil
+                summaryService.clearFailedModelDownloads { message in
+                    failedModelDownloadCleanupStatus = message
+                    updateStorageDisplays()
+                    isCleaningFailedModelDownloads = false
+                }
+            } label: {
+                HStack {
+                    if isCleaningFailedModelDownloads {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Cleaning…")
+                    } else {
+                        Label("Clean Failed Model Downloads", systemImage: "arrow.down.doc")
+                    }
+                }
+            }
+            .disabled(isCleaningFailedModelDownloads)
+
+            if let failedModelDownloadCleanupStatus {
+                Text(failedModelDownloadCleanupStatus)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+        } header: {
+            Text("Caches")
+        } footer: {
+            Text("Clear All Caches keeps downloaded LiteRT and MLX models. The TTS memory cache only holds audio kept for replay. Cleaning failed downloads removes incomplete .download, .partial and .dl-bits files; completed models are kept.")
+        }
+
+        Section {
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack {
+                        Text("App Container")
+                            .foregroundColor(.secondary)
+                        Spacer()
+                        if isLoadingStorageBreakdown {
+                            ProgressView()
+                                .scaleEffect(0.8)
+                        } else {
+                            Button {
+                                refreshStorageBreakdown()
+                            } label: {
+                                Image(systemName: "arrow.clockwise")
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                    }
+
+                    if storageBreakdownItems.isEmpty {
+                        Text(isLoadingStorageBreakdown ? "Scanning storage…" : "No storage details found.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    } else {
+                        ForEach(storageBreakdownItems) { item in
+                            HStack(alignment: .top, spacing: 10) {
+                                Image(systemName: item.isModelStorage ? "cube.box.fill" : "folder.fill")
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 22)
+
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(item.name)
+                                        .font(.subheadline)
+                                        .fontWeight(.semibold)
+                                    Text(item.detail)
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                        .lineLimit(2)
+                                }
+
+                                Spacer()
+
+                                Text(item.sizeText)
+                                    .font(.caption)
+                                    .fontWeight(.semibold)
+                                    .foregroundColor(.secondary)
+
+                                if item.cleanupKind != nil || item.isModelStorage {
+                                    Button(role: .destructive) {
+                                        pendingStorageBreakdownDelete = item
+                                        showStorageBreakdownDeleteConfirm = true
+                                    } label: {
+                                        Image(systemName: "trash")
+                                    }
+                                    .buttonStyle(.borderless)
+                                    .disabled(isDeletingStorageBreakdown)
+                                }
+                            }
+                            .padding(.vertical, 3)
+                        }
+                    }
+
+                    if let storageBreakdownStatus {
+                        Text(storageBreakdownStatus)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+
+                    Text("Removable cache rows exclude local models. Use model rows or Local Model Storage to delete downloaded models.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+        } header: {
+            Text("Storage Breakdown")
+        }
+
+        Section {
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack {
+                        Text("Downloaded Models")
+                            .foregroundColor(.secondary)
+                        Spacer()
+                        if isLoadingModelStorage {
+                            ProgressView()
+                                .scaleEffect(0.8)
+                        } else {
+                            Button {
+                                refreshModelStorage()
+                            } label: {
+                                Image(systemName: "arrow.clockwise")
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                    }
+
+                    if modelStorageItems.isEmpty {
+                        Text(isLoadingModelStorage ? "Scanning model storage…" : "No local models found.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    } else {
+                        ForEach(modelStorageItems) { item in
+                            HStack(alignment: .top, spacing: 10) {
+                                Image(systemName: item.kind == .liteRT ? "cube.box.fill" : "cpu.fill")
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 22)
+
+                                VStack(alignment: .leading, spacing: 3) {
+                                    HStack(spacing: 6) {
+                                        Text(item.name)
+                                            .font(.subheadline)
+                                            .fontWeight(.semibold)
+                                            .lineLimit(2)
+                                        if item.isCurrentSelection {
+                                            Text("Current")
+                                                .font(.caption2)
+                                                .padding(.horizontal, 6)
+                                                .padding(.vertical, 2)
+                                                .foregroundStyle(RedappDesign.accent)
+                                                .background(RedappDesign.accentSoft)
+                                                .clipShape(Capsule())
+                                        }
+                                    }
+                                    Text("\(item.kind.rawValue) • \(item.detail)")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                    Text(item.sizeText)
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+
+                                Spacer()
+
+                                Button(role: .destructive) {
+                                    pendingModelStorageDelete = item
+                                    showModelStorageDeleteConfirm = true
+                                } label: {
+                                    Image(systemName: "trash")
+                                }
+                                .buttonStyle(.borderless)
+                                .disabled(isDeletingModelStorage)
+                            }
+                            .padding(.vertical, 4)
+                        }
+                    }
+
+                    if let modelStorageStatus {
+                        Text(modelStorageStatus)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+
+                    Text("Deleting a model removes only that selected model. Other caches and models are left alone.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+        } header: {
+            Text("Local Models")
+        }
+
+        Section {
+            Label("Image uploads use Catbox.moe (free, no account needed)", systemImage: "photo.on.rectangle")
+                .font(.subheadline)
+        } header: {
+            Text("Image Uploads")
+        } footer: {
+            Text("Images are uploaded anonymously to Catbox.moe before posting to Reddit.")
+        }
+    }
+
+
     private func updateStorageDisplays() {
         removableCacheSizeDisplay = summaryService.getRemovableCacheSize()
         refreshStorageBreakdown()
@@ -5760,6 +5908,8 @@ struct SettingsView: View {
             return "Uses the local Summarize daemon with the configured Codex CLI model for summaries, Q&A, tables, and visual prompts."
         case .applePCCGateway:
             return "Uses a token-protected Mac gateway that forwards summaries, Q&A, batch summaries, tables, and visual prompts to fm serve with the pcc model."
+        case .chatGPT:
+            return "Uses your ChatGPT plan (Sign in with ChatGPT) for summaries, Q&A, batch summaries, tables, and visual prompts."
         }
     }
 
@@ -5939,7 +6089,7 @@ struct SettingsView: View {
                                         .font(.body)
                                     Text("Selected")
                                         .font(.caption)
-                                        .foregroundColor(.green)
+                                        .foregroundColor(RedappDesign.positive)
                                 }
                                 Spacer()
                                 Button(role: .destructive) {
@@ -5965,6 +6115,8 @@ struct SettingsView: View {
 	                        Text("Select a .litertlm model file or a folder containing one from iCloud Drive, local storage, or external drives.")
 	                    }
                 }
+                .scrollContentBackground(.hidden)
+                .background(RedappDesign.canvas)
                 .navigationTitle("Manage LiteRT Models")
                 .toolbar {
                     ToolbarItem(placement: .cancellationAction) {
@@ -6714,6 +6866,31 @@ class RedditAPI {
         }
     }
     
+    /// Icon URL for a subreddit (community icon, else the legacy icon image).
+    /// Uses the signed-in API when available, otherwise Reddit's public JSON.
+    func fetchSubredditIconURL(_ subreddit: String) async throws -> URL? {
+        let name = subreddit.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? subreddit
+        let data: Data
+        if RedditAuthManager.shared.isAuthenticated {
+            data = try await makeAuthenticatedRequest(url: URL(string: "https://oauth.reddit.com/r/\(name)/about")!, method: "GET", body: nil)
+        } else {
+            var request = URLRequest(url: URL(string: "https://www.reddit.com/r/\(name)/about.json")!)
+            request.setValue("RedditApp/1.0", forHTTPHeaderField: "User-Agent")
+            let (body, response) = try await URLSession.shared.data(for: request)
+            guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
+            data = body
+        }
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let about = json["data"] as? [String: Any] else { return nil }
+        for key in ["community_icon", "icon_img"] {
+            if let raw = about[key] as? String, !raw.isEmpty {
+                let cleaned = raw.replacingOccurrences(of: "&amp;", with: "&")
+                if let url = URL(string: cleaned), url.scheme?.hasPrefix("http") == true { return url }
+            }
+        }
+        return nil
+    }
+
     func fetchPostFlairs(subreddit: String) async throws -> [FlairChoice] {
         // First ensure we're authenticated
         try await RedditAuthManager.shared.refreshTokenIfNeeded()
@@ -8578,6 +8755,9 @@ class RedditSubredditViewModel: ObservableObject {
     @Published var batchFinalSummary: String? {
         didSet {
             if isApplyingFinalSummaryUpdate { return }
+            // While the overview streams, skip per-chunk widget saves and reloads;
+            // generateFinalSummary publishes the finished text once.
+            if isGeneratingBatchOverallSummary, batchFinalSummary?.isEmpty == false { return }
             if batchFinalSummary != nil {
                 requiresImmediateWidgetRefresh = true
             }
@@ -8608,7 +8788,23 @@ class RedditSubredditViewModel: ObservableObject {
     @Published var batchRawComments: String = ""
     @Published var batchExecutionMode: BatchExecutionMode = .settings
     @Published var batchExtractedPosts: [BatchExtractedPost] = []
-    @Published private(set) var batchCapturedSources: [ResearchSourceInput] = []
+    @Published private(set) var batchCapturedSources: [ResearchSourceInput] = [] {
+        didSet { batchSourceLinksCache = nil }
+    }
+    /// Built once per change to the captured sources; the batch screen reads it on every render.
+    private var batchSourceLinksCache: [String: URL]?
+    var batchCapturedSourceLinks: [String: URL] {
+        if let cached = batchSourceLinksCache { return cached }
+        var links: [String: URL] = [:]
+        for source in batchCapturedSources {
+            let permalink = normalizeRedditPermalink(source.permalink)
+            if let url = URL(string: permalink), !permalink.isEmpty {
+                links[source.sourceID] = url
+            }
+        }
+        batchSourceLinksCache = links
+        return links
+    }
     @Published private(set) var batchCoverage: ResearchCoverageInput = .empty
     @Published private(set) var savedResearchRunID: UUID?
     @Published var researchLibraryError: String?
@@ -10335,11 +10531,27 @@ class RedditSubredditViewModel: ObservableObject {
     @MainActor
     @discardableResult
     func saveCurrentBatchToResearchLibrary() -> UUID? {
-        guard !batchSummaries.isEmpty || !(batchFinalSummary?.isEmpty ?? true) else {
+        let summariesToSave: [(title: String, summary: String, permalink: String)] = batchExecutionMode == .web
+            ? batchExtractedPosts.map { (title: $0.title, summary: $0.comments, permalink: $0.permalink) }
+            : batchSummaries.map { (title: $0.postTitle, summary: $0.summary, permalink: $0.permalink) }
+        guard !summariesToSave.isEmpty || !(batchFinalSummary?.isEmpty ?? true) else {
             researchLibraryError = "There are no completed summaries to save yet."
             return nil
         }
-        if let savedResearchRunID {
+        let currentSourceDigest = BatchPodcastContextBuilder.sourceDigest(
+            sources: batchCapturedSources,
+            summaries: summariesToSave.map {
+                BatchPodcastPostSummaryInput(
+                    title: $0.title,
+                    summary: $0.summary,
+                    permalink: $0.permalink
+                )
+            },
+            overallSummary: batchFinalSummary
+        )
+        if let savedResearchRunID,
+           let savedRun = try? ResearchLibraryStore.shared.run(id: savedResearchRunID),
+           savedRun.sourceDigest == currentSourceDigest {
             if let overall = batchFinalSummary?.trimmingCharacters(in: .whitespacesAndNewlines),
                !overall.isEmpty {
                 do {
@@ -10371,7 +10583,7 @@ class RedditSubredditViewModel: ObservableObject {
 
         var coverage = batchCoverage
         coverage.postsRequested = max(coverage.postsRequested, max(batchTotalPosts, posts.count))
-        coverage.postsAnalyzed = max(coverage.postsAnalyzed, batchSummaries.count)
+        coverage.postsAnalyzed = max(coverage.postsAnalyzed, summariesToSave.count)
         if let batchError, !batchError.isEmpty, !coverage.failureMessages.contains(batchError) {
             coverage.failureMessages.append(batchError)
         }
@@ -10402,9 +10614,7 @@ class RedditSubredditViewModel: ObservableObject {
             timeRange: selectedPostType == .top ? selectedTopPostTimeRange.rawValue : "all",
             sources: batchCapturedSources,
             coverage: coverage,
-            perPostSummaries: batchSummaries.map {
-                (title: $0.postTitle, summary: $0.summary, permalink: $0.permalink)
-            },
+            perPostSummaries: summariesToSave,
             overallSummary: batchFinalSummary,
             generationReceipt: receipt
         )
@@ -10589,9 +10799,26 @@ class RedditSubredditViewModel: ObservableObject {
 	        showBatchResults = true
 	        batchFinalSummary = ""
 	        isGeneratingBatchOverallSummary = true
-	        Task {
-	            await generateFinalSummary(subreddit: effectiveBatchContextName)
+	        #if os(iOS)
+	        // Submit while still in the foreground (the tap), so the whole step — final summary plus
+	        // the condensed widget summary — runs under one continued-processing task.
+	        let backgroundHandle = GeminiBackgroundTaskManager.shared.beginLongRunningTask(
+	            identifier: .summarization,
+	            title: "Generating overall summary"
+	        )
+	        #endif
+	        let summaryTask = Task {
+	            #if os(iOS)
+	            await backgroundHandle.waitForTaskStartIfNeeded()
+	            #endif
+	            let succeeded = await generateFinalSummary(subreddit: effectiveBatchContextName)
+	            #if os(iOS)
+	            backgroundHandle.finish(success: succeeded)
+	            #endif
 	        }
+	        #if os(iOS)
+	        backgroundHandle.registerCancellationHandler { summaryTask.cancel() }
+	        #endif
 	    }
 
     func overallSummaryPrompt() -> String {
@@ -10661,7 +10888,9 @@ class RedditSubredditViewModel: ObservableObject {
         """
     }
 
-    private func generateFinalSummary(subreddit: String) async {
+    /// Returns whether the overall summary was produced.
+    @discardableResult
+    private func generateFinalSummary(subreddit: String) async -> Bool {
         let selectedProvider = SummaryService.shared.settings.selectedSummaryProvider
         await MainActor.run {
             self.batchProgress = 1.0
@@ -10740,6 +10969,7 @@ class RedditSubredditViewModel: ObservableObject {
                 }
                 #endif
             }
+            return true
         } catch {
             await MainActor.run {
                 self.batchError = "Failed to generate final summary: \(error.localizedDescription)"
@@ -10755,6 +10985,7 @@ class RedditSubredditViewModel: ObservableObject {
                 }
                 #endif
             }
+            return false
         }
     }
     
@@ -11232,124 +11463,75 @@ struct CommentAnalyticsView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                    // Header with glass effect
-                    HStack {
-                        Text("Comment Analysis")
-                            .font(.largeTitle)
-                            .fontWeight(.bold)
-                        
-                        Spacer()
-                        
-                        Button(action: {
-                            presentationMode.wrappedValue.dismiss()
-                        }) {
-                            Image(systemName: "xmark.circle.fill")
-                                .font(.title2)
-                                .foregroundColor(.gray)
-                        }
-                    }
-                
+            VStack(alignment: .leading, spacing: 28) {
                 if isLoading {
-                    VStack {
+                    VStack(spacing: 12) {
                         ProgressView()
-                            .padding()
-                        Text("Analyzing comments...")
+                            .tint(RedappDesign.accent)
+                        Text("Analyzing comments…")
+                            .font(.subheadline)
+                            .foregroundStyle(RedappDesign.inkSecondary)
                     }
                     .frame(maxWidth: .infinity, minHeight: 300)
                 } else if let analytics = analytics {
-                    // Sentiment Analysis
-                    VStack(alignment: .leading, spacing: 15) {
-                        Text("Sentiment Analysis")
-                            .font(.title2)
-                            .fontWeight(.bold)
-                            .padding(.horizontal)
-                        
-                        HStack(alignment: .top, spacing: 15) {
-                            // Left side - Sentiment stats
-                            VStack(alignment: .leading, spacing: 15) {
-                                sentimentStatRow(label: "Positive", count: analytics.sentimentCounts.positive, percentage: analytics.sentimentPercentages.positive, color: .green)
-                                sentimentStatRow(label: "Neutral", count: analytics.sentimentCounts.neutral, percentage: analytics.sentimentPercentages.neutral, color: AppColors.neutralGray)
-                                sentimentStatRow(label: "Negative", count: analytics.sentimentCounts.negative, percentage: analytics.sentimentPercentages.negative, color: .red)
+                    // Sentiment
+                    analyticsSection("Sentiment") {
+                        ViewThatFits(in: .horizontal) {
+                            HStack(alignment: .center, spacing: 28) {
+                                sentimentStats(analytics)
+                                sentimentChart(analytics)
                             }
-                            .frame(minWidth: 150)
-                            .padding()
-                            
-                            // Right side - Pie chart
-                            VStack {
-                                SentimentPieChartView(
-                                    positive: analytics.sentimentPercentages.positive,
-                                    neutral: analytics.sentimentPercentages.neutral,
-                                    negative: analytics.sentimentPercentages.negative
-                                )
-                                .frame(height: 200)
-                                
-                                // Legend
-                                HStack(spacing: 12) {
-                                    legendItem(color: .green, label: "Positive")
-                                    legendItem(color: AppColors.neutralGray, label: "Neutral")
-                                    legendItem(color: .red, label: "Negative")
-                                }
+                            VStack(alignment: .leading, spacing: 20) {
+                                sentimentStats(analytics)
+                                sentimentChart(analytics)
+                                    .frame(maxWidth: .infinity)
                             }
-                            .padding()
                         }
-                        .padding(.horizontal)
+                        .redappCard(cornerRadius: RedappDesign.Radius.large, padding: 20)
                     }
-                    
-                    // Overall Stats
-                    VStack(alignment: .leading, spacing: 15) {
-                        Text("Overall Comment Analysis")
-                            .font(.title2)
-                            .fontWeight(.bold)
-                            .padding(.horizontal)
-                        
-                        VStack(alignment: .leading, spacing: 10) {
+
+                    // Overall Stats + Key Insights
+                    analyticsSection("At a glance") {
+                        VStack(alignment: .leading, spacing: 12) {
                             bulletPoint("Comments show \(getSentimentMajority(analytics: analytics)) sentiment: \(String(format: "%.0f", analytics.sentimentPercentages.positive))% positive, \(String(format: "%.0f", analytics.sentimentPercentages.neutral))% neutral, \(String(format: "%.0f", analytics.sentimentPercentages.negative))% negative.")
                             bulletPoint("Average comment length is \(analytics.averageCommentLength) characters.")
                             bulletPoint("\(analytics.uniqueAuthorsCount) unique authors contributed to this discussion.")
-                            
+
                             if let mostActive = analytics.mostActiveAuthor {
                                 bulletPoint("Most active author contributed \(mostActive.count) comments.")
                             }
-                            
+
                             let mostCommonLength = analytics.commentLengthDistribution.max(by: { $0.value < $1.value })?.key ?? "unknown"
                             bulletPoint("The most common comment length is between \(mostCommonLength) characters.")
-                        }
-                        .padding()
-                        .padding(.horizontal)
-                    }
-                    
-                    // Key Insights
-                    VStack(alignment: .leading, spacing: 15) {
-                        Text("Key Insights")
-                            .font(.title2)
-                            .fontWeight(.bold)
-                            .padding(.horizontal)
-                        
-                        VStack(alignment: .leading, spacing: 10) {
+
+                            Rectangle()
+                                .fill(RedappDesign.hairline)
+                                .frame(height: 1)
+                                .padding(.vertical, 2)
+
                             bulletPoint("This thread has \(analytics.totalComments) analyzed comments.")
-                            
+
                             if !analytics.highlyVotedComments.isEmpty {
                                 bulletPoint("The highest voted comment has \(analytics.highlyVotedComments.first?.score ?? 0) upvotes.")
                             }
-                            
+
                             if !analytics.commentTopics.isEmpty {
                                 let topicsText = analytics.commentTopics.prefix(3).joined(separator: ", ")
                                 bulletPoint("Common topics include: \(topicsText)")
                             }
-                            
+
                             bulletPoint("Comment length distribution shows most comments are \(getMostCommonLengthDescription(analytics: analytics)).")
                         }
-                        .padding()
-                        .padding(.horizontal)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .redappCard(cornerRadius: RedappDesign.Radius.large, padding: 20)
                     }
-                    
+
                     // Thematic Analysis (LLM-based)
-                    VStack(alignment: .leading, spacing: 15) {
-                        HStack {
-                            Text("Thematic Analysis")
-                                .font(.title2)
-                                .fontWeight(.bold)
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack(alignment: .firstTextBaseline) {
+                            Text("Themes")
+                                .font(RedappType.section)
+                                .foregroundStyle(RedappDesign.ink)
 
                             Spacer()
 
@@ -11357,129 +11539,137 @@ struct CommentAnalyticsView: View {
                             if thematicAnalysis != nil {
                                 if isSpeakingAnalysisCloud || isSpeakingAnalysisLocally {
                                     Button { stopAnalysisTTS() } label: {
-                                        Image(systemName: "stop.circle.fill")
-                                            .foregroundColor(.red)
+                                        Label("Stop", systemImage: "stop.fill")
                                     }
-                                    .buttonStyle(PlainButtonStyle())
+                                    .buttonStyle(RedappSecondaryButtonStyle())
                                 } else {
-                                    Button { speakAnalysisCloud() } label: {
-                                        Image(systemName: "speaker.wave.2")
+                                    Menu {
+                                        Button { speakAnalysisCloud() } label: {
+                                            Label("Read aloud (Cloud)", systemImage: "speaker.wave.2")
+                                        }
+                                        Button { speakAnalysisLocally() } label: {
+                                            Label("Read aloud (Local)", systemImage: "speaker.wave.2.circle")
+                                        }
+                                        Button { speakAnalysisWithKokoro() } label: {
+                                            Label("Read aloud (MLX TTS)", systemImage: "waveform")
+                                        }
+                                    } label: {
+                                        Label("Listen", systemImage: "headphones")
                                     }
-                                    .buttonStyle(PlainButtonStyle())
-                                    #if os(macOS)
-                                    .help("Read aloud (Cloud)")
-                                    #endif
-
-                                    Button { speakAnalysisLocally() } label: {
-                                        Image(systemName: "speaker.wave.2.circle")
-                                    }
-                                    .buttonStyle(PlainButtonStyle())
-                                    #if os(macOS)
-                                    .help("Read aloud (Local)")
-                                    #endif
-
-                                    Button { speakAnalysisWithKokoro() } label: {
-                                        Image(systemName: "waveform")
-                                    }
-                                    .buttonStyle(PlainButtonStyle())
-                                    #if os(macOS)
-                                    .help("Read aloud (MLX TTS)")
-                                    #endif
+                                    .buttonStyle(RedappSecondaryButtonStyle())
+                                    .accessibilityLabel("Read analysis aloud")
                                 }
                             }
                         }
-                        .padding(.horizontal)
-
-                        Text("Based on analysis of \(analyzedCommentCount) comments.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                            .padding(.horizontal)
 
                         if let throughput = summaryService.mlxThroughputState,
                            throughput.provider == summaryService.settings.selectedSummaryProvider,
                            throughput.provider != .appleCloud {
                             Text(mlxThroughputInlineText(throughput))
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
-                                .padding(.horizontal)
+                                .font(.caption)
+                                .foregroundStyle(RedappDesign.inkSecondary)
                         }
 
                         if isThematicAnalysisLoading {
-                            VStack(alignment: .leading, spacing: 8) {
+                            VStack(alignment: .leading, spacing: 12) {
                                 HStack(spacing: 8) {
                                     ProgressView()
-                                    Text("Generating thematic analysis with AI...")
-                                        .foregroundColor(.secondary)
+                                        .controlSize(.small)
+                                        .tint(RedappDesign.accent)
+                                    Text("Generating thematic analysis with AI…")
+                                        .font(.subheadline)
+                                        .foregroundStyle(RedappDesign.inkSecondary)
                                 }
 
                                 if let partial = thematicAnalysis,
                                    !partial.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                                     ReadableReplyText(content: thematicAnalysisDisplayText(partial), fontScale: 0.9)
-                                        .padding()
                                         .frame(maxWidth: .infinity, alignment: .leading)
-                                        .background(.ultraThinMaterial)
-                                        .cornerRadius(12)
                                 }
                             }
-                            .frame(maxWidth: .infinity)
-                            .padding()
-                            .padding(.horizontal)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .redappCard(cornerRadius: RedappDesign.Radius.large, padding: 20)
                         } else if let thematicAnalysisError = thematicAnalysisError {
-                            Text("Error generating thematic analysis: \(thematicAnalysisError)")
-                                .foregroundColor(.red)
-                                .padding()
-                                .padding(.horizontal)
+                            RedappInlineMessage(
+                                title: "Couldn’t generate the thematic analysis",
+                                message: thematicAnalysisError.replacingOccurrences(of: "Error generating thematic analysis: ", with: "")
+                            )
                         } else if let thematicAnalysis = thematicAnalysis {
                             ReadableReplyText(content: thematicAnalysisDisplayText(thematicAnalysis), fontScale: 0.9)
-                                .padding()
                                 .frame(maxWidth: .infinity, alignment: .leading)
-                                .background(.ultraThinMaterial)
-                                .cornerRadius(12)
-                                .padding(.horizontal)
+                                .redappCard(cornerRadius: RedappDesign.Radius.large, padding: 20)
                         } else {
                             Text("No thematic analysis available")
-                                .foregroundColor(.secondary)
-                                .padding()
-                                .padding(.horizontal)
+                                .font(.subheadline)
+                                .foregroundStyle(RedappDesign.inkSecondary)
                         }
                     }
-                    
+
                     // Comment Summaries by Sentiment
-                    VStack(alignment: .leading, spacing: 15) {
-                        Text("Comment Summaries by Sentiment")
-                            .font(.title2)
-                            .fontWeight(.bold)
-                            .padding(.horizontal)
-                        
-                        // Top positive comments
-                        if analytics.sentimentCounts.positive > 0 {
-                            commentSection(title: "Top Positive Comments", comments: getTopCommentsBySentiment(comments: comments, type: .positive))
-                        }
-                        
-                        // Notable neutral comments
-                        if analytics.sentimentCounts.neutral > 0 {
-                            commentSection(title: "Notable Neutral Comments", comments: getTopCommentsBySentiment(comments: comments, type: .neutral))
-                        }
-                        
-                        // Top negative comments
-                        if analytics.sentimentCounts.negative > 0 {
-                            commentSection(title: "Top Negative Comments", comments: getTopCommentsBySentiment(comments: comments, type: .negative))
+                    analyticsSection("Representative comments") {
+                        VStack(alignment: .leading, spacing: 20) {
+                            // Top positive comments
+                            if analytics.sentimentCounts.positive > 0 {
+                                commentSection(title: "Top positive", color: RedappDesign.positive, comments: getTopCommentsBySentiment(comments: comments, type: .positive))
+                            }
+
+                            // Notable neutral comments
+                            if analytics.sentimentCounts.neutral > 0 {
+                                commentSection(title: "Notable neutral", color: RedappDesign.neutral, comments: getTopCommentsBySentiment(comments: comments, type: .neutral))
+                            }
+
+                            // Top negative comments
+                            if analytics.sentimentCounts.negative > 0 {
+                                commentSection(title: "Top negative", color: RedappDesign.negative, comments: getTopCommentsBySentiment(comments: comments, type: .negative))
+                            }
                         }
                     }
                 } else {
-                    Text("No data available")
-                        .frame(maxWidth: .infinity)
-                        .padding()
+                    ContentUnavailableView(
+                        "No data available",
+                        systemImage: "chart.pie",
+                        description: Text("There are no comments to analyze yet.")
+                    )
+                    .frame(maxWidth: .infinity, minHeight: 300)
                 }
             }
-            .padding(.top)
+            .padding(.horizontal, 24)
+            .padding(.top, 8)
+            .padding(.bottom, 40)
+            .redappReadableColumn(RedappDesign.reportWidth)
         }
-        
-        .scrollContentBackground(.hidden)        // hide list/scroll filler
-        .background(.clear)                      // completely transparent background
-        .background(.ultraThinMaterial.opacity(0.1), in: RoundedRectangle(cornerRadius: 32, style: .continuous))  // ultra-subtle glass effect
-        .shadow(radius: 10, y: 4)
-        .padding()
+        .scrollContentBackground(.hidden)
+        .background(RedappDesign.canvas.ignoresSafeArea())
+        .safeAreaBar(edge: .top, spacing: 0) {
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 6) {
+                    RedappEyebrow("Deep analysis")
+                    Text("Comment analysis")
+                        .font(RedappType.display)
+                        .foregroundStyle(RedappDesign.ink)
+                    if analyzedCommentCount > 0 {
+                        Text("Based on \(analyzedCommentCount) comments")
+                            .font(.subheadline)
+                            .foregroundStyle(RedappDesign.inkSecondary)
+                    }
+                }
+
+                Spacer()
+
+                Button(action: {
+                    presentationMode.wrappedValue.dismiss()
+                }) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 16, weight: .medium))
+                }
+                .buttonStyle(RedappIconButtonStyle())
+                .accessibilityLabel("Close")
+            }
+            .padding(.horizontal, 24)
+            .padding(.top, 20)
+            .padding(.bottom, 12)
+            .redappReadableColumn(RedappDesign.reportWidth)
+        }
         .onAppear {
             // Generate analytics on appear
             Task {
@@ -11495,7 +11685,7 @@ struct CommentAnalyticsView: View {
             titleVisibility: .visible,
             presenting: pendingAnalysisReroute
         ) { request in
-            ForEach(BatchRerouteProvider.allCases) { provider in
+            ForEach(BatchRerouteProvider.available) { provider in
                 Button(provider.displayName) {
                     rerouteThematicAnalysis(request, to: provider)
                 }
@@ -11509,47 +11699,98 @@ struct CommentAnalyticsView: View {
     }
     
     // Helper Views
-    private func sentimentStatRow(label: String, count: Int, percentage: Double, color: Color) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text(label)
-                .font(.headline)
-            
-            Text("\(count)")
-                .font(.title)
-                .foregroundColor(color)
-            
-            // Progress bar
-            ZStack(alignment: .leading) {
-                Rectangle()
-                    .foregroundColor(AppColors.systemGray5)
-                    .frame(height: 8)
-                    .cornerRadius(4)
-                
-                Rectangle()
-                    .foregroundColor(color)
-                    .frame(width: max(CGFloat(percentage / 100.0) * 200, 5), height: 8)
-                    .cornerRadius(4)
-            }
+    private func analyticsSection<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(title)
+                .font(RedappType.section)
+                .foregroundStyle(RedappDesign.ink)
+            content()
         }
     }
-    
+
+    private func sentimentStats(_ analytics: CommentAnalytics) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            sentimentStatRow(label: "Positive", count: analytics.sentimentCounts.positive, percentage: analytics.sentimentPercentages.positive, color: RedappDesign.positive)
+            sentimentStatRow(label: "Neutral", count: analytics.sentimentCounts.neutral, percentage: analytics.sentimentPercentages.neutral, color: RedappDesign.neutral)
+            sentimentStatRow(label: "Negative", count: analytics.sentimentCounts.negative, percentage: analytics.sentimentPercentages.negative, color: RedappDesign.negative)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func sentimentChart(_ analytics: CommentAnalytics) -> some View {
+        VStack(spacing: 14) {
+            SentimentPieChartView(
+                positive: analytics.sentimentPercentages.positive,
+                neutral: analytics.sentimentPercentages.neutral,
+                negative: analytics.sentimentPercentages.negative
+            )
+            .frame(width: 150, height: 150)
+
+            // Legend
+            HStack(spacing: 12) {
+                legendItem(color: RedappDesign.positive, label: "Positive")
+                legendItem(color: RedappDesign.neutral, label: "Neutral")
+                legendItem(color: RedappDesign.negative, label: "Negative")
+            }
+            .fixedSize()
+        }
+    }
+
+    private func sentimentStatRow(label: String, count: Int, percentage: Double, color: Color) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(label)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(RedappDesign.ink)
+                Spacer()
+                Text("\(count)")
+                    .font(.title3.weight(.bold))
+                    .monospacedDigit()
+                    .foregroundStyle(RedappDesign.ink)
+                Text("\(String(format: "%.0f", percentage))%")
+                    .font(.subheadline)
+                    .monospacedDigit()
+                    .foregroundStyle(RedappDesign.inkSecondary)
+                    .frame(minWidth: 40, alignment: .trailing)
+            }
+
+            // Progress bar
+            GeometryReader { proxy in
+                ZStack(alignment: .leading) {
+                    Capsule()
+                        .fill(RedappDesign.hairline)
+                    Capsule()
+                        .fill(color)
+                        .frame(width: percentage > 0 ? max(proxy.size.width * CGFloat(min(percentage, 100) / 100.0), 6) : 0)
+                }
+            }
+            .frame(height: 6)
+        }
+        .accessibilityElement(children: .combine)
+    }
+
     private func legendItem(color: Color, label: String) -> some View {
-        HStack {
+        HStack(spacing: 6) {
             Circle()
                 .fill(color)
-                .frame(width: 12, height: 12)
-            
+                .frame(width: 8, height: 8)
+
             Text(label)
                 .font(.caption)
+                .foregroundStyle(RedappDesign.inkSecondary)
         }
     }
-    
+
     private func bulletPoint(_ text: String) -> some View {
-        HStack(alignment: .top) {
-            Text("•")
-                .fontWeight(.bold)
-            
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Circle()
+                .fill(RedappDesign.accent)
+                .frame(width: 5, height: 5)
+                .alignmentGuide(.firstTextBaseline) { d in d[.bottom] + 4 }
+
             Text(text)
+                .font(.body)
+                .foregroundStyle(RedappDesign.ink)
                 .fixedSize(horizontal: false, vertical: true)
         }
     }
@@ -11591,32 +11832,40 @@ struct CommentAnalyticsView: View {
         return result.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
     }
     
-    private func commentSection(title: String, comments: [CommentData]) -> some View {
+    @ViewBuilder
+    private func commentSection(title: String, color: Color, comments: [CommentData]) -> some View {
+        if !comments.isEmpty {
         VStack(alignment: .leading, spacing: 10) {
-            Text(title)
-                .font(.headline)
-                .padding(.horizontal)
-            
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(color)
+                    .frame(width: 8, height: 8)
+                RedappEyebrow(title)
+            }
+
             ForEach(comments.prefix(3), id: \.id) { comment in
-                VStack(alignment: .leading, spacing: 5) {
-                    Text(comment.rawText.prefix(200))
+                VStack(alignment: .leading, spacing: 10) {
+                    RedappQuote(text: String(comment.rawText.prefix(200)))
                         .lineLimit(3)
-                    
-                    HStack {
+
+                    HStack(spacing: 8) {
+                        RedappAvatar(name: comment.author, size: 20)
                         Text("u/\(comment.author)")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                        
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(RedappDesign.ink)
+
                         Spacer()
-                        
-                        Text("\(comment.score) upvotes")
+
+                        Label("\(comment.score)", systemImage: "arrow.up")
                             .font(.caption)
-                            .foregroundColor(.secondary)
+                            .foregroundStyle(RedappDesign.inkSecondary)
+                            .accessibilityLabel("\(comment.score) upvotes")
                     }
                 }
-                .padding()
-                .padding(.horizontal)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .redappCard()
             }
+        }
         }
     }
     
@@ -11833,6 +12082,7 @@ struct CommentAnalyticsView: View {
             case .webAI: return "Web AI"
             case .summarizeDaemon: return "Codex/Summarize"
             case .applePCCGateway: return "Apple PCC Gateway"
+            case .chatGPT: return "ChatGPT"
             }
         }()
         if state.tokens == 0 && !state.isFinal {
@@ -12113,6 +12363,24 @@ struct CommentAnalyticsView: View {
 // MARK: - Post Summary View
 
 @available(iOS 26, macOS 15, *)
+/// Card chrome for the summary views when they are shown as standalone sheets.
+private struct RedappSummarySheetChrome: ViewModifier {
+    let isEnabled: Bool
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if isEnabled {
+            content
+                .background(RedappDesign.elevated, in: RoundedRectangle(cornerRadius: 32, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 32, style: .continuous).strokeBorder(RedappDesign.hairlineStrong, lineWidth: 1))
+                .shadow(radius: 10, y: 4)
+                .padding()
+        } else {
+            content
+        }
+    }
+}
+
 struct PostSummaryView: View {
     let postSummary: String
     let isGenerating: Bool
@@ -12121,6 +12389,8 @@ struct PostSummaryView: View {
     let onKokoroSpeak: (() -> Void)?
     var onAskAI: ((String, (@MainActor @Sendable (String) -> Void)?) async throws -> String)? = nil
     var onAskAIWeb: ((String, (@MainActor @Sendable (String) -> Void)?) async throws -> String)? = nil
+    /// Inside the reader's Thread summary panel: no sheet title or card chrome.
+    var isEmbeddedInPanel: Bool = false
     @Environment(\.presentationMode) var presentationMode
     @ObservedObject private var summaryService = SummaryService.shared
     @State private var showAskAIResponse = false
@@ -12139,6 +12409,7 @@ struct PostSummaryView: View {
 
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
+                if !isEmbeddedInPanel {
                 // Header with glass effect
                 HStack {
                     VStack(alignment: .leading, spacing: 4) {
@@ -12159,21 +12430,29 @@ struct PostSummaryView: View {
                     Button(action: {
                         presentationMode.wrappedValue.dismiss()
                     }) {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.title2)
-                            .foregroundColor(.gray)
+                        Image(systemName: "xmark")
+                            .font(.system(size: 15, weight: .bold))
+                            .foregroundStyle(RedappDesign.ink)
+                            .frame(width: 36, height: 36)
+                            .background(RedappDesign.ink.opacity(0.06), in: Circle())
+                            .frame(width: 44, height: 44)
+                            .contentShape(Circle())
                     }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Close")
                 }
                 .padding(.horizontal)
+                }
                 
                 // Summary content
                 VStack(alignment: .leading, spacing: 15) {
                     if isGenerating && postSummary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         HStack(spacing: 8) {
                             ProgressView()
-                            Text("Generating summary...")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
+                                .tint(RedappDesign.accent)
+                            Text("Generating summary…")
+                                .font(.subheadline)
+                                .foregroundStyle(RedappDesign.inkSecondary)
                         }
                         .padding(.vertical, 12)
                     } else {
@@ -12212,9 +12491,7 @@ struct PostSummaryView: View {
         }
         .scrollContentBackground(.hidden)
         .background(.clear)
-        .background(.ultraThinMaterial.opacity(0.1), in: RoundedRectangle(cornerRadius: 32, style: .continuous))
-        .shadow(radius: 10, y: 4)
-        .padding()
+        .modifier(RedappSummarySheetChrome(isEnabled: !isEmbeddedInPanel))
         .webAIHandoffPresenter(appState: AppState.shared)
         .sheet(isPresented: $showAskAIResponse) {
             AskAIResponseSheet(
@@ -12281,6 +12558,7 @@ struct PostSummaryView: View {
             case .webAI: return "Web AI"
             case .summarizeDaemon: return "Codex/Summarize"
             case .applePCCGateway: return "Apple PCC Gateway"
+            case .chatGPT: return "ChatGPT"
             }
         }()
         if state.tokens == 0 && !state.isFinal {
@@ -12308,6 +12586,8 @@ struct CommentSummaryView: View {
     let promptNotice: String?
     var onAskAI: ((String, (@MainActor @Sendable (String) -> Void)?) async throws -> String)? = nil
     var onAskAIWeb: ((String, (@MainActor @Sendable (String) -> Void)?) async throws -> String)? = nil
+    /// Inside the reader's Thread summary panel: no sheet title or card chrome.
+    var isEmbeddedInPanel: Bool = false
     @Environment(\.presentationMode) var presentationMode
     @ObservedObject private var summaryService = SummaryService.shared
     @State private var showAskAIResponse = false
@@ -12360,6 +12640,7 @@ struct CommentSummaryView: View {
 
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
+                if !isEmbeddedInPanel {
                 // Header with glass effect
                 HStack {
                     VStack(alignment: .leading) {
@@ -12383,12 +12664,19 @@ struct CommentSummaryView: View {
                     Button(action: {
                         presentationMode.wrappedValue.dismiss()
                     }) {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.title2)
-                            .foregroundColor(.gray)
+                        Image(systemName: "xmark")
+                            .font(.system(size: 15, weight: .bold))
+                            .foregroundStyle(RedappDesign.ink)
+                            .frame(width: 36, height: 36)
+                            .background(RedappDesign.ink.opacity(0.06), in: Circle())
+                            .frame(width: 44, height: 44)
+                            .contentShape(Circle())
                     }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Close")
                 }
                 .padding(.horizontal)
+                }
 
                 if let promptNotice {
                     HStack(alignment: .top, spacing: 10) {
@@ -12410,9 +12698,10 @@ struct CommentSummaryView: View {
                     if isGenerating && commentSummary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         HStack(spacing: 8) {
                             ProgressView()
-                            Text("Generating summary...")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
+                                .tint(RedappDesign.accent)
+                            Text("Generating summary…")
+                                .font(.subheadline)
+                                .foregroundStyle(RedappDesign.inkSecondary)
                         }
                         .padding(.vertical, 12)
                     } else {
@@ -12433,43 +12722,33 @@ struct CommentSummaryView: View {
                 .padding(.horizontal)
                 
                 // Q&A Section
-                Divider()
+                Rectangle()
+                    .fill(RedappDesign.hairline)
+                    .frame(height: 1)
                     .padding(.horizontal)
-                
-                VStack(alignment: .leading, spacing: 15) {
-                    Text("Ask a question about the comments:")
+
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Ask about the comments")
                         .font(.headline)
+                        .foregroundStyle(RedappDesign.ink)
                         .padding(.horizontal)
 
-                    HStack {
-                        TextField("Enter your question", text: $question)
-                            .textFieldStyle(LiquidGlassTextFieldStyle())
-                            .disabled(isAnswering)
-                            .onSubmit {
-                                askQuestion()
-                            }
-
-                        Button(action: askQuestion) {
-                            if isAnswering {
-                                ProgressView()
-                            } else {
-                                Text("Ask")
-                            }
-                        }
-                        .buttonStyle(LiquidGlassButtonStyle())
-                        .disabled(isAnswering || question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                        .padding(.trailing, 16)
-
-                        if summaryService.settings.selectedSummaryProvider != .webAI {
-                            Button(action: openWebCommentQuestion) {
-                                Image(systemName: "globe")
-                            }
-                            .buttonStyle(LiquidGlassButtonStyle())
-                            .disabled(question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                            .padding(.trailing, 16)
-                        }
-                    }
+                    RedappAskBar(
+                        placeholder: "Ask a question…",
+                        text: $question,
+                        isBusy: isAnswering,
+                        onSubmit: askQuestion
+                    )
                     .padding(.horizontal)
+
+                    if summaryService.settings.selectedSummaryProvider != .webAI {
+                        Button(action: openWebCommentQuestion) {
+                            Label("Use web model", systemImage: "globe")
+                        }
+                        .buttonStyle(RedappSecondaryButtonStyle(isCompact: true))
+                        .disabled(question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .padding(.horizontal)
+                    }
 
                     if isAnswering {
                         ProgressView("Answering...")
@@ -12513,15 +12792,12 @@ struct CommentSummaryView: View {
                             .padding(.bottom, 4)
                         }
                         if let answerSpeechSynthesisError = answerSpeechSynthesisError {
-                            Text(answerSpeechSynthesisError)
-                                .font(.caption)
-                                .foregroundColor(.red)
+                            RedappInlineMessage(message: answerSpeechSynthesisError)
                                 .padding(.horizontal)
                                 .padding(.bottom, 4)
                         }
                     } else if !isAnswering, let answerError = answerError {
-                        Text("Question Error: \(answerError)")
-                            .foregroundColor(.red)
+                        RedappInlineMessage(title: "Couldn’t answer that question", message: answerError)
                             .padding(.horizontal)
                     }
 
@@ -12539,9 +12815,7 @@ struct CommentSummaryView: View {
         }
         .scrollContentBackground(.hidden)
         .background(.clear)
-        .background(.ultraThinMaterial.opacity(0.1), in: RoundedRectangle(cornerRadius: 32, style: .continuous))
-        .shadow(radius: 10, y: 4)
-        .padding()
+        .modifier(RedappSummarySheetChrome(isEnabled: !isEmbeddedInPanel))
         .webAIHandoffPresenter(appState: AppState.shared)
         .sheet(isPresented: $showAskAIResponse) {
             AskAIResponseSheet(
@@ -12620,6 +12894,7 @@ struct CommentSummaryView: View {
             case .webAI: return "Web AI"
             case .summarizeDaemon: return "Codex/Summarize"
             case .applePCCGateway: return "Apple PCC Gateway"
+            case .chatGPT: return "ChatGPT"
             }
         }()
         if state.tokens == 0 && !state.isFinal {
@@ -13130,177 +13405,19 @@ struct CommentSummaryView: View {
 
 struct GlassBackgroundView: View {
     let variant: BackgroundVariant
-    @Environment(\.colorScheme) private var colorScheme
-    
+
     enum BackgroundVariant {
         case analytics
         case summary
         case settings
     }
-    
+
+    /// Every variant now sits on the same reading canvas as the rest of the app.
     var body: some View {
-        ZStack {
-            if colorScheme == .dark {
-                Color.black
-            } else {
-                baseGradient
-                GeometricPatternView(variant: variant)
-            }
-        }
-    }
-    
-    private var baseGradient: some View {
-        LinearGradient(
-            colors: gradientColors,
-            startPoint: .topLeading,
-            endPoint: .bottomTrailing
-        )
-    }
-    
-    private var gradientColors: [Color] {
-        switch variant {
-        case .analytics:
-            return [
-                Color.blue.opacity(0.6),
-                Color.purple.opacity(0.5),
-                Color.indigo.opacity(0.7),
-                Color.cyan.opacity(0.4),
-                Color.white.opacity(0.3)
-            ]
-        case .summary:
-            return [
-                Color.gray.opacity(0.4),
-                Color.secondary.opacity(0.3),
-                Color.primary.opacity(0.15),
-                Color.gray.opacity(0.35),
-                Color.clear
-            ]
-        case .settings:
-            return [
-                Color.pink.opacity(0.6),
-                Color.orange.opacity(0.5),
-                Color.purple.opacity(0.7),
-                Color.yellow.opacity(0.4),
-                Color.white.opacity(0.3)
-            ]
-        }
+        RedappDesign.canvas
     }
 }
 
-struct GeometricPatternView: View {
-    let variant: GlassBackgroundView.BackgroundVariant
-    private let shapes: [PatternShape]
-    
-    init(variant: GlassBackgroundView.BackgroundVariant) {
-        self.variant = variant
-        self.shapes = GeometricPatternView.generateShapes(for: variant)
-    }
-    
-    var body: some View {
-        Canvas { context, size in
-            let minDimension = max(min(size.width, size.height), 1)
-            
-            for shape in shapes {
-                let center = CGPoint(
-                    x: shape.normalizedCenter.x * size.width,
-                    y: shape.normalizedCenter.y * size.height
-                )
-                
-                let baseSize = shape.normalizedSize * minDimension
-                let width = baseSize
-                let height = shape.kind == .circle ? baseSize : baseSize * shape.aspectRatio
-                
-                let rect = CGRect(
-                    x: center.x - width / 2,
-                    y: center.y - height / 2,
-                    width: width,
-                    height: height
-                )
-                
-                switch shape.kind {
-                case .circle:
-                    context.fill(Path(ellipseIn: rect), with: .color(shape.color))
-                case .rectangle:
-                    context.fill(Path(rect), with: .color(shape.color))
-                }
-            }
-        }
-    }
-    
-    private struct PatternShape {
-        let kind: ShapeKind
-        let normalizedCenter: CGPoint
-        let normalizedSize: CGFloat
-        let aspectRatio: CGFloat
-        let color: Color
-    }
-    
-    private enum ShapeKind {
-        case circle
-        case rectangle
-    }
-    
-    private static func generateShapes(for variant: GlassBackgroundView.BackgroundVariant) -> [PatternShape] {
-        let patternDefinitions: [(ShapeKind, Int, Color)] = {
-            switch variant {
-            case .analytics:
-                return [
-                    (.circle, 8, Color.blue.opacity(0.1)),
-                    (.rectangle, 6, Color.purple.opacity(0.08))
-                ]
-            case .summary:
-                return []
-            case .settings:
-                return [
-                    (.circle, 7, Color.pink.opacity(0.1)),
-                    (.rectangle, 8, Color.orange.opacity(0.08))
-                ]
-            }
-        }()
-        
-        var generator = SeededRandomNumberGenerator(seed: seed(for: variant))
-        
-        return patternDefinitions.flatMap { definition -> [PatternShape] in
-            let (kind, count, color) = definition
-            return (0..<count).map { _ in
-                PatternShape(
-                    kind: kind,
-                    normalizedCenter: CGPoint(
-                        x: CGFloat.random(in: 0...1, using: &generator),
-                        y: CGFloat.random(in: 0...1, using: &generator)
-                    ),
-                    normalizedSize: CGFloat.random(in: 0.12...0.28, using: &generator),
-                    aspectRatio: kind == .rectangle ? CGFloat.random(in: 0.55...0.8, using: &generator) : 1,
-                    color: color
-                )
-            }
-        }
-    }
-    
-    private static func seed(for variant: GlassBackgroundView.BackgroundVariant) -> UInt64 {
-        switch variant {
-        case .analytics:
-            return 0xA17F35C34E291B2C
-        case .summary:
-            return 0xB4C9781D23249FA1
-        case .settings:
-            return 0xC6D34A9E88235D7E
-        }
-    }
-}
-
-private struct SeededRandomNumberGenerator: RandomNumberGenerator {
-    private var state: UInt64
-    
-    init(seed: UInt64) {
-        self.state = seed == 0 ? 0x4d595df4d0f33173 : seed
-    }
-    
-    mutating func next() -> UInt64 {
-        state = 2862933555777941757 &* state &+ 3037000493
-        return state
-    }
-}
 // MARK: - Analytics Visualization Components
 
 struct PieSlice: View {
@@ -13327,27 +13444,73 @@ struct SentimentPieChartView: View {
     let positive: Double
     let neutral: Double
     let negative: Double
-    
+
     var body: some View {
         GeometryReader { geometry in
+            let side = min(geometry.size.width, geometry.size.height)
+            let lineWidth = max(side * 0.16, 10)
+            let total = max(positive + neutral + negative, 0.0001)
+            let p = positive / total
+            let n = neutral / total
             ZStack {
-                // Pie slices
-                PieSlice(startAngle: .degrees(0), endAngle: .degrees(positive * 3.6), color: .green)
-                PieSlice(startAngle: .degrees(positive * 3.6), endAngle: .degrees((positive + neutral) * 3.6), color: AppColors.neutralGray)
-                PieSlice(startAngle: .degrees((positive + neutral) * 3.6), endAngle: .degrees(360), color: .red)
-                
-                // Optional: Center hole for donut chart
-                ZStack {
-                    AppColors.background
-                    Circle().fill(Color.clear) // Keep the circle shape transparent
-                }
-                .frame(width: geometry.size.width * 0.5, height: geometry.size.height * 0.5)
-                .clipShape(Circle()) // Clip the background color to the circle
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(Color.white.opacity(0.3), lineWidth: 0.5)
+                Circle()
+                    .stroke(RedappDesign.hairline, lineWidth: lineWidth)
+                ring(from: 0, to: p, color: RedappDesign.positive, lineWidth: lineWidth)
+                ring(from: p, to: p + n, color: RedappDesign.neutral, lineWidth: lineWidth)
+                ring(from: p + n, to: 1, color: RedappDesign.negative, lineWidth: lineWidth)
             }
+            .padding(lineWidth / 2)
+            .frame(width: side, height: side)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .aspectRatio(1, contentMode: .fit)
+        .accessibilityElement()
+        .accessibilityLabel("Sentiment: \(Int(positive.rounded()))% positive, \(Int(neutral.rounded()))% neutral, \(Int(negative.rounded()))% negative")
+    }
+
+    @ViewBuilder
+    private func ring(from start: Double, to end: Double, color: Color, lineWidth: CGFloat) -> some View {
+        if end > start {
+            Circle()
+                .trim(from: start, to: end)
+                .stroke(color, style: StrokeStyle(lineWidth: lineWidth, lineCap: .butt))
+                .rotationEffect(.degrees(-90))
+        }
+    }
+}
+
+/// Small square post image in the feed (blurred for NSFW / spoilers).
+struct PostRowThumbnail: View {
+    let url: URL
+    var isHidden: Bool = false
+    private let side: CGFloat = 64
+
+    var body: some View {
+        KFImage(url)
+            .downsampling(size: CGSize(width: side * 3, height: side * 3))
+            .cacheOriginalImage()
+            .placeholder {
+                RoundedRectangle(cornerRadius: RedappDesign.Radius.small, style: .continuous)
+                    .fill(RedappDesign.elevated)
+            }
+            .fade(duration: 0.15)
+            .resizable()
+            .scaledToFill()
+            .frame(width: side, height: side)
+            .blur(radius: isHidden ? 12 : 0)
+            .overlay {
+                if isHidden {
+                    Image(systemName: "eye.slash")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(.white)
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: RedappDesign.Radius.small, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: RedappDesign.Radius.small, style: .continuous)
+                    .strokeBorder(RedappDesign.hairline, lineWidth: 1)
+            )
+            .accessibilityHidden(true)
     }
 }
 
@@ -13393,120 +13556,232 @@ struct ClickableImage: View {
 }
 
 // MARK: - PostRowView
-struct PostRowView: View {
-    let post: SubredditPostData
-    @State private var isExpanded = false
+/// First-run guide shown in the reader column until Reddit credentials exist.
+struct RedappOnboardingCard: View {
+    let onOpenSettings: () -> Void
+
+    private struct Step: Identifiable {
+        let id: Int
+        let symbol: String
+        let title: String
+        let detail: String
+    }
+
+    private let steps: [Step] = [
+        Step(id: 1, symbol: "key.horizontal", title: "Create a free Reddit app",
+             detail: "At reddit.com/prefs/apps, create an “installed app” with redirect URI redapp://auth."),
+        Step(id: 2, symbol: "doc.on.clipboard", title: "Add its client ID",
+             detail: "Paste the client ID in Settings › Reddit. It’s stored in your Keychain."),
+        Step(id: 3, symbol: "sparkles", title: "Load a community and summarize",
+             detail: "Open any subreddit, then summarize posts, whole threads or the entire feed.")
+    ]
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .top, spacing: 12) {
-                VStack {
-                    Image(systemName: "arrow.up")
-                        .foregroundColor(.orange)
-                    Text("\(post.ups)")
-                        .font(.subheadline)
-                        .foregroundColor(.gray)
-                }
-                .frame(width: 40)
+        VStack(alignment: .leading, spacing: 22) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Welcome to redapp")
+                    .font(.largeTitle.weight(.bold))
+                Text("Turn Reddit threads into research you can verify, save and hear. Setup takes about two minutes.")
+                    .font(.title3)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(post.title)
-                        .font(.headline)
-                        .foregroundColor(.primary)
-
-                    if !post.selftext.isEmpty {
-                        if isExpanded {
-                            MarkdownTextView(content: post.processedSelftext, fontScale: {
-                                #if os(macOS)
-                                return 0.7
-                                #else
-                                return 1.1
-                                #endif
-                            }())
-                                .foregroundColor(.secondary) // Match preview color
-                        } else {
-                            Text(post.attributedPreviewText ?? AttributedString(post.previewText))
+            VStack(alignment: .leading, spacing: 18) {
+                ForEach(steps) { step in
+                    HStack(alignment: .top, spacing: 14) {
+                        Image(systemName: step.symbol)
+                            .font(.system(size: 17, weight: .semibold))
+                            .foregroundStyle(RedappDesign.accent)
+                            .frame(width: 40, height: 40)
+                            .background(RedappDesign.accent.opacity(0.14), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+                            .accessibilityHidden(true)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("\(step.id). \(step.title)")
+                                .font(.headline)
+                            Text(step.detail)
                                 .font(.subheadline)
-                                .foregroundColor(.secondary)
-                                .lineLimit(3)
-                        }
-                        
-                        // Show images if expanded and has images
-                        if isExpanded && !post.imageURLs.isEmpty {
-                            ScrollView(.horizontal, showsIndicators: false) {
-                                HStack(spacing: 8) {
-                                    ForEach(post.imageURLs, id: \.self) { url in
-                                        ClickableImage(url: url, maxHeight: 150)
-                                    }
-                                }
-                            }
-                            .padding(.vertical, 8)
-                        }
-                        
-                        // Show links if expanded and has links
-                        if isExpanded && !post.links.isEmpty {
-                            VStack(alignment: .leading, spacing: 4) {
-                                ForEach(post.links, id: \.1) { (linkText, url) in
-                                    Link(destination: url) {
-                                        HStack(spacing: 4) {
-                                            Image(systemName: "link")
-                                                .font(.caption)
-                                            Text(linkText)
-                                                .lineLimit(1)
-                                                .truncationMode(.tail)
-                                        }
-                                        .foregroundColor(.primary)
-                                        .padding(.horizontal, 8)
-                                        .padding(.vertical, 4)
-                                        .background(.ultraThinMaterial)
-                                        .cornerRadius(8)
-                                    }
-                                    .buttonStyle(PlainButtonStyle())
-                                }
-                            }
-                            .padding(.top, 4)
-                        }
-
-                        if post.selftext.count > 10 {
-                            Button(action: { isExpanded.toggle() }) {
-                                Text(isExpanded ? "Show less" : "Show more")
-                            }
-                            .buttonStyle(LiquidGlassButtonStyle())
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
                     }
-
-                    HStack {
-                        Image(systemName: "bubble.right")
-                        Text("\(post.num_comments) comments")
-                        Spacer()
-
-                        if let fullURL = post.fullURL {
-                            Button(action: {
-                                #if os(iOS)
-                                UIApplication.shared.open(fullURL)
-                                #elseif os(macOS)
-                                NSWorkspace.shared.open(fullURL)
-                                #endif
-                            }) {
-                                HStack(spacing: 4) {
-                                    Image(systemName: "safari")
-                                    Text("Open")
-                                }
-                            }
-                            .buttonStyle(LiquidGlassButtonStyle())
-                        }
-                    }
-                    .font(.caption)
-                    .foregroundColor(.secondary)
+                    .accessibilityElement(children: .combine)
                 }
             }
 
-            if let imageUrl = post.bestImageURL {
-                ClickableImage(url: imageUrl, maxHeight: 300)
+            Button(action: onOpenSettings) {
+                Label("Set Up Reddit Access", systemImage: "gearshape")
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 2)
+            }
+            .buttonStyle(RedappPrimaryButtonStyle())
+        }
+        .padding(28)
+        .frame(maxWidth: 520, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: RedappDesign.Radius.large, style: .continuous)
+                .fill(RedappDesign.card)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: RedappDesign.Radius.large, style: .continuous)
+                .strokeBorder(RedappDesign.hairline, lineWidth: 1)
+        )
+    }
+}
+
+struct PostRowView: View {
+    let post: SubredditPostData
+    var showsSubreddit: Bool = false
+    var isSelected: Bool = false
+    @State private var isExpanded = false
+    @AppStorage("FeedShowsThumbnails") private var showsThumbnails = true
+
+    private var ageText: String? {
+        RedappTime.shortAge(fromUnix: post.created_utc)
+    }
+
+    private var canExpand: Bool {
+        post.selftext.count > 10 || !post.imageURLs.isEmpty || !post.links.isEmpty
+    }
+
+    private var footerText: String {
+        var parts = ["\(RedappNumber.compact(post.num_comments)) comment\(post.num_comments == 1 ? "" : "s")"]
+        if let ageText { parts.append(ageText == "now" ? "just now" : "\(ageText) ago") }
+        return parts.joined(separator: " · ")
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 14) {
+            VStack(spacing: 3) {
+                Image(systemName: "arrowshape.up")
+                    .font(.system(size: 15, weight: .medium))
+                Text(RedappNumber.compact(post.ups))
+                    .font(.subheadline.weight(.medium).monospacedDigit())
+            }
+            .foregroundStyle(isSelected ? RedappDesign.accent : RedappDesign.inkSecondary)
+            .frame(width: 34)
+            .padding(.top, 2)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("\(post.ups) upvotes")
+
+            VStack(alignment: .leading, spacing: 5) {
+                if showsSubreddit {
+                    RedappMetaLine(subreddit: post.subreddit, author: post.author)
+                }
+
+                Text(post.title)
+                    .font(.headline)
+                    .foregroundStyle(RedappDesign.ink)
+                    .multilineTextAlignment(.leading)
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if !post.selftext.isEmpty && !isExpanded {
+                    Text(post.attributedPreviewText ?? AttributedString(post.previewText))
+                        .font(.subheadline)
+                        .foregroundStyle(RedappDesign.inkSecondary)
+                        .lineLimit(3)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                if isExpanded {
+                    expandedContent
+                }
+
+                Text(footerText)
+                    .font(.footnote)
+                    .foregroundStyle(RedappDesign.inkSecondary)
+                    .padding(.top, 1)
+            }
+            Spacer(minLength: 0)
+
+            if showsThumbnails, !isExpanded, let thumbURL = post.feedThumbnailURL {
+                PostRowThumbnail(url: thumbURL, isHidden: post.hidesThumbnail)
+                    .padding(.top, 2)
             }
         }
-        .padding(.vertical, 8)
-        .padding(.horizontal)
+        .padding(.vertical, 16)
+        .padding(.leading, 14)
+        .padding(.trailing, 18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background {
+            if isSelected {
+                RedappDesign.rowSelection
+                    .overlay(alignment: .leading) {
+                        Rectangle()
+                            .fill(RedappDesign.accent)
+                            .frame(width: 3)
+                    }
+            }
+        }
+        .contentShape(Rectangle())
+        .contextMenu {
+            if canExpand && !post.selftext.isEmpty {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) { isExpanded.toggle() }
+                } label: {
+                    Label(isExpanded ? "Show Less" : "Preview Here", systemImage: isExpanded ? "chevron.up" : "chevron.down")
+                }
+            }
+            Button {
+                SavedPostsStore.shared.toggle(post)
+            } label: {
+                Label(SavedPostsStore.shared.isSaved(post) ? "Remove from Saved" : "Save Post",
+                      systemImage: SavedPostsStore.shared.isSaved(post) ? "bookmark.slash" : "bookmark")
+            }
+            if let fullURL = post.fullURL {
+                Button {
+                    openInBrowser(fullURL)
+                } label: {
+                    Label("Open on Reddit", systemImage: "safari")
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var expandedContent: some View {
+        MarkdownTextView(content: post.processedSelftext, fontScale: {
+            #if os(macOS)
+            return 0.7
+            #else
+            return 0.75
+            #endif
+        }())
+        .foregroundStyle(RedappDesign.inkSecondary)
+
+        if !post.imageURLs.isEmpty {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(post.imageURLs, id: \.self) { url in
+                        ClickableImage(url: url, maxHeight: 150)
+                    }
+                }
+            }
+            .padding(.vertical, 4)
+        }
+
+        if !post.links.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(post.links, id: \.1) { (linkText, url) in
+                    Link(destination: url) {
+                        Label(linkText, systemImage: "link")
+                            .font(.footnote)
+                            .lineLimit(1)
+                            .foregroundStyle(RedappDesign.accent)
+                    }
+                    .buttonStyle(PlainButtonStyle())
+                }
+            }
+        }
+    }
+
+    private func openInBrowser(_ url: URL) {
+        #if os(iOS)
+        UIApplication.shared.open(url)
+        #elseif os(macOS)
+        NSWorkspace.shared.open(url)
+        #endif
     }
 }
 
@@ -13562,7 +13837,40 @@ private func containsMarkdownTable(in text: String) -> Bool {
     return false
 }
 
+/// Lines that carry Markdown structure (lists, headings, rules, quotes, tables,
+/// bold lead-ins). Joining these onto one line is what produced run-on output
+/// like "1. Major Themes *Device Security…", so they keep their own line.
+private func isMarkdownStructuralLine(_ line: String) -> Bool {
+    let trimmed = line.trimmingCharacters(in: .whitespaces)
+    guard !trimmed.isEmpty else { return false }
+    if trimmed.hasPrefix("#") || trimmed.hasPrefix(">") || trimmed.hasPrefix("|") || trimmed.hasPrefix("```") {
+        return true
+    }
+    if trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ") || trimmed.hasPrefix("+ ") || trimmed.hasPrefix("• ") {
+        return true
+    }
+    if trimmed.range(of: #"^\d+[.)]\s"#, options: .regularExpression) != nil {
+        return true
+    }
+    if trimmed.range(of: #"^([-*_])(\s*\1){2,}$"#, options: .regularExpression) != nil {
+        return true
+    }
+    // A short line that is entirely bold, or ends in a colon, is a lead-in heading.
+    if trimmed.count <= 90,
+       trimmed.range(of: #"^\*\*[^*]+\*\*:?$"#, options: .regularExpression) != nil
+        || (trimmed.hasSuffix(":") && !trimmed.contains(". ")) {
+        return true
+    }
+    return false
+}
+
 private func splitLongReplyParagraph(_ paragraph: String) -> [String] {
+    let paragraphLines = paragraph.components(separatedBy: .newlines)
+    if paragraphLines.count > 1, paragraphLines.contains(where: isMarkdownStructuralLine) {
+        // Structured blocks render line-by-line; never flatten them.
+        return [paragraphLines.joined(separator: "\n")]
+    }
+
     let compact = paragraph
         .components(separatedBy: .newlines)
         .map { $0.trimmingCharacters(in: .whitespaces) }
@@ -13621,10 +13929,59 @@ struct ReadableReplyText: View {
 
     var body: some View {
         MarkdownTextView(
-            content: readableReplyText(content),
+            content: MarkdownRenderCache.shared.readableText(for: content),
             fontScale: fontScale,
             sourceLinks: sourceLinks
         )
+    }
+}
+
+/// Memoizes the pure text work behind markdown rendering, keyed by content.
+/// While one reply streams, the rest of a screen re-renders many times a second;
+/// without this, every summary on it re-parsed its markdown on each chunk.
+final class MarkdownRenderCache {
+    static let shared = MarkdownRenderCache()
+
+    private final class Box<Value> {
+        let value: Value
+        init(_ value: Value) { self.value = value }
+    }
+
+    private let readable = NSCache<NSString, NSString>()
+    private let parsed = NSCache<NSString, Box<[MarkdownTextView.MarkdownElement]>>()
+    private let citations = NSCache<NSString, Box<[String: Int]>>()
+
+    private init() {
+        readable.countLimit = 300
+        parsed.countLimit = 300
+        citations.countLimit = 300
+    }
+
+    func readableText(for text: String) -> String {
+        let key = text as NSString
+        if let cached = readable.object(forKey: key) { return cached as String }
+        let result = readableReplyText(text)
+        readable.setObject(result as NSString, forKey: key)
+        return result
+    }
+
+    func elements(
+        for text: String,
+        parse: (String) -> [MarkdownTextView.MarkdownElement]
+    ) -> [MarkdownTextView.MarkdownElement] {
+        let key = text as NSString
+        if let cached = parsed.object(forKey: key) { return cached.value }
+        let result = parse(text)
+        parsed.setObject(Box(result), forKey: key)
+        return result
+    }
+
+    func citationNumbers(for text: String) -> [String: Int] {
+        let key = text as NSString
+        if let cached = citations.object(forKey: key) { return cached.value }
+        let result = RedappCitations.numbering(in: text)
+        citations.setObject(Box(result), forKey: key)
+        return result
     }
 }
 
@@ -13634,8 +13991,13 @@ struct MarkdownTextView: View {
     let fontScale: CGFloat
     let justifyParagraphs: Bool
     let sourceLinks: [String: URL]
+    /// 1-based citation numbers in order of first appearance, so every
+    /// `[t1_…]` evidence token renders as a compact numbered link.
+    private let citationNumbers: [String: Int]
     @Environment(\.colorScheme) var colorScheme
-    
+    /// Follows Dynamic Type so AI reports grow with the user's text size.
+    @ScaledMetric(relativeTo: .body) private var dynamicTypeScale: CGFloat = 1.0
+
     // Initialize with optional font scale
     init(
         content: String,
@@ -13647,8 +14009,9 @@ struct MarkdownTextView: View {
         self.fontScale = fontScale
         self.justifyParagraphs = justifyParagraphs
         self.sourceLinks = sourceLinks
+        self.citationNumbers = MarkdownRenderCache.shared.citationNumbers(for: content)
     }
-    
+
     // Platform-specific base font size with scale factor
     private var baseFontSize: CGFloat {
         let baseSize: CGFloat
@@ -13657,12 +14020,13 @@ struct MarkdownTextView: View {
         #else
         baseSize = 16
         #endif
-        return baseSize * fontScale
+        return baseSize * fontScale * dynamicTypeScale
     }
-    
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            ForEach(parseMarkdownContent(content), id: \.id) { element in
+            // Offsets as identity: repeated lines (e.g. two "---" rules) must not collide.
+            ForEach(Array(MarkdownRenderCache.shared.elements(for: content, parse: parseMarkdownContent).enumerated()), id: \.offset) { _, element in
                 renderElement(element)
             }
         }
@@ -13678,11 +14042,12 @@ struct MarkdownTextView: View {
         case code(String)
         case codeBlock(String, language: String?)
         case heading(String, level: Int)
-        case bulletPoint(String)
+        case bulletPoint(String, level: Int = 0)
         case numberedPoint(String, number: Int)
         case link(text: String, url: String)
         case paragraph(String)
-        
+        case rule
+
         var id: String {
             switch self {
             case .text(let content): return "text-\(content.hashValue)"
@@ -13692,7 +14057,8 @@ struct MarkdownTextView: View {
             case .code(let content): return "code-\(content.hashValue)"
             case .codeBlock(let content, _): return "codeblock-\(content.hashValue)"
             case .heading(let content, let level): return "heading\(level)-\(content.hashValue)"
-            case .bulletPoint(let content): return "bullet-\(content.hashValue)"
+            case .bulletPoint(let content, let level): return "bullet\(level)-\(content.hashValue)"
+            case .rule: return "rule"
             case .numberedPoint(let content, let number): return "numbered\(number)-\(content.hashValue)"
             case .link(let text, let url): return "link-\(text.hashValue)-\(url.hashValue)"
             case .paragraph(let content): return "paragraph-\(content.hashValue)"
@@ -13739,12 +14105,37 @@ struct MarkdownTextView: View {
                 continue
             }
             
-            // Handle bullet points
-            if line.trimmingCharacters(in: .whitespaces).starts(with: "- ") ||
-               line.trimmingCharacters(in: .whitespaces).starts(with: "* ") ||
-               line.trimmingCharacters(in: .whitespaces).starts(with: "+ ") {
-                let content = String(line.trimmingCharacters(in: .whitespaces).dropFirst(2))
-                elements.append(.bulletPoint(parseInlineMarkdown(content)))
+            let strippedLine = line.trimmingCharacters(in: .whitespaces)
+
+            // Horizontal rules (---, ***, ___) become a quiet divider, not literal dashes.
+            if strippedLine.range(of: #"^([-*_])(\s*\1){2,}$"#, options: .regularExpression) != nil {
+                elements.append(.rule)
+                continue
+            }
+
+            // A line that is entirely bold ("**Discussion**") is a section lead-in.
+            if strippedLine.count <= 90,
+               let match = strippedLine.range(of: #"^\*\*([^*]+)\*\*:?$"#, options: .regularExpression),
+               match.lowerBound == strippedLine.startIndex {
+                let inner = strippedLine
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "*:"))
+                    .trimmingCharacters(in: .whitespaces)
+                if !inner.isEmpty {
+                    elements.append(.heading(inner, level: 4))
+                    continue
+                }
+            }
+
+            // Handle bullet points (nesting follows the source indentation)
+            if strippedLine.starts(with: "- ") ||
+               strippedLine.starts(with: "* ") ||
+               strippedLine.starts(with: "+ ") ||
+               strippedLine.starts(with: "• ") {
+                let indent = line.prefix(while: { $0 == " " || $0 == "\t" })
+                    .reduce(0) { $0 + ($1 == "\t" ? 4 : 1) }
+                let content = String(strippedLine.dropFirst(2))
+                    .trimmingCharacters(in: .whitespaces)
+                elements.append(.bulletPoint(parseInlineMarkdown(content), level: min(indent / 2, 3)))
                 continue
             }
             
@@ -13759,6 +14150,7 @@ struct MarkdownTextView: View {
                     let contentStart = trimmedLine.index(dotIndex, offsetBy: 2)
                     if contentStart < trimmedLine.endIndex {
                         let content = String(trimmedLine[contentStart...])
+                            .trimmingCharacters(in: .whitespaces)
                         elements.append(.numberedPoint(parseInlineMarkdown(content), number: number))
                         continue
                     }
@@ -13821,24 +14213,9 @@ struct MarkdownTextView: View {
                 .padding(.horizontal, 8)
                 .padding(.vertical, 4)
                 .background {
-                    ZStack {
-                        Capsule()
-                            .fill(.ultraThinMaterial)
-                        
-                        LinearGradient(
-                            colors: [
-                                Color.white.opacity(0.15),
-                                Color.white.opacity(0.05)
-                            ],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
-                        .blendMode(.overlay)
-                        .clipShape(Capsule())
-                        
-                        Capsule()
-                            .strokeBorder(Color.white.opacity(0.2), lineWidth: 0.5)
-                    }
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(RedappDesign.elevated)
+                        .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).strokeBorder(RedappDesign.hairline, lineWidth: 1))
                 }
                 .textSelection(.enabled)
             
@@ -13851,24 +14228,9 @@ struct MarkdownTextView: View {
                     .textSelection(.enabled)
             }
             .background {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 12)
-                        .fill(.ultraThinMaterial)
-                    
-                    LinearGradient(
-                        colors: [
-                            Color.white.opacity(0.15),
-                            Color.white.opacity(0.05)
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                    .blendMode(.overlay)
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
-                    
-                    RoundedRectangle(cornerRadius: 12)
-                        .strokeBorder(Color.white.opacity(0.1), lineWidth: 0.5)
-                }
+                RoundedRectangle(cornerRadius: RedappDesign.Radius.medium, style: .continuous)
+                    .fill(RedappDesign.elevated)
+                    .overlay(RoundedRectangle(cornerRadius: RedappDesign.Radius.medium, style: .continuous).strokeBorder(RedappDesign.hairline, lineWidth: 1))
             }
             .padding(.vertical, 4)
             
@@ -13880,26 +14242,38 @@ struct MarkdownTextView: View {
                 .padding(.top, level == 1 ? 16 : level == 2 ? 12 : 8)
                 .padding(.bottom, 6)
             
-        case .bulletPoint(let content):
-            HStack(alignment: .top, spacing: 12) {
-                Text("•")
-                    .font(.system(size: baseFontSize))
-                    .foregroundColor(.secondary)
+        case .bulletPoint(let content, let level):
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Text(level == 0 ? "•" : "◦")
+                    .font(.system(size: baseFontSize, weight: .bold))
+                    .foregroundStyle(level == 0 ? RedappDesign.accent : Color.secondary)
+                    .frame(width: baseFontSize * 0.6, alignment: .center)
+                    .accessibilityHidden(true)
                 renderInlineMarkdown(content)
+                    .font(.system(size: baseFontSize))
+                    .lineSpacing(3)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            .padding(.leading, 20)
-            
+            .padding(.leading, 4 + CGFloat(level) * 22)
+
         case .numberedPoint(let content, let number):
-            HStack(alignment: .top, spacing: 12) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
                 Text("\(number).")
-                    .font(.system(size: baseFontSize))
-                    .foregroundColor(.secondary)
-                    .frame(minWidth: 20, alignment: .trailing)
+                    .font(.system(size: baseFontSize, weight: .semibold).monospacedDigit())
+                    .foregroundStyle(RedappDesign.accent)
+                    .frame(minWidth: baseFontSize * 1.2, alignment: .trailing)
                 renderInlineMarkdown(content)
+                    .font(.system(size: baseFontSize))
+                    .lineSpacing(3)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            .padding(.leading, 16)
+
+        case .rule:
+            Rectangle()
+                .fill(RedappDesign.hairlineStrong)
+                .frame(height: 1)
+                .padding(.vertical, 6)
+                .accessibilityHidden(true)
             
         case .link(let text, let url):
             Link(text, destination: URL(string: url) ?? URL(string: "https://")!)
@@ -13946,23 +14320,41 @@ struct MarkdownTextView: View {
     func parseInlineFormatting(_ text: String) -> AttributedString {
         var result = AttributedString()
         var currentIndex = text.startIndex
+        // Plain characters are collected into one run; appending them one at a time made
+        // thousands of tiny runs, which was slow to build and to hash on every re-render.
+        var plainRun = ""
+        func flushPlainRun() {
+            guard !plainRun.isEmpty else { return }
+            result.append(AttributedString(plainRun))
+            plainRun = ""
+        }
         
         // Process the text character by character
         while currentIndex < text.endIndex {
-            // Turn evidence tokens into compact, clickable Reddit citations.
-            if text[currentIndex...].lowercased().hasPrefix("[source:"),
+            // Turn evidence tokens ([t1_…], [SOURCE:t1_…], or grouped lists of
+            // them) into compact numbered citations that link to the source.
+            if text[currentIndex] == "[",
                let closingBracket = text[currentIndex...].firstIndex(of: "]") {
-                let idStart = text.index(currentIndex, offsetBy: 8)
-                let sourceID = String(text[idStart..<closingBracket])
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                if !sourceID.isEmpty {
-                    var source = AttributedString("[\(sourceID)]")
-                    if let destination = sourceLinks[sourceID] {
-                        source.link = destination
-                        source.foregroundColor = .accentColor
-                        source.underlineStyle = .single
+                let groupBody = String(text[text.index(after: currentIndex)..<closingBracket])
+                if let sourceIDs = RedappCitations.sourceIDs(inGroupBody: groupBody) {
+                    flushPlainRun()
+                    // Drop the space the model leaves before the bracket so the marks hug the word.
+                    if result.characters.last == " " {
+                        result.characters.removeLast()
                     }
-                    result.append(source)
+                    for sourceID in sourceIDs {
+                        let number = citationNumbers[sourceID] ?? (citationNumbers.count + 1)
+                        var citation = AttributedString("\u{2009}[\(number)]")
+                        citation.font = .system(size: baseFontSize * 0.72, weight: .semibold).monospacedDigit()
+                        citation.baselineOffset = baseFontSize * 0.28
+                        if let destination = sourceLinks[sourceID] {
+                            citation.link = destination
+                            citation.foregroundColor = RedappDesign.accent
+                        } else {
+                            citation.foregroundColor = .secondary
+                        }
+                        result.append(citation)
+                    }
                     currentIndex = text.index(after: closingBracket)
                     continue
                 }
@@ -13980,9 +14372,10 @@ struct MarkdownTextView: View {
                     let label = String(text[labelStart..<labelEnd])
                     let urlString = String(text[urlStart..<closeParen])
                     if let destination = URL(string: urlString), !label.isEmpty {
+                        flushPlainRun()
                         var link = AttributedString(label)
                         link.link = destination
-                        link.foregroundColor = .accentColor
+                        link.foregroundColor = RedappDesign.accent
                         link.underlineStyle = .single
                         result.append(link)
                         currentIndex = text.index(after: closeParen)
@@ -13996,6 +14389,7 @@ struct MarkdownTextView: View {
                 let delimiter = String(text[currentIndex...].prefix(2))
                 if let endRange = text[text.index(currentIndex, offsetBy: 2)...].range(of: delimiter) {
                     let boldText = String(text[text.index(currentIndex, offsetBy: 2)..<endRange.lowerBound])
+                    flushPlainRun()
                     var boldAttr = AttributedString(boldText)
                     boldAttr.font = .system(size: baseFontSize, weight: .bold)
                     result.append(boldAttr)
@@ -14012,6 +14406,7 @@ struct MarkdownTextView: View {
                 let delimiter = String(text[currentIndex])
                 if let endIndex = text[text.index(after: currentIndex)...].firstIndex(of: Character(delimiter)) {
                     let italicText = String(text[text.index(after: currentIndex)..<endIndex])
+                    flushPlainRun()
                     var italicAttr = AttributedString(italicText)
                     italicAttr.font = .system(size: baseFontSize).italic()
                     result.append(italicAttr)
@@ -14024,6 +14419,7 @@ struct MarkdownTextView: View {
             if text[currentIndex] == "`" {
                 if let endIndex = text[text.index(after: currentIndex)...].firstIndex(of: "`") {
                     let codeText = String(text[text.index(after: currentIndex)..<endIndex])
+                    flushPlainRun()
                     var codeAttr = AttributedString(codeText)
                     codeAttr.font = .system(size: baseFontSize * 0.9, design: .monospaced)
                     codeAttr.foregroundColor = .primary
@@ -14035,10 +14431,11 @@ struct MarkdownTextView: View {
             }
             
             // Regular character
-            result.append(AttributedString(String(text[currentIndex])))
+            plainRun.append(text[currentIndex])
             currentIndex = text.index(after: currentIndex)
         }
-        
+        flushPlainRun()
+
         return result
     }
     
@@ -14118,147 +14515,81 @@ struct ResizableTextBox: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text(title)
-                    .font(.headline)
+                if !title.isEmpty {
+                    Text(title)
+                        .font(.headline)
+                }
                 Spacer()
-                // Cloud TTS button
-                if let onCloudSpeakClicked = onCloudSpeakClicked {
-                    Button {
-                        onCloudSpeakClicked()
-                    } label: {
-                        Image(systemName: "speaker.wave.2")
-                    }
-                    .buttonStyle(PlainButtonStyle())
-                    #if os(macOS)
-                    .help("Read aloud (Cloud)")
-                    #endif
-                    .padding(.trailing, 4)
-                }
-                // Local TTS button
-                if let onLocalSpeakClicked = onLocalSpeakClicked {
-                    Button {
-                        onLocalSpeakClicked()
-                    } label: {
-                        if isAnswer {
-                            // For answer box, show stop icon if isSpeakingAnswerLocally is true
-                            if let isSpeaking = (Mirror(reflecting: self).descendant("_isSpeakingAnswerLocally") as? State<Bool>)?.wrappedValue, isSpeaking {
-                                Image(systemName: "stop.fill")
-                            } else {
-                                Image(systemName: "speaker.wave.2.circle")
+                RedappCommentActionCapsule {
+                    HStack(spacing: 2) {
+                        // One Listen menu instead of three look-alike speaker buttons.
+                        if onCloudSpeakClicked != nil || onLocalSpeakClicked != nil || onKokoroSpeakClicked != nil {
+                            Menu {
+                                if let onCloudSpeakClicked {
+                                    Button(action: onCloudSpeakClicked) {
+                                        Label("OpenAI voice", systemImage: "speaker.wave.2")
+                                        Text("Cloud")
+                                    }
+                                }
+                                if let onLocalSpeakClicked {
+                                    Button(action: onLocalSpeakClicked) {
+                                        Label("System voice", systemImage: "speaker.wave.2.circle")
+                                        Text("On device · tap again to stop")
+                                    }
+                                }
+                                if let onKokoroSpeakClicked {
+                                    Button(action: onKokoroSpeakClicked) {
+                                        Label("MLX voice", systemImage: "waveform")
+                                        Text("On device")
+                                    }
+                                }
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "play.fill")
+                                    Text("Listen")
+                                    Image(systemName: "chevron.down")
+                                        .font(.caption2.weight(.semibold))
+                                }
                             }
-                        } else {
-                            // For summary box, show stop icon if isSpeakingLocally is true
-                            if let isSpeaking = (Mirror(reflecting: self).descendant("_isSpeakingLocally") as? State<Bool>)?.wrappedValue, isSpeaking {
-                                Image(systemName: "stop.fill")
-                            } else {
-                                Image(systemName: "speaker.wave.2.circle")
-                            }
+                            .menuStyle(.button)
+                            .buttonStyle(RedappCommentChromeIconButtonStyle())
+                            .accessibilityLabel("Listen")
                         }
+                        if isAnswer, let onSummarizeClicked = onSummarizeClicked {
+                            Button {
+                                onSummarizeClicked()
+                            } label: {
+                                Image(systemName: "doc.text.magnifyingglass")
+                            }
+                            .buttonStyle(RedappCommentChromeIconButtonStyle())
+                            .help("Summarize")
+                            .accessibilityLabel("Summarize")
+                        }
+                        Button {
+                            copyToClipboard(content)
+                        } label: {
+                            Image(systemName: "doc.on.doc")
+                        }
+                        .buttonStyle(RedappCommentChromeIconButtonStyle())
+                        .help("Copy")
+                        .accessibilityLabel("Copy text")
                     }
-                    .buttonStyle(PlainButtonStyle())
-                    #if os(macOS)
-                    .help(isAnswer ? "Read aloud (Local) / Stop" : "Read aloud (Local) / Stop")
-                    #endif
-                    .padding(.trailing, 8)
                 }
-                if let onKokoroSpeakClicked = onKokoroSpeakClicked {
-                    Button {
-                        onKokoroSpeakClicked()
-                    } label: {
-                        Image(systemName: "waveform")
-                    }
-                    .buttonStyle(PlainButtonStyle())
-                    #if os(macOS)
-                    .help("Read aloud (MLX TTS)")
-                    #endif
-                    .padding(.trailing, 8)
-                }
-                // Summarize button (only for answers)
-                if isAnswer, let onSummarizeClicked = onSummarizeClicked {
-                    Button {
-                        onSummarizeClicked()
-                    } label: {
-                        Image(systemName: "doc.text.magnifyingglass")
-                    }
-                    .buttonStyle(PlainButtonStyle())
-                    #if os(macOS)
-                    .help("Summarize") // Add tooltip for macOS
-                    #endif
-                    .padding(.trailing, 4)
-                }
-                Button {
-                    copyToClipboard(content)
-                } label: {
-                    Image(systemName: "doc.on.doc")
-                }
-                .buttonStyle(PlainButtonStyle()) // Use PlainButtonStyle for better integration
-                #if os(macOS)
-                .help("Copy content") // Add tooltip for macOS
-                #endif
             }
 
-            ScrollView {
+            // Plain text on the page: no box, inner scroll or resize handle.
+            Group {
                 if renderMarkdown {
                     ReadableReplyText(content: content, fontScale: isAnswer ? 0.9 : 1.0)
-                        .padding()
                 } else {
                     SelectableText(content)
-                        .padding()
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.top, 4)
             .environment(\.askAISelectionHandler, onAskAI)
             .environment(\.askAIWebSelectionHandler, onAskAIWeb)
-            .frame(height: boxHeight)
-            .background {
-                ZStack {
-                    if isDarkMode {
-                        RoundedRectangle(cornerRadius: 8)
-                            .fill(Color.black)
-                        RoundedRectangle(cornerRadius: 8)
-                            .fill(Color.black.opacity(0.98))
-                    } else {
-                        RoundedRectangle(cornerRadius: 8)
-                            .fill(.thinMaterial)
-                            .opacity(0.7)
-                        RoundedRectangle(cornerRadius: 8)
-                            .fill(.ultraThinMaterial)
-                            .opacity(0.5)
-                    }
-                    RoundedRectangle(cornerRadius: 8)
-                        .fill(
-                            LinearGradient(
-                                colors: [
-                                    isDarkMode ? Color.black.opacity(0.92) : Color.white.opacity(0.4),
-                                    isDarkMode ? Color.black.opacity(0.85) : Color.white.opacity(0.1)
-                                ],
-                                startPoint: .top,
-                                endPoint: .bottom
-                            )
-                        )
-                        .blur(radius: 8)
-                    RoundedRectangle(cornerRadius: 8)
-                        .stroke(isDarkMode ? Color.white.opacity(0.1) : Color.white.opacity(0.4), lineWidth: 0.5)
-                }
-            }
-            .shadow(color: Color.black.opacity(0.08), radius: 8, x: 0, y: 2)
-
-            HStack {
-                Spacer()
-                Rectangle()
-                    .fill(Color.gray.opacity(0.3))
-                    .frame(width: 30, height: 4)
-                    .cornerRadius(2)
-                Spacer()
-            }
-            .contentShape(Rectangle())
-            .gesture(
-                DragGesture(coordinateSpace: .local)
-                    .onChanged { gesture in
-                        let maxHeight = isAnswer ? CGFloat(1000) : CGFloat(800)
-                        boxHeight = max(100, min(maxHeight, boxHeight + gesture.translation.height))
-                    }
-            )
         }
     }
 
@@ -14274,78 +14605,100 @@ struct ResizableTextBox: View {
 }
 
 // MARK: - Liquid Glass Styles
-/// Native Liquid Glass with the app's existing compact control measurements.
-/// Keeping this as a regular `ButtonStyle` also lets `Menu` labels receive the
-/// same treatment as buttons instead of falling back to unstyled blue icons.
+private struct RedappCommentActionCapsule<Content: View>: View {
+    let content: Content
+
+    init(@ViewBuilder content: () -> Content) {
+        self.content = content()
+    }
+
+    /// A quiet grouped control: field-colored capsule with a hairline edge.
+    var body: some View {
+        HStack(spacing: 2) {
+            content
+        }
+        .padding(3)
+        .background(Capsule(style: .continuous).fill(RedappDesign.field))
+        .overlay(Capsule(style: .continuous).strokeBorder(RedappDesign.hairlineStrong, lineWidth: 1))
+        .accessibilityElement(children: .contain)
+    }
+}
+
+private struct RedappCommentGlassModifier: ViewModifier {
+    func body(content: Content) -> some View {
+        content
+            .background(Capsule(style: .continuous).fill(RedappDesign.field))
+            .overlay(Capsule(style: .continuous).strokeBorder(RedappDesign.hairlineStrong, lineWidth: 1))
+    }
+}
+
+private struct RedappRoundedGlassModifier: ViewModifier {
+    let cornerRadius: CGFloat
+
+    func body(content: Content) -> some View {
+        content
+            .background(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous).fill(RedappDesign.card))
+            .overlay(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous).strokeBorder(RedappDesign.hairline, lineWidth: 1))
+    }
+}
+
+private struct RedappCommentChromeIconButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var isEnabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.subheadline.weight(.medium))
+            .foregroundStyle(RedappDesign.accent)
+            .padding(.horizontal, 10)
+            .frame(minWidth: 40, minHeight: 36)
+            .contentShape(Capsule(style: .continuous))
+            .background {
+                Capsule(style: .continuous)
+                    .fill(RedappDesign.ink.opacity(configuration.isPressed ? 0.08 : 0))
+            }
+            .opacity(isEnabled ? 1 : 0.45)
+    }
+}
+
+private struct RedappGroupedActionButtonModifier: ViewModifier {
+    let isCompact: Bool
+    let isProminent: Bool
+
+    func body(content: Content) -> some View {
+        content.buttonStyle(RedappCommentChromeIconButtonStyle())
+    }
+}
+
+private struct RedappGroupedIconButtonModifier: ViewModifier {
+    let isSelected: Bool
+    let isCompact: Bool
+
+    func body(content: Content) -> some View {
+        content.buttonStyle(
+            BatchSummaryGlassIconButtonStyle(
+                isSelected: isSelected,
+                isCompact: isCompact
+            )
+        )
+    }
+}
+
+/// Legacy name, new look: prominent buttons are the orange primary button,
+/// everything else is the quiet outlined button from the design system.
 struct LiquidGlassButtonStyle: ButtonStyle {
     var isProminent: Bool = false
 
     @ViewBuilder
     func makeBody(configuration: Configuration) -> some View {
-        #if os(iOS)
-        if #available(iOS 26.0, *) {
-            let shape = RoundedRectangle(cornerRadius: 20, style: .continuous)
-            let glass = isProminent
-                ? Glass.regular.tint(Color.accentColor.opacity(0.24))
-                : Glass.regular
-
-            configuration.label
-                .font(.callout)
-                .foregroundStyle(.primary)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
-                .contentShape(shape)
-                .glassEffect(glass.interactive(), in: .rect(cornerRadius: 20))
-                .scaleEffect(configuration.isPressed ? 0.95 : 1.0)
-                .animation(.easeInOut(duration: 0.1), value: configuration.isPressed)
+        if isProminent {
+            RedappPrimaryButtonStyle().makeBody(configuration: configuration)
         } else {
-            legacyBody(configuration: configuration)
+            RedappSecondaryButtonStyle(isCapsule: false).makeBody(configuration: configuration)
         }
-        #else
-        legacyBody(configuration: configuration)
-        #endif
-    }
-
-    private func legacyBody(configuration: Configuration) -> some View {
-        let shape = RoundedRectangle(cornerRadius: 20, style: .continuous)
-
-        return configuration.label
-            .font(.callout)
-            .foregroundStyle(.primary)
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
-            .background {
-                ZStack {
-                    // Glass layer
-                    shape
-                        .fill(.ultraThinMaterial)
-                    
-                    // Shimmer
-                    LinearGradient(
-                        colors: [
-                            Color.white.opacity(configuration.isPressed ? 0.3 : 0.2),
-                            Color.white.opacity(0.05),
-                            Color.white.opacity(configuration.isPressed ? 0.3 : 0.2)
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                    .blendMode(.overlay)
-                    .clipShape(shape)
-                    
-                    // Border
-                    shape
-                        .strokeBorder(
-                            Color.white.opacity(isProminent ? 0.22 : 0.14),
-                            lineWidth: isProminent ? 0.8 : 0.5
-                        )
-                }
-            }
-            .scaleEffect(configuration.isPressed ? 0.95 : 1.0)
-            .animation(.easeInOut(duration: 0.1), value: configuration.isPressed)
     }
 }
 
+/// Icon button used across batch results and toolbars.
 struct BatchSummaryGlassIconButtonStyle: ButtonStyle {
     var isSelected: Bool = false
     var isCompact: Bool = false
@@ -14353,106 +14706,41 @@ struct BatchSummaryGlassIconButtonStyle: ButtonStyle {
     @Environment(\.isEnabled) private var isEnabled
 
     func makeBody(configuration: Configuration) -> some View {
-        let shape = RoundedRectangle(cornerRadius: 14, style: .continuous)
-        let minWidth: CGFloat = isCompact ? 34 : 50
-        let minHeight: CGFloat = isCompact ? 34 : 40
-        let horizontalPadding: CGFloat = isCompact ? 4 : 12
-
+        let shape = RoundedRectangle(cornerRadius: 10, style: .continuous)
         configuration.label
-            .font(.system(size: isCompact ? 17 : 18, weight: .semibold))
-            .foregroundStyle(isEnabled ? Color.primary : Color.secondary.opacity(0.55))
-            .padding(.horizontal, horizontalPadding)
-            .frame(minWidth: minWidth, minHeight: minHeight)
+            .font(.system(size: isCompact ? 16 : 17, weight: .medium))
+            .foregroundStyle(isSelected ? RedappDesign.accent : RedappDesign.ink)
+            .padding(.horizontal, isCompact ? 4 : 10)
+            .frame(minWidth: isCompact ? 34 : 44, minHeight: isCompact ? 34 : 40)
             .background {
-                if isSelected || configuration.isPressed {
-                    shape
-                        .fill(Color.white.opacity(configuration.isPressed ? 0.18 : 0.10))
-                        .overlay {
-                            shape.strokeBorder(Color.white.opacity(0.26), lineWidth: 1)
-                        }
-                }
+                shape.fill(
+                    isSelected
+                        ? RedappDesign.accentSoft
+                        : RedappDesign.ink.opacity(configuration.isPressed ? 0.08 : 0)
+                )
             }
             .contentShape(shape)
-            .opacity(isEnabled ? 1 : 0.48)
-            .scaleEffect(configuration.isPressed ? 0.94 : 1.0)
-            .animation(.easeInOut(duration: 0.12), value: configuration.isPressed)
+            .opacity(isEnabled ? 1 : 0.45)
     }
 }
 
+/// Stand-alone outlined icon button.
 struct BatchSummaryStandaloneGlassButtonStyle: ButtonStyle {
     var isSelected: Bool = false
 
     @Environment(\.isEnabled) private var isEnabled
 
-    @ViewBuilder
     func makeBody(configuration: Configuration) -> some View {
-        let cornerRadius: CGFloat = 22
-        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-        let tint = Color.white
-        let iconColor = Color.primary
-
-        #if os(iOS)
-        if #available(iOS 26.0, *) {
-            configuration.label
-                .font(.system(size: 18, weight: .semibold))
-                .foregroundStyle(isEnabled ? iconColor : Color.secondary.opacity(0.55))
-                .padding(.horizontal, 14)
-                .frame(minWidth: 52, minHeight: 42)
-                .background {
-                    if isSelected || configuration.isPressed {
-                        shape.fill(Color.white.opacity(configuration.isPressed ? 0.20 : 0.11))
-                    }
-                }
-                .glassEffect(.regular.tint(tint.opacity(0.20)).interactive(), in: .rect(cornerRadius: cornerRadius))
-                .overlay {
-                    shape.strokeBorder(Color.white.opacity(isSelected ? 0.30 : 0.16), lineWidth: 1)
-                }
-                .contentShape(shape)
-                .opacity(isEnabled ? 1 : 0.48)
-                .scaleEffect(configuration.isPressed ? 0.94 : 1.0)
-                .animation(.easeInOut(duration: 0.12), value: configuration.isPressed)
-        } else {
-            fallbackBody(configuration: configuration, shape: shape, tint: tint, iconColor: iconColor)
-        }
-        #else
-        fallbackBody(configuration: configuration, shape: shape, tint: tint, iconColor: iconColor)
-        #endif
-    }
-
-    private func fallbackBody(
-        configuration: Configuration,
-        shape: RoundedRectangle,
-        tint: Color,
-        iconColor: Color
-    ) -> some View {
+        let shape = RoundedRectangle(cornerRadius: 10, style: .continuous)
         configuration.label
-            .font(.system(size: 18, weight: .semibold))
-            .foregroundStyle(isEnabled ? iconColor : Color.secondary.opacity(0.55))
-            .padding(.horizontal, 14)
-            .frame(minWidth: 52, minHeight: 42)
-            .background {
-                shape
-                    .fill(tint.opacity(configuration.isPressed ? 0.22 : 0.14))
-                    .background(.ultraThinMaterial, in: shape)
-                    .overlay {
-                        LinearGradient(
-                            colors: [
-                                Color.white.opacity(configuration.isPressed ? 0.24 : 0.18),
-                                Color.white.opacity(0.04)
-                            ],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
-                        .clipShape(shape)
-                    }
-                    .overlay {
-                        shape.strokeBorder(Color.white.opacity(isSelected ? 0.30 : 0.16), lineWidth: 1)
-                    }
-            }
+            .font(.system(size: 17, weight: .medium))
+            .foregroundStyle(isSelected ? RedappDesign.accent : RedappDesign.ink)
+            .padding(.horizontal, 12)
+            .frame(minWidth: 44, minHeight: 40)
+            .background(shape.fill(isSelected ? RedappDesign.accentSoft : RedappDesign.field))
+            .overlay(shape.strokeBorder(RedappDesign.hairlineStrong, lineWidth: 1))
             .contentShape(shape)
-            .opacity(isEnabled ? 1 : 0.48)
-            .scaleEffect(configuration.isPressed ? 0.94 : 1.0)
-            .animation(.easeInOut(duration: 0.12), value: configuration.isPressed)
+            .opacity(isEnabled ? (configuration.isPressed ? 0.7 : 1) : 0.45)
     }
 }
 
@@ -14460,78 +14748,25 @@ struct BatchSummaryStandaloneGlassButtonStyle: ButtonStyle {
 struct AdaptiveLiquidGlassButtonStyle: ButtonStyle {
     let cornerRadius: CGFloat
     let isCompact: Bool
-    
+
     init(cornerRadius: CGFloat = 8, isCompact: Bool = false) {
         self.cornerRadius = cornerRadius
         self.isCompact = isCompact
     }
-    
-    func makeBody(configuration: Configuration) -> some View {
-        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
 
-        configuration.label
-            .padding(.horizontal, isCompact ? 12 : 16)
-            .padding(.vertical, isCompact ? 8 : 12)
-            .background {
-                ZStack {
-                    shape
-                        .fill(.regularMaterial)
-                    
-                    LinearGradient(
-                        colors: [
-                            Color.white.opacity(configuration.isPressed ? 0.3 : 0.2),
-                            Color.white.opacity(0.05)
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                    .blendMode(.overlay)
-                    .clipShape(shape)
-                    
-                    shape
-                        .strokeBorder(
-                            Color.white.opacity(0.18),
-                            lineWidth: 0.8
-                        )
-                }
-            }
-            .scaleEffect(configuration.isPressed ? 0.95 : 1.0)
-            .animation(.easeInOut(duration: 0.1), value: configuration.isPressed)
+    func makeBody(configuration: Configuration) -> some View {
+        RedappSecondaryButtonStyle(isCapsule: cornerRadius >= 18).makeBody(configuration: configuration)
     }
 }
 
+/// Text fields: white (or dark field) with a hairline edge, as in the mockup.
 struct LiquidGlassTextFieldStyle: TextFieldStyle {
     func _body(configuration: TextField<Self._Label>) -> some View {
         configuration
             .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background {
-                ZStack {
-                    // Base glass layer
-                    RoundedRectangle(cornerRadius: 20)
-                        .fill(.ultraThinMaterial)
-                    
-                    // Shimmer effect
-                    LinearGradient(
-                        colors: [
-                            Color.white.opacity(0.2),
-                            Color.white.opacity(0.05),
-                            Color.white.opacity(0.2)
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                    .blendMode(.overlay)
-                    .clipShape(RoundedRectangle(cornerRadius: 20))
-                    
-                    // Border
-                    RoundedRectangle(cornerRadius: 20)
-                        .strokeBorder(
-                            AppColors.redditCardBorder,
-                            lineWidth: 1
-                        )
-                }
-            }
+            .padding(.vertical, 10)
+            .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(RedappDesign.field))
+            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(RedappDesign.hairlineStrong, lineWidth: 1))
     }
 }
 
@@ -14539,80 +14774,29 @@ struct LiquidGlassTextEditorStyle: ViewModifier {
     var isDraggingOver: Bool = false
     var minHeight: CGFloat = 80
     var maxHeight: CGFloat = 200
-    
+
     func body(content: Content) -> some View {
         content
             .padding(12)
             .frame(minHeight: minHeight, maxHeight: maxHeight)
-            .background {
-                ZStack {
-                    // Base glass layer
-                    RoundedRectangle(cornerRadius: 20)
-                        .fill(isDraggingOver ? Color.blue.opacity(0.05) : Color.clear)
-                        .background(
-                            RoundedRectangle(cornerRadius: 20)
-                                .fill(.ultraThinMaterial)
-                        )
-                    
-                    // Shimmer effect
-                    LinearGradient(
-                        colors: [
-                            Color.white.opacity(isDraggingOver ? 0.3 : 0.2),
-                            Color.white.opacity(0.05),
-                            Color.white.opacity(isDraggingOver ? 0.3 : 0.2)
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                    .blendMode(.overlay)
-                    .clipShape(RoundedRectangle(cornerRadius: 20))
-                    
-                    // Border
-                    RoundedRectangle(cornerRadius: 20)
-                        .strokeBorder(
-                            isDraggingOver
-                            ? LinearGradient(
-                                colors: [
-                                    Color.blue.opacity(0.5),
-                                    Color.blue.opacity(0.3)
-                                ],
-                                startPoint: .top,
-                                endPoint: .bottom
-                            )
-                            : AppColors.redditCardBorder,
-                            lineWidth: isDraggingOver ? 2 : 1
-                        )
-                }
-            }
+            .scrollContentBackground(.hidden)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(isDraggingOver ? RedappDesign.accentSoft : RedappDesign.field)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(isDraggingOver ? RedappDesign.accent : RedappDesign.hairlineStrong, lineWidth: isDraggingOver ? 2 : 1)
+            )
             .animation(.easeInOut(duration: 0.2), value: isDraggingOver)
     }
 }
 
 struct LiquidGlassBackground: ViewModifier {
     func body(content: Content) -> some View {
-        // Use current material effect
         content
-            .background {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 8)
-                        .fill(.ultraThinMaterial)
-                    LinearGradient(
-                        colors: [
-                                Color.white.opacity(0.5),
-                                Color.white.opacity(0.2)
-                            ],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
-                        .blur(radius: 20)
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                    RoundedRectangle(cornerRadius: 8)
-                            .stroke(
-                                AppColors.redditCardBorder,
-                                lineWidth: 1
-                            )
-                    }
-                }
+            .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(RedappDesign.card))
+            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(RedappDesign.hairline, lineWidth: 1))
     }
 }
 
@@ -14620,29 +14804,8 @@ struct LiquidGlassSegmentedPickerStyle: ViewModifier {
     func body(content: Content) -> some View {
         content
             .padding(4)
-            .background {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 12)
-                        .fill(.ultraThinMaterial)
-                    
-                    LinearGradient(
-                        colors: [
-                            Color.white.opacity(0.15),
-                            Color.white.opacity(0.05)
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                    .blendMode(.overlay)
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
-                    
-                    RoundedRectangle(cornerRadius: 12)
-                        .strokeBorder(
-                            AppColors.redditCardBorder,
-                            lineWidth: 1
-                        )
-                }
-            }
+            .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(RedappDesign.field))
+            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(RedappDesign.hairlineStrong, lineWidth: 1))
     }
 }
 
@@ -14771,6 +14934,11 @@ struct SelectableText: View {
         copy.fontWeight = weight
         return copy
     }
+
+    /// Same as `fontWeight(_:)`, but never ambiguous with SwiftUI's `View.fontWeight`.
+    func textWeight(_ weight: Font.Weight?) -> SelectableText {
+        fontWeight(weight)
+    }
     
     func underline(_ active: Bool = true) -> SelectableText {
         var copy = self
@@ -14835,6 +15003,9 @@ struct SelectableText: View {
 
 #if os(iOS)
 class SelectableUITextView: UITextView {
+    /// Inputs of the last render; lets updates skip unchanged text (a big cost
+    /// on long threads, where every state change used to re-set every text view).
+    var lastRenderSignature: Int?
     var onAskAI: ((String) -> Void)? {
         didSet {
             installAskAIMenuItemIfNeeded()
@@ -14962,6 +15133,22 @@ struct SelectableTextRepresentable: UIViewRepresentable {
     func updateUIView(_ textView: SelectableUITextView, context: Context) {
         textView.onAskAI = onAskAI
         textView.onAskAIWeb = onAskAIWeb
+
+        var hasher = Hasher()
+        hasher.combine(text)
+        hasher.combine(attributedText)
+        hasher.combine(String(describing: font))
+        hasher.combine(String(describing: fontWeight))
+        hasher.combine(String(describing: foregroundColor))
+        hasher.combine(String(describing: textAlignment))
+        hasher.combine(isJustified)
+        hasher.combine(lineLimit)
+        hasher.combine(underline)
+        hasher.combine(context.environment.colorScheme)
+        hasher.combine(context.environment.dynamicTypeSize)
+        let signature = hasher.finalize()
+        if textView.lastRenderSignature == signature { return }
+        textView.lastRenderSignature = signature
         
         // Convert SwiftUI Font to UIFont
         let uiFont: UIFont
@@ -14995,18 +15182,20 @@ struct SelectableTextRepresentable: UIViewRepresentable {
         // Apply font weight if specified
         let finalFont: UIFont
         if let weight = fontWeight {
-            let traits: UIFontDescriptor.SymbolicTraits
+            let uiWeight: UIFont.Weight
             switch weight {
-            case .bold, .heavy, .black:
-                traits = .traitBold
-            default:
-                traits = []
+            case .ultraLight: uiWeight = .ultraLight
+            case .thin: uiWeight = .thin
+            case .light: uiWeight = .light
+            case .medium: uiWeight = .medium
+            case .semibold: uiWeight = .semibold
+            case .bold: uiWeight = .bold
+            case .heavy: uiWeight = .heavy
+            case .black: uiWeight = .black
+            default: uiWeight = .regular
             }
-            if let descriptor = uiFont.fontDescriptor.withSymbolicTraits(traits) {
-                finalFont = UIFont(descriptor: descriptor, size: uiFont.pointSize)
-            } else {
-                finalFont = uiFont
-            }
+            // Keep the Dynamic Type size of the text style, change only the weight.
+            finalFont = UIFont.systemFont(ofSize: uiFont.pointSize, weight: uiWeight)
         } else {
             finalFont = uiFont
         }
@@ -15064,8 +15253,16 @@ struct SelectableTextRepresentable: UIViewRepresentable {
             attributedString.addAttribute(.foregroundColor, value: resolvedTextColor, range: fullRange)
             textView.attributedText = attributedString
         } else {
-            textView.attributedText = nil
-            textView.text = text
+            // Plain strings are set as attributed text so the resolved font
+            // (including its weight) always sticks to the text view.
+            let paragraph = NSMutableParagraphStyle()
+            paragraph.alignment = resolvedAlignment
+            paragraph.lineBreakMode = .byWordWrapping
+            textView.attributedText = NSAttributedString(string: text, attributes: [
+                .font: finalFont,
+                .foregroundColor: resolvedTextColor,
+                .paragraphStyle: paragraph
+            ])
         }
 
         textView.textAlignment = resolvedAlignment
@@ -15110,8 +15307,10 @@ struct CommentView: View {
         min(max(comment.depth, 0), 6)
     }
 
+    /// Narrow per-level indent; the colored rail carries the nesting instead
+    /// of whitespace, so deep threads keep a readable line length.
     private var leadingIndent: CGFloat {
-        min(CGFloat(depth) * 26, 84)
+        min(CGFloat(depth) * 14, 70)
     }
 
     private var displayedScore: Int {
@@ -15119,23 +15318,19 @@ struct CommentView: View {
     }
 
     private var metadataColor: Color {
-        isDarkMode ? Color.white.opacity(0.58) : Color.black.opacity(0.52)
-    }
-
-    private var cardFill: Color {
-        isDarkMode ? Color(red: 0.055, green: 0.06, blue: 0.085) : Color.white.opacity(0.92)
-    }
-
-    private var cardBorder: Color {
-        isDarkMode ? Color.white.opacity(0.08) : Color.black.opacity(0.08)
+        RedappDesign.inkSecondary
     }
 
     private var accentColor: Color {
-        Color(red: 0.53, green: 0.25, blue: 1.0)
+        RedappDesign.accent
     }
 
     private var replyRailColor: Color {
-        accentColor.opacity(isDarkMode ? 0.85 : 0.6)
+        RedappDesign.depthColor(depth).opacity(isDarkMode ? 0.9 : 0.7)
+    }
+
+    private var ageText: String? {
+        comment.createdAt.map { RedappTime.shortAge(from: $0) }
     }
 
     private var commentShareURL: URL {
@@ -15150,35 +15345,50 @@ struct CommentView: View {
         return URL(string: "https://www.reddit.com/comments/\(comment.id)")!
     }
 
-    private var avatarGradient: LinearGradient {
-        let palette: [[Color]] = [
-            [Color(red: 0.12, green: 0.72, blue: 0.78), Color(red: 0.08, green: 0.38, blue: 0.58)],
-            [Color(red: 0.47, green: 0.28, blue: 0.92), Color(red: 0.26, green: 0.18, blue: 0.58)],
-            [Color(red: 0.18, green: 0.72, blue: 0.36), Color(red: 0.08, green: 0.38, blue: 0.24)],
-            [Color(red: 0.94, green: 0.38, blue: 0.18), Color(red: 0.55, green: 0.16, blue: 0.1)]
-        ]
-        let checksum = comment.author.unicodeScalars.reduce(0) { $0 + Int($1.value) }
-        let colors = palette[checksum % palette.count]
-        return LinearGradient(colors: colors, startPoint: .topLeading, endPoint: .bottomTrailing)
+    @Environment(\.horizontalSizeClass) private var commentSizeClass
+
+    /// iPhone threads use smaller avatars and a tighter reply indent so deep
+    /// replies keep room for the author name and votes.
+    private var isCompactWidth: Bool { commentSizeClass == .compact }
+
+    private var avatarSize: CGFloat {
+        if isCompactWidth { return depth == 0 ? 32 : 26 }
+        return depth == 0 ? 40 : 34
+    }
+
+    private var replyIndent: CGFloat {
+        if isCompactWidth { return depth < 3 ? avatarSize / 2 + 12 : 12 }
+        return depth < 4 ? avatarSize + 12 : 14
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .top, spacing: 8) {
-                if depth > 0 {
-                    RoundedRectangle(cornerRadius: 2)
-                        .fill(replyRailColor)
-                        .frame(width: 3)
-                        .padding(.vertical, 10)
-                }
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(alignment: .top, spacing: isCompactWidth ? 10 : 12) {
+                RedappAvatar(name: comment.author, size: avatarSize)
+                    .onTapGesture { toggleCollapsed() }
 
-                commentCard
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                VStack(alignment: .leading, spacing: 6) {
+                    commentHeader
+
+                    if isCollapsed {
+                        if !comment.replies.isEmpty {
+                            Text("\(comment.replies.count) repl\(comment.replies.count == 1 ? "y" : "ies") hidden")
+                                .font(.footnote)
+                                .foregroundStyle(RedappDesign.inkSecondary)
+                        }
+                    } else {
+                        commentBody
+                        commentImages
+                        commentLinks
+                        commentActionRow
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(.leading, leadingIndent)
+            .padding(.vertical, 12)
 
             if !isCollapsed && !comment.replies.isEmpty {
-                LazyVStack(alignment: .leading, spacing: 8) {
+                VStack(alignment: .leading, spacing: 0) {
                     ForEach(comment.replies.prefix(visibleRepliesCount)) { reply in
                         CommentView(comment: reply, postPermalink: postPermalink)
                     }
@@ -15191,23 +15401,24 @@ struct CommentView: View {
                                 Text("Show \(comment.replies.count - visibleRepliesCount) more replies")
                                 Image(systemName: "chevron.down")
                             }
-                            .font(.caption.weight(.semibold))
-                            .foregroundColor(accentColor)
-                            .padding(.horizontal, 12)
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(RedappDesign.accent)
                             .padding(.vertical, 8)
-                            .background(
-                                Capsule()
-                                    .fill(accentColor.opacity(0.12))
-                            )
                         }
                         .buttonStyle(.plain)
-                        .padding(.leading, leadingIndent + 44)
                     }
+                }
+                .padding(.leading, replyIndent)
+                .overlay(alignment: .topLeading) {
+                    // Thread line from this comment's avatar down through its replies.
+                    Rectangle()
+                        .fill(RedappDesign.hairlineStrong)
+                        .frame(width: 1.5)
+                        .padding(.leading, avatarSize / 2 - 0.75)
+                        .padding(.bottom, 16)
                 }
             }
         }
-        .padding(.leading, 8)
-        .padding(.vertical, 2)
         .alert("Error", isPresented: $showReplyError) {
             Button("OK") { }
         } message: {
@@ -15235,104 +15446,84 @@ struct CommentView: View {
         }
     }
 
-    private var commentCard: some View {
-        HStack(alignment: .top, spacing: 12) {
-            avatarView
-
-            VStack(alignment: .leading, spacing: 10) {
-                commentHeader
-
-                if !isCollapsed {
-                    commentBody
-                    commentImages
-                    commentLinks
-                    commentActionRow
-
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
+    private func toggleCollapsed() {
+        withAnimation(.easeInOut(duration: 0.18)) {
+            isCollapsed.toggle()
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 14)
-        .background {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(cardFill)
-        }
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(cardBorder, lineWidth: 1)
-        )
-        .shadow(color: Color.black.opacity(isDarkMode ? 0.2 : 0.06), radius: 10, x: 0, y: 5)
-    }
-
-    private var avatarView: some View {
-        ZStack {
-            Circle()
-                .fill(avatarGradient)
-
-            Image("reddit")
-                .resizable()
-                .scaledToFit()
-                .frame(width: 25, height: 25)
-
-            Circle()
-                .stroke(Color.white.opacity(isDarkMode ? 0.18 : 0.7), lineWidth: 1)
-        }
-        .frame(width: 44, height: 44)
-        .shadow(color: Color.black.opacity(isDarkMode ? 0.28 : 0.12), radius: 6, x: 0, y: 3)
-        .accessibilityHidden(true)
     }
 
     private var commentHeader: some View {
-        Button {
-            withAnimation(.easeInOut(duration: 0.18)) {
-                isCollapsed.toggle()
-            }
-        } label: {
-            HStack(alignment: .firstTextBaseline, spacing: 5) {
-                Text("u/\(comment.author)")
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundColor(.primary)
-                    .lineLimit(1)
-
-                Text("•")
-                    .font(.caption)
-                    .foregroundColor(metadataColor)
-
-                Text("\(comment.score) \(comment.score == 1 ? "point" : "points")")
-                    .font(.system(size: 14))
-                    .foregroundColor(metadataColor)
-                    .lineLimit(1)
-
-                Spacer(minLength: 8)
-
-                if !comment.replies.isEmpty {
-                    Text("\(comment.replies.count)")
-                        .font(.caption)
-                        .foregroundColor(metadataColor)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(
-                            Capsule()
-                                .fill(metadataColor.opacity(0.12))
-                        )
+        HStack(alignment: .center, spacing: 6) {
+            Button(action: toggleCollapsed) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(comment.author)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(RedappDesign.ink)
+                        .lineLimit(1)
+                    if let ageText {
+                        Text("· \(ageText == "now" ? "just now" : "\(ageText) ago")")
+                            .font(.subheadline)
+                            .foregroundStyle(RedappDesign.inkSecondary)
+                            .lineLimit(1)
+                            .fixedSize()
+                            .layoutPriority(1)
+                    }
+                    if isCollapsed {
+                        Image(systemName: "chevron.down")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(RedappDesign.inkSecondary)
+                    }
                 }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("u/\(comment.author)\(isCollapsed ? ", collapsed" : "")")
+            .accessibilityHint(isCollapsed ? "Expands this comment" : "Collapses this comment")
 
-                Image(systemName: isCollapsed ? "chevron.down" : "chevron.up")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundColor(metadataColor)
+            Spacer(minLength: 8)
+
+            HStack(spacing: 8) {
+                Button {
+                    submitVote(userVote == .upvote ? .none : .upvote)
+                } label: {
+                    Image(systemName: userVote == .upvote ? "arrowshape.up.fill" : "arrowshape.up")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(userVote == .upvote ? RedappDesign.upvote : RedappDesign.ink)
+                        .frame(width: 30, height: 30)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(isSubmittingVote)
+                .accessibilityLabel(userVote == .upvote ? "Remove upvote" : "Upvote")
+
+                Text(RedappNumber.compact(displayedScore))
+                    .font(.subheadline.weight(.semibold).monospacedDigit())
+                    .foregroundStyle(RedappDesign.ink)
+                    .accessibilityLabel("\(displayedScore) points")
+
+                Button {
+                    submitVote(userVote == .downvote ? .none : .downvote)
+                } label: {
+                    Image(systemName: userVote == .downvote ? "arrowshape.down.fill" : "arrowshape.down")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(userVote == .downvote ? RedappDesign.downvote : RedappDesign.ink)
+                        .frame(width: 30, height: 30)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(isSubmittingVote)
+                .accessibilityLabel(userVote == .downvote ? "Remove downvote" : "Downvote")
             }
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel(isCollapsed ? "Expand comment" : "Collapse comment")
     }
 
     @ViewBuilder
     private var commentBody: some View {
         if !comment.processedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             SelectableText(comment.attributedText ?? AttributedString(comment.processedText))
-                .font(.system(size: 16))
+                .font(.body)
                 .lineSpacing(3)
+                .foregroundStyle(RedappDesign.ink)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
@@ -15401,33 +15592,7 @@ struct CommentView: View {
     }
 
     private var commentActionRow: some View {
-        HStack(spacing: 12) {
-            Button {
-                submitVote(userVote == .upvote ? .none : .upvote)
-            } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: "arrow.up")
-                        .font(.system(size: 16, weight: .bold))
-                    Text("\(displayedScore)")
-                        .font(.system(size: 14, weight: .semibold))
-                }
-            }
-            .foregroundColor(userVote == .upvote ? accentColor : metadataColor)
-            .disabled(isSubmittingVote)
-            .buttonStyle(.plain)
-            .accessibilityLabel(userVote == .upvote ? "Remove upvote" : "Upvote")
-
-            Button {
-                submitVote(userVote == .downvote ? .none : .downvote)
-            } label: {
-                Image(systemName: "arrow.down")
-                    .font(.system(size: 16, weight: .medium))
-            }
-            .foregroundColor(userVote == .downvote ? .orange : metadataColor)
-            .disabled(isSubmittingVote)
-            .buttonStyle(.plain)
-            .accessibilityLabel(userVote == .downvote ? "Remove downvote" : "Downvote")
-
+        HStack(spacing: 18) {
             Button {
                 if authManager.isAuthenticated {
                     withAnimation(.easeInOut(duration: 0.18)) {
@@ -15438,19 +15603,13 @@ struct CommentView: View {
                     showReplyError = true
                 }
             } label: {
-                Label("Reply", systemImage: "bubble")
-                    .labelStyle(.titleAndIcon)
+                Label("Reply", systemImage: "bubble.left")
             }
-            .buttonStyle(.plain)
-            .foregroundColor(metadataColor)
             .accessibilityLabel("Reply to comment")
 
             ShareLink(item: commentShareURL) {
-                Label("Share", systemImage: "square.and.arrow.up")
-                    .labelStyle(.titleAndIcon)
+                Image(systemName: "square.and.arrow.up")
             }
-            .buttonStyle(.plain)
-            .foregroundColor(metadataColor)
             .accessibilityLabel("Share comment")
 
             Menu {
@@ -15467,16 +15626,15 @@ struct CommentView: View {
                 }
             } label: {
                 Image(systemName: "ellipsis")
-                    .font(.system(size: 16, weight: .semibold))
+                    .frame(width: 28, height: 24)
+                    .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
-            .foregroundColor(metadataColor)
             .accessibilityLabel("More comment actions")
         }
-        .font(.system(size: 14, weight: .medium))
-        .lineLimit(1)
-        .minimumScaleFactor(0.75)
-        .padding(.top, 2)
+        .buttonStyle(.plain)
+        .font(.subheadline)
+        .foregroundStyle(RedappDesign.inkSecondary)
+        .frame(minHeight: 32)
     }
 
     private func submitVote(_ newDirection: VoteDirection) {
@@ -15624,23 +15782,19 @@ struct ReplyComposer: View {
     }
 
     private var accentColor: Color {
-        Color(red: 0.0, green: 0.58, blue: 1.0)
+        RedappDesign.accent
     }
 
     private var panelBackground: Color {
-        Color(red: 0.055, green: 0.058, blue: 0.071)
+        RedappDesign.canvas
     }
 
     private var fieldBackground: Color {
-        Color(red: 0.105, green: 0.112, blue: 0.135)
-    }
-
-    private var controlBackground: Color {
-        Color(red: 0.17, green: 0.18, blue: 0.21)
+        RedappDesign.field
     }
 
     private var fieldStroke: Color {
-        Color.white.opacity(0.055)
+        RedappDesign.hairlineStrong
     }
 
     var body: some View {
@@ -15648,9 +15802,7 @@ struct ReplyComposer: View {
             #if os(iOS)
             .presentationDetents([.fraction(0.86), .large])
             .presentationDragIndicator(.hidden)
-            .presentationCornerRadius(34)
-            .presentationBackground(.clear)
-            .clearModalBackground()
+            .presentationBackground(RedappDesign.canvas)
             #else
             .frame(minWidth: 580, minHeight: 520)
             #endif
@@ -15660,7 +15812,6 @@ struct ReplyComposer: View {
         GeometryReader { proxy in
             composerBody(editorHeight: editorHeight(for: proxy.size.height))
         }
-        .preferredColorScheme(.dark)
     }
 
     private var composerBackground: some View {
@@ -15672,14 +15823,12 @@ struct ReplyComposer: View {
             composerBackground
             
             VStack(spacing: 0) {
-                header
-
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(alignment: .leading, spacing: 20) {
                         contextPreview
 
                         Rectangle()
-                            .fill(Color.white.opacity(0.08))
+                            .fill(RedappDesign.hairline)
                             .frame(height: 1)
 
                         replyEditor(height: editorHeight)
@@ -15700,11 +15849,15 @@ struct ReplyComposer: View {
                     .padding(.top, 18)
                     .padding(.bottom, 12)
                 }
-
-                bottomToolbar
-                .padding(.horizontal, 24)
-                .padding(.top, 12)
-                .padding(.bottom, 22)
+                .safeAreaBar(edge: .top, spacing: 0) {
+                    header
+                }
+                .safeAreaBar(edge: .bottom, spacing: 0) {
+                    bottomToolbar
+                        .padding(.horizontal, 24)
+                        .padding(.top, 12)
+                        .padding(.bottom, 22)
+                }
             }
         }
     }
@@ -15715,33 +15868,19 @@ struct ReplyComposer: View {
 
     private var header: some View {
         HStack {
-            Button {
+            Button("Cancel") {
                 selectedImages.removeAll()
                 onCancel()
                 dismiss()
-            } label: {
-                Text("Cancel")
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundStyle(Color.white.opacity(0.94))
-                    .padding(.horizontal, 22)
-                    .frame(height: 44)
-                    .background {
-                        Capsule(style: .continuous)
-                            .fill(controlBackground)
-                            .overlay {
-                                Capsule(style: .continuous)
-                                    .stroke(Color.white.opacity(0.08), lineWidth: 1)
-                            }
-                    }
             }
-            .buttonStyle(.plain)
+            .buttonStyle(RedappSecondaryButtonStyle())
             .disabled(isSubmitting || isUploadingImages)
 
             Spacer()
 
             Text(title)
-                .font(.system(size: 19, weight: .bold))
-                .foregroundStyle(Color.white.opacity(0.92))
+                .font(.headline)
+                .foregroundStyle(RedappDesign.ink)
 
             Spacer()
 
@@ -15752,42 +15891,31 @@ struct ReplyComposer: View {
                     if isSubmitting || isUploadingImages {
                         ProgressView()
                             .controlSize(.small)
-                            .tint(accentColor)
+                            .tint(.white)
                     } else {
                         Text(submitTitle)
-                            .font(.system(size: 18, weight: .semibold))
                     }
                 }
-                .foregroundStyle(canSubmit ? accentColor : Color.secondary.opacity(0.72))
-                .padding(.horizontal, 22)
-                .frame(minWidth: 94, minHeight: 44)
-                .background {
-                    Capsule(style: .continuous)
-                        .fill(controlBackground.opacity(canSubmit ? 1.0 : 0.78))
-                        .overlay {
-                            Capsule(style: .continuous)
-                                .stroke(Color.white.opacity(canSubmit ? 0.08 : 0.045), lineWidth: 1)
-                        }
-                }
+                .frame(minWidth: 64)
             }
-            .buttonStyle(.plain)
+            .buttonStyle(RedappPrimaryButtonStyle(isCapsule: true))
             .disabled(!canSubmit)
         }
-        .padding(.horizontal, 16)
-        .padding(.top, 22)
-        .padding(.bottom, 10)
+        .padding(.horizontal, 20)
+        .padding(.top, 20)
+        .padding(.bottom, 8)
     }
 
     private var contextPreview: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 10) {
                 Image(systemName: "arrowshape.turn.up.left.fill")
-                    .font(.system(size: 17, weight: .semibold))
-                    .foregroundStyle(Color.secondary)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(RedappDesign.accent)
 
                 Text(contextLabel)
-                    .font(.system(size: 18, weight: .bold))
-                    .foregroundStyle(Color.white.opacity(0.92))
+                    .font(.headline)
+                    .foregroundStyle(RedappDesign.ink)
                     .lineLimit(1)
                     .truncationMode(.tail)
             }
@@ -15795,13 +15923,13 @@ struct ReplyComposer: View {
             if !contextText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 HStack(alignment: .top, spacing: 12) {
                     Capsule(style: .continuous)
-                        .fill(Color.secondary.opacity(0.35))
-                        .frame(width: 5)
+                        .fill(RedappDesign.accent)
+                        .frame(width: 3)
 
                     Text(contextText)
-                        .font(.system(size: 15, weight: .medium))
+                        .font(.subheadline)
                         .lineSpacing(3)
-                        .foregroundStyle(Color.secondary)
+                        .foregroundStyle(RedappDesign.inkSecondary)
                         .lineLimit(5)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -15812,8 +15940,8 @@ struct ReplyComposer: View {
     private func replyEditor(height: CGFloat) -> some View {
         ZStack(alignment: .topLeading) {
             TextEditor(text: $text)
-                .font(.system(size: 21, weight: .regular))
-                .foregroundStyle(Color.white.opacity(0.94))
+                .font(.body)
+                .foregroundStyle(RedappDesign.ink)
                 .tint(accentColor)
                 .scrollContentBackground(.hidden)
                 .padding(.horizontal, 8)
@@ -15826,21 +15954,21 @@ struct ReplyComposer: View {
                 }
 
             if text.isEmpty {
-                Text("Write your reply...")
-                    .font(.system(size: 21, weight: .semibold))
-                    .foregroundStyle(Color.secondary)
+                Text("Write your reply…")
+                    .font(.body)
+                    .foregroundStyle(RedappDesign.inkTertiary)
                     .padding(.top, 16)
                     .padding(.leading, 14)
                     .allowsHitTesting(false)
             }
         }
         .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
+            RoundedRectangle(cornerRadius: RedappDesign.Radius.medium, style: .continuous)
                 .fill(fieldBackground)
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(isDraggingOver ? accentColor.opacity(0.85) : fieldStroke, lineWidth: isDraggingOver ? 1.5 : 1)
+            RoundedRectangle(cornerRadius: RedappDesign.Radius.medium, style: .continuous)
+                .strokeBorder(isDraggingOver ? accentColor.opacity(0.85) : fieldStroke, lineWidth: isDraggingOver ? 1.5 : 1)
         )
     }
 
@@ -15856,7 +15984,7 @@ struct ReplyComposer: View {
                             .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                             .overlay(
                                 RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                    .stroke(Color.white.opacity(0.14), lineWidth: 1)
+                                    .strokeBorder(RedappDesign.hairline, lineWidth: 1)
                             )
                             .clipped()
 
@@ -15879,9 +16007,9 @@ struct ReplyComposer: View {
 
     private var uploadProgressView: some View {
         VStack(alignment: .leading, spacing: 7) {
-            Text("Uploading images...")
+            Text("Uploading images…")
                 .font(.caption.weight(.semibold))
-                .foregroundStyle(Color.white.opacity(0.66))
+                .foregroundStyle(RedappDesign.inkSecondary)
             ProgressView(value: uploadProgress)
                 .tint(accentColor)
         }
@@ -15890,20 +16018,18 @@ struct ReplyComposer: View {
     private var bottomToolbar: some View {
         HStack(spacing: 16) {
             Button(action: openImagePicker) {
-                Image(systemName: "photo")
-                    .font(.system(size: 16, weight: .medium))
+                Label("Add image", systemImage: "photo")
             }
-            .buttonStyle(.plain)
+            .buttonStyle(RedappSecondaryButtonStyle())
             .disabled(isSubmitting || isUploadingImages)
-            .accessibilityLabel("Add image")
 
             Spacer()
 
             Text("\(text.count)")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
+                .font(.caption)
+                .monospacedDigit()
+                .foregroundStyle(RedappDesign.inkTertiary)
         }
-        .foregroundStyle(.secondary)
         #if os(iOS)
         .sheet(isPresented: $showImagePicker) {
             ImagePicker(selectedImages: $selectedImages)
@@ -15912,19 +16038,7 @@ struct ReplyComposer: View {
     }
 
     private func errorView(_ message: String) -> some View {
-        HStack(alignment: .top, spacing: 8) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .font(.caption.weight(.semibold))
-            Text(message)
-                .font(.footnote.weight(.medium))
-        }
-        .foregroundStyle(Color(red: 1.0, green: 0.62, blue: 0.62))
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .background {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color(red: 0.32, green: 0.08, blue: 0.12).opacity(0.42))
-        }
+        RedappInlineMessage(message: message, kind: .warning)
     }
 
     private func openImagePicker() {
@@ -16143,12 +16257,13 @@ struct PostComposer: View {
 
                     Text("Posting to r/\(subreddit)")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(RedappDesign.inkSecondary)
                         .padding(.top, 2)
                 }
-                .padding(.horizontal, 18)
+                .padding(.horizontal, 20)
                 .padding(.top, 18)
                 .padding(.bottom, 28)
+                .redappReadableColumn()
             }
             .scrollContentBackground(.hidden)
             .background(composerBackground.ignoresSafeArea())
@@ -16174,11 +16289,13 @@ struct PostComposer: View {
                                 .fontWeight(.semibold)
                         }
                     }
+                    .buttonStyle(.borderedProminent)
+                    .tint(RedappDesign.accent)
                     .disabled(isSubmitDisabled)
                 }
             }
         }
-        .preferredColorScheme(.dark)
+        .presentationBackground(RedappDesign.canvas)
         .alert("Error", isPresented: $showError) {
             Button("OK") { }
         } message: {
@@ -16221,15 +16338,15 @@ struct PostComposer: View {
     }
 
     private var composerBackground: Color {
-        Color(red: 0.055, green: 0.058, blue: 0.071)
+        RedappDesign.canvas
     }
 
     private var fieldBackground: Color {
-        Color(red: 0.105, green: 0.112, blue: 0.135)
+        RedappDesign.field
     }
 
     private var fieldStroke: Color {
-        Color.white.opacity(0.055)
+        RedappDesign.hairlineStrong
     }
 
     private var postTypeSection: some View {
@@ -16243,9 +16360,9 @@ struct PostComposer: View {
             .padding(2)
             .frame(height: 40)
             .background(fieldBackground)
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: RedappDesign.Radius.small + 2, style: .continuous))
             .overlay(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                RoundedRectangle(cornerRadius: RedappDesign.Radius.small + 2, style: .continuous)
                     .stroke(fieldStroke, lineWidth: 1)
             )
         }
@@ -16263,9 +16380,9 @@ struct PostComposer: View {
                     .padding(.trailing, 64)
                     .frame(height: 44)
                     .background(fieldBackground)
-                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .clipShape(RoundedRectangle(cornerRadius: RedappDesign.Radius.small + 2, style: .continuous))
                     .overlay(
-                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        RoundedRectangle(cornerRadius: RedappDesign.Radius.small + 2, style: .continuous)
                             .stroke(fieldStroke, lineWidth: 1)
                     )
 
@@ -16321,9 +16438,9 @@ struct PostComposer: View {
                 .padding(.horizontal, 13)
                 .frame(height: 40)
                 .background(fieldBackground)
-                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .clipShape(RoundedRectangle(cornerRadius: RedappDesign.Radius.small + 2, style: .continuous))
                 .overlay(
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    RoundedRectangle(cornerRadius: RedappDesign.Radius.small + 2, style: .continuous)
                         .stroke(fieldStroke, lineWidth: 1)
                 )
             }
@@ -16335,9 +16452,9 @@ struct PostComposer: View {
                     .padding(.horizontal, 14)
                     .frame(height: 40)
                     .background(fieldBackground)
-                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .clipShape(RoundedRectangle(cornerRadius: RedappDesign.Radius.small + 2, style: .continuous))
                     .overlay(
-                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        RoundedRectangle(cornerRadius: RedappDesign.Radius.small + 2, style: .continuous)
                             .stroke(fieldStroke, lineWidth: 1)
                     )
             }
@@ -16381,9 +16498,9 @@ struct PostComposer: View {
             .padding(.horizontal, 14)
             .frame(height: 44)
             .background(fieldBackground)
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: RedappDesign.Radius.small + 2, style: .continuous))
             .overlay(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                RoundedRectangle(cornerRadius: RedappDesign.Radius.small + 2, style: .continuous)
                     .stroke(fieldStroke, lineWidth: 1)
             )
         }
@@ -16425,10 +16542,10 @@ struct PostComposer: View {
                 .padding(.bottom, 10)
             }
             .background(fieldBackground)
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: RedappDesign.Radius.small + 2, style: .continuous))
             .overlay(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .stroke(isDraggingOverTextEditor ? Color.accentColor.opacity(0.85) : fieldStroke, lineWidth: 1)
+                RoundedRectangle(cornerRadius: RedappDesign.Radius.small + 2, style: .continuous)
+                    .stroke(isDraggingOverTextEditor ? RedappDesign.accent.opacity(0.85) : fieldStroke, lineWidth: 1)
             )
             .onDrop(of: [.image], isTargeted: $isDraggingOverImageSection) { providers in
                 handleImageDrop(providers: providers)
@@ -16470,7 +16587,7 @@ struct PostComposer: View {
                 .foregroundStyle(.secondary)
         }
         .buttonStyle(.plain)
-        .foregroundStyle(.secondary)
+        .foregroundStyle(RedappDesign.inkSecondary)
     }
 
     private var selectedImagesStrip: some View {
@@ -16482,10 +16599,10 @@ struct PostComposer: View {
                             .resizable()
                             .scaledToFill()
                             .frame(width: 78, height: 78)
-                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                            .clipShape(RoundedRectangle(cornerRadius: RedappDesign.Radius.small + 2, style: .continuous))
                             .overlay(
-                                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                    .stroke(Color.white.opacity(0.14), lineWidth: 1)
+                                RoundedRectangle(cornerRadius: RedappDesign.Radius.small + 2, style: .continuous)
+                                    .stroke(RedappDesign.hairline, lineWidth: 1)
                             )
 
                         Button(action: {
@@ -16508,6 +16625,7 @@ struct PostComposer: View {
         HStack(spacing: 10) {
             ProgressView(value: uploadProgress)
                 .progressViewStyle(.linear)
+                .tint(RedappDesign.accent)
 
             Text("\(Int(uploadProgress * 100))%")
                 .font(.caption)
@@ -16517,13 +16635,11 @@ struct PostComposer: View {
         .padding(.horizontal, 13)
         .padding(.vertical, 10)
         .background(fieldBackground)
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: RedappDesign.Radius.small + 2, style: .continuous))
     }
 
     private func composerLabel(_ text: String) -> some View {
-        Text(text)
-            .font(.system(size: 13, weight: .semibold))
-            .foregroundStyle(.primary)
+        RedappEyebrow(text)
     }
 
     private func postTypeButton(_ type: PostType, systemImage: String) -> some View {
@@ -16539,14 +16655,10 @@ struct PostComposer: View {
                     .font(.system(size: 13, weight: .semibold))
             }
             .frame(maxWidth: .infinity, minHeight: 34)
-            .foregroundStyle(postType == type ? Color.accentColor : Color.secondary)
+            .foregroundStyle(postType == type ? RedappDesign.accent : RedappDesign.inkSecondary)
             .background(
                 RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .fill(postType == type ? Color.accentColor.opacity(0.12) : Color.clear)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .stroke(postType == type ? Color.accentColor.opacity(0.72) : Color.clear, lineWidth: 1)
+                    .fill(postType == type ? RedappDesign.accentSoft : Color.clear)
             )
         }
         .buttonStyle(.plain)
@@ -16814,15 +16926,22 @@ enum BatchRerouteProvider: String, CaseIterable, Identifiable {
     case gemini
     case applePCCGateway
     case summarizeDaemon
+    case chatGPT
     case appleCloud
     case webAI
 
     var id: String { rawValue }
 
+    /// Reroute targets offered in the UI; ChatGPT only in local builds.
+    static var available: [BatchRerouteProvider] {
+        allCases.filter { $0 != .chatGPT || ChatGPTPlanAvailability.isEnabled }
+    }
+
     var displayName: String {
         switch self {
         case .gemini: return "Gemini"
         case .applePCCGateway: return "Apple PCC Gateway"
+        case .chatGPT: return "ChatGPT"
         case .summarizeDaemon: return "Codex/Summarize"
         case .appleCloud: return "Apple Cloud"
         case .webAI: return "Web AI"
@@ -16834,6 +16953,7 @@ enum BatchRerouteProvider: String, CaseIterable, Identifiable {
         case .gemini: return .gemini
         case .applePCCGateway: return .applePCCGateway
         case .summarizeDaemon: return .summarizeDaemon
+        case .chatGPT: return .chatGPT
         case .appleCloud: return .appleCloud
         case .webAI: return .webAI
         }
@@ -16854,40 +16974,6 @@ struct BatchExtractedPost: Identifiable, Equatable {
 }
 
 // MARK: - Sidebar Components
-struct SidebarHeader: View {
-    @ObservedObject private var summaryService = SummaryService.shared
-
-    var body: some View {
-        HStack(spacing: 12) {
-            // Active model indicator
-            HStack(spacing: 4) {
-                Circle()
-                    .fill(.green)
-                    .frame(width: 8, height: 8)
-
-                Text(summaryService.settings.selectedSummaryProvider.displayName)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
-
-            // TTS indicator
-            HStack(spacing: 4) {
-                Circle()
-                    .fill(.green)
-                    .frame(width: 8, height: 8)
-
-                Text("Speech: \(summaryService.settings.localTTSEngine.displayName)")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
-
-            Spacer()
-        }
-        .padding(.horizontal)
-        .padding(.top, 4)
-    }
-}
-
 private enum SubredditFavoritesStore {
     static let key = "FavoriteSubreddits"
 
@@ -16917,115 +17003,58 @@ struct SidebarControls: View {
     @State private var batchCommentsExportStatus: String = ""
     @State private var batchCommentsExportItems: [Any] = []
     @State private var isPresentingBatchCommentsShare: Bool = false
-    @State private var favoriteSubreddits: [String] = SubredditFavoritesStore.load()
-    
+    @State private var isEditingCustomPostLimit = false
+    @State private var customPostLimitDraft = ""
+    @ObservedObject private var communities = RedappCommunitiesModel.shared
+    var onCompose: (() -> Void)? = nil
+    var onShowSidebar: (() -> Void)? = nil
+
+    private static let postLimitPresets = [10, 25, 50, 75, 100]
+
+    /// The community on screen ("iOS"), or nil for the Home feed.
+    private var currentCommunity: String? {
+        let title = viewModel.activeFeedTitle
+        guard viewModel.selectedFeedMode != .home, title.hasPrefix("r/") else { return nil }
+        return String(title.dropFirst(2))
+    }
+
     var body: some View {
-        VStack {
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: 8) {
-                    subredditField(maxWidth: 200)
-                    favoritesMenu
-                    favoriteToggleButton
+        VStack(alignment: .leading, spacing: 14) {
+            if let onShowSidebar {
+                // Two-column layout: the list column is narrow, so the controls get their own
+                // row and the community name keeps the full width below them.
+                HStack(alignment: .center, spacing: 10) {
+                    Button(action: onShowSidebar) {
+                        Image(systemName: "sidebar.leading")
+                    }
+                    .buttonStyle(RedappIconButtonStyle())
+                    .accessibilityLabel("Show sidebar")
+                    .padding(.leading, -8)
+
+                    Spacer(minLength: 8)
+
+                    sortMenu
+                    composeButton
                 }
 
-                VStack(spacing: 8) {
-                    subredditField(maxWidth: .infinity)
-                    HStack(spacing: 8) {
-                        favoritesMenu
-                        favoriteToggleButton
-                    }
+                feedTitleBlock
+            } else {
+                HStack(alignment: .top, spacing: 10) {
+                    feedTitleBlock
+
+                    Spacer(minLength: 8)
+
+                    sortMenu
+                    composeButton
                 }
             }
-            .padding(.horizontal)
 
-            HStack {
-                Text("Show")
-                TextField("Number of posts", text: $viewModel.postLimit)
-                    .textFieldStyle(LiquidGlassTextFieldStyle())
-                    #if os(iOS)
-                    .keyboardType(.numberPad)
-                    .focused(focusedField, equals: .postLimit)
-                    .frame(width: 60)
-                    #else
-                    .frame(width: 80)
-                    #endif
-                Text("posts")
-
-                sortMenu
-            }
-            .padding(.horizontal)
-
-            HStack(spacing: 12) {
-                if !viewModel.posts.isEmpty {
-                if viewModel.isBatchProcessing {
-                    Button(action: {
-                        focusedField.wrappedValue = nil
-                        viewModel.cancelBatchProcessing()
-                    }) {
-                            HStack(spacing: 6) {
-                                Image(systemName: "stop.circle.fill")
-                                Text("Cancel")
-                            }
-                        }
-                        .buttonStyle(LiquidGlassButtonStyle(isProminent: true))
-                        .disabled(viewModel.isLoading || isExportingBatchComments)
-                    } else {
-                        if summaryService.settings.selectedSummaryProvider == .webAI {
-                            Button(action: {
-                                focusedField.wrappedValue = nil
-                                viewModel.startWebBatchProcessing(subreddit: viewModel.batchContextName)
-                            }) {
-                                HStack(spacing: 6) {
-                                    Image(systemName: "doc.on.doc.fill")
-                                    Text("Batch Summarize")
-                                }
-                            }
-                            .buttonStyle(LiquidGlassButtonStyle(isProminent: false))
-                            .disabled(viewModel.isLoading || isExportingBatchComments)
-                        } else {
-                            Menu {
-                                Button {
-                                    focusedField.wrappedValue = nil
-                                    viewModel.startBatchProcessing(subreddit: viewModel.batchContextName)
-                                } label: {
-                                    Text("Settings model")
-                                }
-
-                                Button {
-                                    focusedField.wrappedValue = nil
-                                    viewModel.startWebBatchProcessing(subreddit: viewModel.batchContextName)
-                                } label: {
-                                    Text("Web model")
-                                }
-                            } label: {
-                                HStack(spacing: 6) {
-                                    Image(systemName: "doc.on.doc.fill")
-                                    Text("Batch Summarize")
-                                }
-                            }
-                            .buttonStyle(LiquidGlassButtonStyle(isProminent: false))
-                            .disabled(viewModel.isLoading || isExportingBatchComments)
-                        }
-                    }
-
-                    Button(action: {
-                        focusedField.wrappedValue = nil
-                        exportBatchComments(subreddit: viewModel.batchContextName)
-                    }) {
-                        if isExportingBatchComments {
-                            ProgressView()
-                                .controlSize(.small)
-                        } else {
-                            Image(systemName: "text.bubble")
-                        }
-                    }
-                    .buttonStyle(LiquidGlassButtonStyle(isProminent: false))
-                    .disabled(viewModel.isLoading || viewModel.isBatchProcessing || isExportingBatchComments)
-                    .accessibilityLabel("Share extracted comments")
+            if !viewModel.posts.isEmpty {
+                HStack {
+                    Spacer()
+                    analyzeControl
                 }
             }
-            .padding(.horizontal)
-            .padding(.bottom, 8)
 
             if isExportingBatchComments {
                 VStack(alignment: .leading, spacing: 4) {
@@ -17043,8 +17072,7 @@ struct SidebarControls: View {
                         .lineLimit(1)
                         .truncationMode(.tail)
                 }
-                .padding(.horizontal)
-                .padding(.bottom)
+                .tint(RedappDesign.accent)
             }
             
             // Batch processing status
@@ -17078,19 +17106,17 @@ struct SidebarControls: View {
                             .truncationMode(.tail)
                     }
                 }
-                .padding(.horizontal)
-                .padding(.bottom)
+                .tint(RedappDesign.accent)
             }
             
             // Batch error display
             if let batchError = viewModel.batchError {
-                Text(batchError)
-                    .font(.caption)
-                    .foregroundColor(.red)
-                    .padding(.horizontal)
-                    .padding(.bottom, 4)
+                RedappInlineMessage(message: batchError)
             }
         }
+        .padding(.horizontal, 20)
+        .padding(.top, 18)
+        .padding(.bottom, 14)
 #if os(iOS)
         .sheet(isPresented: $isPresentingBatchCommentsShare) {
             ShareSheet(activityItems: batchCommentsExportItems)
@@ -17101,16 +17127,175 @@ struct SidebarControls: View {
                 .frame(width: 0, height: 0)
         )
 #endif
-#if os(iOS)
-        .toolbar {
-            ToolbarItemGroup(placement: .keyboard) {
-                Spacer()
-                Button("Done") {
-                    focusedField.wrappedValue = nil
+    }
+
+    /// "Analyze community": batch summarize (settings or web model) and export.
+    @ViewBuilder
+    private var analyzeControl: some View {
+        if viewModel.isBatchProcessing {
+            Button(action: {
+                focusedField.wrappedValue = nil
+                viewModel.cancelBatchProcessing()
+            }) {
+                Label("Stop analysis", systemImage: "stop.circle.fill")
+            }
+            .buttonStyle(RedappSecondaryButtonStyle())
+            .disabled(viewModel.isLoading || isExportingBatchComments)
+        } else {
+            Menu {
+                let usesWebModel = summaryService.settings.selectedSummaryProvider == .webAI
+                let webName = summaryService.settings.selectedWebAIProvider.displayName
+                // Which model the main action uses (informational).
+                Section {
+                    Button {} label: {
+                        Label(usesWebModel ? "Using \(webName) on the web" : "Using \(summaryService.settings.selectedSummaryProvider.displayName)", systemImage: "cpu")
+                        Text("Change the model in Settings")
+                    }
+                    .disabled(true)
+                }
+                Section {
+                    Button {
+                        focusedField.wrappedValue = nil
+                        if usesWebModel {
+                            viewModel.startWebBatchProcessing(subreddit: viewModel.batchContextName)
+                        } else {
+                            viewModel.startBatchProcessing(subreddit: viewModel.batchContextName)
+                        }
+                    } label: {
+                        Label(viewModel.selectedFeedMode == .home ? "Summarize entire feed" : "Summarize entire subreddit", systemImage: "sparkles")
+                        Text("Every post and its comments")
+                    }
+                }
+                if !usesWebModel {
+                    Section {
+                        Button {
+                            focusedField.wrappedValue = nil
+                            viewModel.startWebBatchProcessing(subreddit: viewModel.batchContextName)
+                        } label: {
+                            Label("Run on \(webName)", systemImage: "globe")
+                            Text("Uses your web session")
+                        }
+                    }
+                }
+                Section {
+                    Button {
+                        focusedField.wrappedValue = nil
+                        exportBatchComments(subreddit: viewModel.batchContextName)
+                    } label: {
+                        Label("Export all comments", systemImage: "square.and.arrow.up")
+                        Text("As a text file")
+                    }
+                    .disabled(isExportingBatchComments)
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    if isExportingBatchComments {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Image(systemName: "chart.bar.xaxis")
+                    }
+                    Text(viewModel.selectedFeedMode == .home ? "Analyze feed" : "Analyze community")
                 }
             }
+            .buttonStyle(RedappSecondaryButtonStyle())
+            .disabled(viewModel.isLoading || isExportingBatchComments)
+            .accessibilityHint("Summarize every loaded post and its comments")
         }
-#endif
+    }
+
+    private var feedTitleBlock: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text(viewModel.activeFeedTitle)
+                    .font(.title2.weight(.bold))
+                    .foregroundStyle(RedappDesign.ink)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+                    .accessibilityAddTraits(.isHeader)
+                if currentCommunity != nil {
+                    favoriteToggleButton
+                }
+            }
+            postLimitMenu
+        }
+    }
+
+    @ViewBuilder
+    private var composeButton: some View {
+        if let onCompose {
+            Button(action: onCompose) {
+                Image(systemName: "square.and.pencil")
+                    .font(.system(size: 17, weight: .medium))
+                    .frame(width: 22, height: 20)
+            }
+            .buttonStyle(RedappSecondaryButtonStyle(isCapsule: false))
+            .accessibilityLabel("Create post")
+        }
+    }
+
+    private var postLimitTitle: String {
+        let value = viewModel.postLimit.trimmingCharacters(in: .whitespaces)
+        return value.isEmpty ? "Posts" : "\(value) posts"
+    }
+
+    /// Post count as a menu of common sizes, with Custom… for any other value.
+    private var postLimitMenu: some View {
+        Menu {
+            Picker("Number of posts", selection: Binding(
+                get: { Int(viewModel.postLimit) ?? -1 },
+                set: { applyPostLimit(String($0)) }
+            )) {
+                ForEach(Self.postLimitPresets, id: \.self) { count in
+                    Text("\(count) posts").tag(count)
+                }
+            }
+            Divider()
+            Button {
+                customPostLimitDraft = viewModel.postLimit
+                isEditingCustomPostLimit = true
+            } label: {
+                Label("Custom…", systemImage: "number")
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Text(postLimitTitle)
+                Image(systemName: "chevron.down")
+                    .font(.caption2.weight(.semibold))
+            }
+            .font(.subheadline)
+            .foregroundStyle(RedappDesign.inkSecondary)
+        }
+        .buttonStyle(.plain)
+        .fixedSize()
+        .accessibilityLabel("Number of posts, \(postLimitTitle)")
+        .alert("Number of Posts", isPresented: $isEditingCustomPostLimit) {
+            TextField("Posts", text: $customPostLimitDraft)
+                #if os(iOS)
+                .keyboardType(.numberPad)
+                #endif
+            Button("Cancel", role: .cancel) {}
+            Button("Apply") {
+                let digits = customPostLimitDraft.filter(\.isNumber)
+                if !digits.isEmpty {
+                    applyPostLimit(digits)
+                }
+            }
+        } message: {
+            Text("How many posts to load from the feed.")
+        }
+    }
+
+    private func applyPostLimit(_ value: String) {
+        guard viewModel.postLimit != value else { return }
+        viewModel.postLimit = value
+        // Refresh the feed that is already on screen so the count takes effect.
+        guard !viewModel.posts.isEmpty, !viewModel.isBatchProcessing else { return }
+        if viewModel.selectedFeedMode == .home {
+            focusedField.wrappedValue = nil
+            viewModel.fetchHomePosts()
+        } else {
+            triggerLoad()
+        }
     }
 
     private func mlxThroughputInlineText(_ state: SummaryService.MLXThroughputState) -> String {
@@ -17124,6 +17309,7 @@ struct SidebarControls: View {
             case .webAI: return "Web AI"
             case .summarizeDaemon: return "Codex/Summarize"
             case .applePCCGateway: return "Apple PCC Gateway"
+            case .chatGPT: return "ChatGPT"
             }
         }()
         if state.tokens == 0 && !state.isFinal {
@@ -17137,10 +17323,10 @@ struct SidebarControls: View {
 
     private var favoritesMenu: some View {
         Menu {
-            if favoriteSubreddits.isEmpty {
+            if communities.favorites.isEmpty {
                 Text("No favorites yet")
             } else {
-                ForEach(favoriteSubreddits, id: \.self) { favorite in
+                ForEach(communities.favorites, id: \.self) { favorite in
                     Button {
                         selectFavorite(favorite)
                     } label: {
@@ -17151,7 +17337,7 @@ struct SidebarControls: View {
                 Divider()
 
                 Menu {
-                    ForEach(favoriteSubreddits, id: \.self) { favorite in
+                    ForEach(communities.favorites, id: \.self) { favorite in
                         Button(role: .destructive) {
                             removeFavorite(favorite)
                         } label: {
@@ -17163,7 +17349,7 @@ struct SidebarControls: View {
                 }
             }
         } label: {
-            Text("Favorites")
+            Label("Favorites", systemImage: "star.circle")
                 .font(.system(size: 14, weight: .medium))
         }
         .buttonStyle(AdaptiveLiquidGlassButtonStyle(cornerRadius: 20, isCompact: true))
@@ -17210,10 +17396,13 @@ struct SidebarControls: View {
                 Text(PostType.top.displayName)
             }
         } label: {
-            Text(sortMenuTitle)
-                .font(.system(size: 14, weight: .medium))
+            HStack(spacing: 6) {
+                Text(sortMenuTitle)
+                Image(systemName: "chevron.down")
+                    .font(.caption.weight(.semibold))
+            }
         }
-        .buttonStyle(AdaptiveLiquidGlassButtonStyle(cornerRadius: 20, isCompact: true))
+        .buttonStyle(RedappSecondaryButtonStyle())
         .fixedSize()
         .accessibilityLabel("Sort by")
     }
@@ -17255,25 +17444,46 @@ struct SidebarControls: View {
     }
 
     private var favoriteToggleButton: some View {
-        Button(action: toggleFavorite) {
+        Button {
+            if let currentCommunity { communities.toggle(currentCommunity) }
+        } label: {
             Image(systemName: isCurrentSubredditFavorite ? "star.fill" : "star")
-                .font(.system(size: 14, weight: .semibold))
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(isCurrentSubredditFavorite ? RedappDesign.accent : RedappDesign.inkTertiary)
+                .frame(width: 30, height: 30)
+                .contentShape(Rectangle())
         }
-        .buttonStyle(AdaptiveLiquidGlassButtonStyle(cornerRadius: 20, isCompact: true))
-        .disabled(normalizedSubredditName(subreddit).isEmpty)
-        .accessibilityLabel(isCurrentSubredditFavorite ? "Remove from favorites" : "Add to favorites")
+        .buttonStyle(.plain)
+        .accessibilityLabel(isCurrentSubredditFavorite ? "Remove from Communities" : "Add to Communities")
     }
 
     private var isCurrentSubredditFavorite: Bool {
-        favoriteIndex(for: normalizedSubredditName(subreddit)) != nil
+        guard let currentCommunity else { return false }
+        return communities.isFavorite(currentCommunity)
     }
 
     private func subredditField(maxWidth: CGFloat?) -> some View {
-        HStack(spacing: 6) {
-            TextField("Enter subreddit", text: $subreddit)
-                .textFieldStyle(LiquidGlassTextFieldStyle())
+        HStack(spacing: 8) {
+            Button { triggerLoad() } label: {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 28, height: 36)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(normalizedSubredditName(subreddit).isEmpty)
+            .accessibilityLabel("Load posts")
+
+            TextField("Subreddit", text: $subreddit)
+                .textFieldStyle(.plain)
+                .font(.body)
                 .focused(focusedField, equals: .subreddit)
                 .submitLabel(.search)
+                #if os(iOS)
+                .textInputAutocapitalization(.never)
+                #endif
+                .autocorrectionDisabled()
                 .onSubmit {
                     triggerLoad()
                 }
@@ -17285,13 +17495,19 @@ struct SidebarControls: View {
                 } label: {
                     Image(systemName: "xmark.circle.fill")
                         .foregroundStyle(.secondary)
+                        .frame(width: 28, height: 36)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Clear subreddit search")
                 .accessibilityHint("Removes the current subreddit so you can enter another one")
             }
         }
+        .padding(.leading, 8)
+        .padding(.trailing, 6)
+        .frame(minHeight: 44)
         .frame(maxWidth: maxWidth)
+        .modifier(RedappSearchFieldChrome())
     }
 
     private func selectFavorite(_ favorite: String) {
@@ -17302,29 +17518,7 @@ struct SidebarControls: View {
     }
 
     private func removeFavorite(_ favorite: String) {
-        let cleaned = normalizedSubredditName(favorite)
-        guard let index = favoriteIndex(for: cleaned) else { return }
-        favoriteSubreddits.remove(at: index)
-        SubredditFavoritesStore.save(favoriteSubreddits)
-    }
-
-    private func toggleFavorite() {
-        let cleaned = normalizedSubredditName(subreddit)
-        guard !cleaned.isEmpty else { return }
-
-        if let index = favoriteIndex(for: cleaned) {
-            favoriteSubreddits.remove(at: index)
-        } else {
-            favoriteSubreddits.append(cleaned)
-        }
-
-        subreddit = cleaned
-        SubredditFavoritesStore.save(favoriteSubreddits)
-    }
-
-    private func favoriteIndex(for subredditName: String) -> Int? {
-        let target = subredditName.lowercased()
-        return favoriteSubreddits.firstIndex { $0.lowercased() == target }
+        communities.remove(normalizedSubredditName(favorite))
     }
 
     private func normalizedSubredditName(_ name: String) -> String {
@@ -17439,6 +17633,26 @@ private struct MacSharePicker: NSViewRepresentable {
 }
 #endif
 
+/// Field-colored capsule behind the search field and its star button.
+private struct RedappSearchFieldChrome: ViewModifier {
+    enum ChromeShape { case capsule, circle }
+    var shape: ChromeShape = .capsule
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        switch shape {
+        case .capsule:
+            content
+                .background(RedappDesign.field, in: Capsule())
+                .overlay(Capsule().strokeBorder(RedappDesign.hairlineStrong, lineWidth: 1))
+        case .circle:
+            content
+                .background(RedappDesign.field, in: Circle())
+                .overlay(Circle().strokeBorder(RedappDesign.hairlineStrong, lineWidth: 1))
+        }
+    }
+}
+
 private struct SidebarOverlayHeightPreferenceKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
 
@@ -17468,40 +17682,65 @@ struct PostsList: View {
     @EnvironmentObject var appState: AppState
     @State private var isReconnectingReddit = false
     var dismissKeyboard: () -> Void = {}
+    var onOpenSettings: () -> Void = {}
     var onScrollActivityChanged: (Bool) -> Void = { _ in }
-    
+
+    private var errorNeedsRedditConnection: Bool {
+        guard let error = viewModel.error else { return false }
+        let haystack = error.lowercased()
+        let needles = ["log in", "login", "mysubreddits", "fresh login", "401", "session expired", "not configured"]
+        return needles.contains { haystack.contains($0) }
+    }
+
     var body: some View {
         ScrollView {
             if viewModel.isLoading {
+                // Full width, so the top bar's scroll edge spans the column
+                // (a narrow spinner made it a thin strip while loading).
                 ProgressView()
                     .padding()
+                    .frame(maxWidth: .infinity)
             } else if let error = viewModel.error {
                 VStack(spacing: 12) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.largeTitle)
-                        .foregroundStyle(.orange)
-                    Text("Reddit request failed")
-                        .font(.headline)
-                    Text(error)
+                    Image(systemName: errorNeedsRedditConnection ? "person.crop.circle.badge.exclamationmark" : "exclamationmark.triangle.fill")
+                        .font(.system(size: 40))
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(errorNeedsRedditConnection ? RedappDesign.accent : Color.orange)
+                        .padding(.bottom, 2)
+                    Text(errorStateTitle)
+                        .font(.title3.weight(.semibold))
+                        .multilineTextAlignment(.center)
+                    Text(errorStateMessage(for: error))
+                        .font(.subheadline)
                         .multilineTextAlignment(.center)
                         .foregroundStyle(.secondary)
-                    if error.localizedCaseInsensitiveContains("mysubreddits") || error.localizedCaseInsensitiveContains("fresh login") {
-                        Button {
-                            reconnectRedditForHome()
-                        } label: {
-                            if isReconnectingReddit {
-                                ProgressView()
-                                    .controlSize(.small)
-                            } else {
-                                Text("Reconnect Reddit")
+                        .fixedSize(horizontal: false, vertical: true)
+                    if errorNeedsRedditConnection {
+                        if authManager.hasStoredCredentials() {
+                            Button {
+                                reconnectRedditForHome()
+                            } label: {
+                                if isReconnectingReddit {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                } else {
+                                    Text("Connect Reddit")
+                                }
                             }
+                            .buttonStyle(RedappPrimaryButtonStyle(isCapsule: true))
+                            .disabled(isReconnectingReddit)
+                        } else {
+                            Button {
+                                onOpenSettings()
+                            } label: {
+                                Text("Set Up Reddit Access")
+                            }
+                            .buttonStyle(RedappPrimaryButtonStyle(isCapsule: true))
                         }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(isReconnectingReddit)
                     }
                 }
-                .padding(.horizontal)
-                .padding(.top, topInset)
+                .padding(.horizontal, 28)
+                .padding(.top, topInset + 24)
                 .frame(maxWidth: .infinity)
             } else if viewModel.posts.isEmpty {
                 if let status = appState.status(for: viewModel.activeSubreddit) {
@@ -17552,7 +17791,7 @@ struct PostsList: View {
                             .foregroundStyle(.secondary)
                         Text("Load posts to get started")
                             .font(.headline)
-                        Text("Enter a subreddit and press Return, or choose Home from the feed menu.")
+                        Text("Enter a subreddit and tap the search button, or choose Home from the sort menu.")
                             .multilineTextAlignment(.center)
                             .foregroundStyle(.secondary)
                     }
@@ -17567,22 +17806,30 @@ struct PostsList: View {
                         .id("batchSummaryTop")
                     
                     ForEach(viewModel.posts) { post in
-                        Button {
+                        let openPost = {
                             dismissKeyboard()
                             selectedPost = nil
                             DispatchQueue.main.async {
                                 selectedPost = post
                             }
-                        } label: {
-                            PostRowView(post: post)
-                                .background(
-                                    selectedPost?.id == post.id
-                                    ? Color.gray.opacity(0.2)
-                                    : Color.clear
-                                )
                         }
-                        .buttonStyle(PlainButtonStyle())
-                        Divider()
+                        // A tap gesture (not a Button) so a finger that moves, e.g. an
+                        // edge swipe to the sidebar, never opens the post on release.
+                        PostRowView(
+                            post: post,
+                            showsSubreddit: viewModel.selectedFeedMode == .home,
+                            isSelected: selectedPost?.id == post.id
+                        )
+                        .contentShape(Rectangle())
+                        .onTapGesture(perform: openPost)
+                        .accessibilityElement(children: .combine)
+                        .accessibilityAddTraits(.isButton)
+                        .accessibilityAddTraits(selectedPost?.id == post.id ? .isSelected : [])
+                        .accessibilityAction(.default, openPost)
+                        Rectangle()
+                            .fill(RedappDesign.hairline)
+                            .frame(height: 1)
+                            .accessibilityHidden(true)
                     }
                 }
             }
@@ -17595,6 +17842,20 @@ struct PostsList: View {
             dismissKeyboard()
         })
 	    }
+
+    private var errorStateTitle: String {
+        guard errorNeedsRedditConnection else { return "Couldn’t load posts" }
+        return authManager.hasStoredCredentials() ? "Reconnect to Reddit" : "Connect Reddit to start"
+    }
+
+    /// The generic auth error ("Please log in to perform this action") reads
+    /// like the user did something wrong on first launch; explain setup instead.
+    private func errorStateMessage(for error: String) -> String {
+        if errorNeedsRedditConnection && !authManager.hasStoredCredentials() {
+            return "redapp reads Reddit through your own free Reddit API app. Add its client ID in Settings, then log in."
+        }
+        return error
+    }
 
     private func reconnectRedditForHome() {
         guard !isReconnectingReddit else { return }
@@ -17717,6 +17978,8 @@ struct BatchResultsView: View {
     @State private var answerGenerationTask: Task<Void, Never>?
     @State private var answerSummaryTask: Task<Void, Never>?
     @State private var showFloatingAskMenu: Bool = false
+    /// Drives "scroll to bottom" to the true end of the content.
+    @State private var batchScrollPosition = ScrollPosition(idType: String.self)
     @State private var showBatchSummaryActionsMenu: Bool = false
     @State private var showQuestionReliabilityWarning: Bool = false
     
@@ -17798,6 +18061,15 @@ struct BatchResultsView: View {
     @State private var whiteboardTask: Task<Void, Never>?
     @State private var isWhiteboardMinimized: Bool = false
 
+#if os(iOS)
+    // Batch Podcast state is iOS-only. The source snapshot is rebuilt for each
+    // presentation so a previous episode cannot survive a new batch revision.
+    @State private var showBatchPodcast: Bool = false
+    @State private var batchPodcastContext: BatchPodcastContext?
+    @State private var batchPodcastRunID: UUID?
+    @State private var isBatchPodcastMinimized: Bool = false
+#endif
+
     // Batch LLM summary state
     @State private var isSendingBatchResultsToLLM: Bool = false
     @State private var batchLLMResponse: String?
@@ -17811,18 +18083,18 @@ struct BatchResultsView: View {
         colorScheme == .dark
     }
 
+#if os(iOS)
+    private var batchPodcastSession: BatchPodcastSession {
+        BatchPodcastSessionStore.shared
+    }
+#endif
+
     private var isWebBatchMode: Bool {
         viewModel.batchExecutionMode == .web
     }
 
     private var batchSourceLinks: [String: URL] {
-        var links: [String: URL] = [:]
-        for source in viewModel.batchCapturedSources {
-            let permalink = normalizeRedditPermalink(source.permalink)
-            if let url = URL(string: permalink), !permalink.isEmpty {
-                links[source.sourceID] = url
-            }
-        }
+        var links = viewModel.batchCapturedSourceLinks
         for (sourceID, source) in groundedAnswerSources {
             let permalink = normalizeRedditPermalink(source.permalink)
             if let url = URL(string: permalink), !permalink.isEmpty {
@@ -17831,6 +18103,82 @@ struct BatchResultsView: View {
         }
         return links
     }
+
+#if os(iOS)
+    private var hasBatchPodcastEvidence: Bool {
+        !viewModel.batchRawComments.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !viewModel.batchSummaries.isEmpty
+            || !viewModel.batchExtractedPosts.isEmpty
+            || !(viewModel.batchFinalSummary ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func openBatchPodcast() {
+        guard hasBatchPodcastEvidence else { return }
+        let postSummaries: [BatchPodcastPostSummaryInput]
+        if isWebBatchMode {
+            postSummaries = viewModel.batchExtractedPosts.map {
+                BatchPodcastPostSummaryInput(
+                    title: $0.title,
+                    summary: $0.comments,
+                    permalink: $0.permalink
+                )
+            }
+        } else {
+            postSummaries = viewModel.batchSummaries.map {
+                BatchPodcastPostSummaryInput(
+                    title: $0.postTitle,
+                    summary: $0.summary,
+                    permalink: $0.permalink
+                )
+            }
+        }
+
+        do {
+            let context = try BatchPodcastContextBuilder.build(
+                BatchPodcastBuildInput(
+                    contextName: viewModel.batchContextName,
+                    rawComments: viewModel.batchRawComments,
+                    capturedSources: viewModel.batchCapturedSources,
+                    postSummaries: postSummaries,
+                    overallSummary: viewModel.batchFinalSummary,
+                    coverage: viewModel.batchCoverage,
+                    allowSummariesOnly: true
+                )
+            )
+            batchPodcastRunID = viewModel.saveCurrentBatchToResearchLibrary()
+            batchPodcastContext = context
+            batchPodcastSession.begin(context: context, runID: batchPodcastRunID)
+            isBatchPodcastMinimized = false
+            showBatchPodcast = true
+        } catch {
+            viewModel.researchLibraryError = error.localizedDescription
+        }
+    }
+
+    private func invalidateBatchPodcast() {
+        guard showBatchPodcast || batchPodcastContext != nil else { return }
+        showBatchPodcast = false
+        isBatchPodcastMinimized = false
+        batchPodcastSession.invalidate()
+        batchPodcastContext = nil
+        batchPodcastRunID = nil
+    }
+
+    private func minimizeBatchPodcast() {
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+            isBatchPodcastMinimized = true
+            showBatchPodcast = false
+        }
+    }
+
+    private func closeBatchPodcast() {
+        batchPodcastSession.invalidate()
+        isBatchPodcastMinimized = false
+        showBatchPodcast = false
+        batchPodcastContext = nil
+        batchPodcastRunID = nil
+    }
+#endif
 
     private struct MarkdownTableBlock: Identifiable {
         let id = UUID()
@@ -17896,6 +18244,7 @@ struct BatchResultsView: View {
                 
                 ScrollViewReader { proxy in
                     ScrollView {
+                    AnyView(
                     VStack(alignment: .leading, spacing: 20) {
                         // Setup chunked playback chaining for cloud TTS
                         EmptyView()
@@ -17971,34 +18320,18 @@ struct BatchResultsView: View {
                                 HStack {
                                     Image(systemName: "doc.text.magnifyingglass")
                                         .font(.title2)
-                                        .foregroundColor(.primary)
-                                    Text("Subreddit Overview")
-                                        .font(.title2)
-                                        .fontWeight(.bold)
+                                        .foregroundStyle(RedappDesign.accent)
+                                    Text("Subreddit overview")
+                                        .font(RedappType.section)
+                                        .foregroundStyle(RedappDesign.ink)
                                     Spacer()
                                     
-                                    // Cloud TTS for Subreddit Overview
-                                    Button(action: {
-                                        speakOverview()
-                                    }) {
-                                        Image(systemName: "speaker.wave.2")
-                                    }
-                                    .buttonStyle(PlainButtonStyle())
-                                    #if os(macOS)
-                                    .help("Read aloud (Cloud)")
-                                    #endif
-                                    .padding(.trailing, 6)
-
-                                    // Local TTS for Subreddit Overview
-                                    Button(action: {
-                                        speakOverviewLocally()
-                                    }) {
-                                        Image(systemName: "speaker.wave.2.circle")
-                                    }
-                                    .buttonStyle(PlainButtonStyle())
-                                    #if os(macOS)
-                                    .help("Read aloud (Local) / Stop")
-                                    #endif
+                                    batchListenMenu(
+                                        cloud: speakOverview,
+                                        local: speakOverviewLocally,
+                                        cloudActive: isSynthesizingOverviewSpeech,
+                                        localActive: isSpeakingOverviewLocally
+                                    )
                                     .padding(.trailing, 6)
 
                                     Button(action: {
@@ -18038,33 +18371,13 @@ struct BatchResultsView: View {
                                             .font(.caption)
                                             .foregroundColor(.secondary)
                                     }
-                                    .padding()
+                                    .padding(.vertical, 4)
                                     .frame(maxWidth: .infinity, alignment: .leading)
-                                    .background {
-                                        if isDarkMode {
-                                            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                                .fill(Color.black)
-                                        } else {
-                                            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                                .fill(.ultraThinMaterial)
-                                        }
-                                    }
-                                    .cornerRadius(12)
                                 } else {
                                     ReadableReplyText(content: finalSummary, fontScale: 0.9, sourceLinks: batchSourceLinks)
                                         .frame(maxWidth: .infinity, alignment: .leading)
                                         .fixedSize(horizontal: false, vertical: true)
-                                        .padding()
-                                        .background {
-                                            if isDarkMode {
-                                                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                                    .fill(Color.black)
-                                            } else {
-                                                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                                    .fill(.ultraThinMaterial)
-                                            }
-                                        }
-                                        .cornerRadius(12)
+                                        .padding(.vertical, 4)
                                 }
                                 
                                 // Optional: show status/error like in comments summary
@@ -18079,9 +18392,7 @@ struct BatchResultsView: View {
                                     }
                                 }
                                 if let err = overviewSpeechSynthesisError {
-                                    Text(err)
-                                        .font(.caption)
-                                        .foregroundColor(.red)
+                                    RedappInlineMessage(message: err)
                                 }
                             }
                             .padding(.horizontal)
@@ -18091,9 +18402,9 @@ struct BatchResultsView: View {
                         if hasBatchQuestionContext {
                             VStack(alignment: .leading, spacing: 12) {
                                 HStack {
-                                    Text("Ask About This Subreddit")
-                                        .font(.title3)
-                                        .fontWeight(.semibold)
+                                    Text("Ask about this subreddit")
+                                        .font(RedappType.section)
+                                        .foregroundStyle(RedappDesign.ink)
                                     Spacer()
                                 }
 	                                
@@ -18103,7 +18414,7 @@ struct BatchResultsView: View {
                                     .frame(height: 0)
                                     .id("batchSummaryActionsTop")
 
-                                if showBatchSummaryActionsMenu {
+                                if infographicError != nil || whiteboardError != nil {
                                     batchSummaryActionRow(proxy: proxy)
                                         .transition(.move(edge: .top).combined(with: .opacity))
                                 }
@@ -18163,25 +18474,12 @@ struct BatchResultsView: View {
                                             .help("Copy answer")
                                             #endif
                                             
-                                            // Cloud TTS button
-                                            Button(action: speakAnswer) {
-                                                Image(systemName: isSynthesizingAnswerSpeech ? "stop.circle" : "speaker.wave.3")
-                                                    .font(.caption)
-                                            }
-                                            .buttonStyle(PlainButtonStyle())
-                                            #if os(macOS)
-                                            .help(isSynthesizingAnswerSpeech ? "Stop speaking" : "Speak with cloud voice")
-                                            #endif
-                                            
-                                            // Local TTS button
-                                            Button(action: speakAnswerLocally) {
-                                                Image(systemName: isSpeakingAnswerLocally ? "stop.circle" : "speaker.wave.2")
-                                                    .font(.caption)
-                                            }
-                                            .buttonStyle(PlainButtonStyle())
-                                            #if os(macOS)
-                                            .help(isSpeakingAnswerLocally ? "Stop speaking" : "Speak with local voice")
-                                            #endif
+                                            batchListenMenu(
+                                                cloud: speakAnswer,
+                                                local: speakAnswerLocally,
+                                                cloudActive: isSynthesizingAnswerSpeech,
+                                        localActive: isSpeakingAnswerLocally
+                                            )
                                         }
                                         
                                         if isSummarizingAnswer {
@@ -18196,24 +18494,12 @@ struct BatchResultsView: View {
                                         )
                                             .frame(maxWidth: .infinity, alignment: .leading)
                                             .fixedSize(horizontal: false, vertical: true)
-                                            .padding()
-                                            .background {
-                                                if isDarkMode {
-                                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                                        .fill(Color.black)
-                                                } else {
-                                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                                        .fill(.ultraThinMaterial)
-                                                }
-                                            }
-                                            .cornerRadius(10)
+                                            .padding(.vertical, 4)
                                     }
                                 }
                                 
                                 if let error = answerError {
-                                    Text(error)
-                                        .font(.caption)
-                                        .foregroundColor(.red)
+                                    RedappInlineMessage(message: error)
                                         .padding(.horizontal)
                                 }
                                 
@@ -18265,25 +18551,12 @@ struct BatchResultsView: View {
                                             .help("Copy topic summary")
                                             #endif
                                             
-                                            // Cloud TTS button
-                                            Button(action: speakTopicSummary) {
-                                                Image(systemName: isSynthesizingTopicSpeech ? "stop.circle" : "speaker.wave.3")
-                                                    .font(.caption)
-                                            }
-                                            .buttonStyle(PlainButtonStyle())
-                                            #if os(macOS)
-                                            .help(isSynthesizingTopicSpeech ? "Stop speaking" : "Speak with cloud voice")
-                                            #endif
-                                            
-                                            // Local TTS button
-                                            Button(action: speakTopicSummaryLocally) {
-                                                Image(systemName: isSpeakingTopicLocally ? "stop.circle" : "speaker.wave.2")
-                                                    .font(.caption)
-                                            }
-                                            .buttonStyle(PlainButtonStyle())
-                                            #if os(macOS)
-                                            .help(isSpeakingTopicLocally ? "Stop speaking" : "Speak with local voice")
-                                            #endif
+                                            batchListenMenu(
+                                                cloud: speakTopicSummary,
+                                                local: speakTopicSummaryLocally,
+                                                cloudActive: isSynthesizingTopicSpeech,
+                                        localActive: isSpeakingTopicLocally
+                                            )
                                         }
                                         
                                         if isSummarizingTopicSummary {
@@ -18296,25 +18569,13 @@ struct BatchResultsView: View {
                                         ReadableReplyText(content: (showingTopicSummaryCondensed && topicSummaryCondensed != nil) ? topicSummaryCondensed! : topicSummary, fontScale: 0.9, sourceLinks: batchSourceLinks)
                                             .frame(maxWidth: .infinity, alignment: .leading)
                                             .fixedSize(horizontal: false, vertical: true)
-                                            .padding()
-                                            .background {
-                                                if isDarkMode {
-                                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                                        .fill(Color.black)
-                                                } else {
-                                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                                        .fill(.ultraThinMaterial)
-                                                }
-                                            }
-                                            .cornerRadius(10)
+                                            .padding(.vertical, 4)
                                     }
                                     .padding(.top, 8)
                                 }
                                 
                                 if let error = topicSummaryError {
-                                    Text(error)
-                                        .font(.caption)
-                                        .foregroundColor(.red)
+                                    RedappInlineMessage(message: error)
                                         .padding(.horizontal)
                                 }
                             }
@@ -18328,10 +18589,10 @@ struct BatchResultsView: View {
                                 HStack {
                                     Image(systemName: "tablecells")
                                         .font(.title3)
-                                        .foregroundColor(.primary)
-                                    Text("Overall Summary (Table Format)")
-                                        .font(.title3)
-                                        .fontWeight(.semibold)
+                                        .foregroundStyle(RedappDesign.accent)
+                                    Text("Overall summary (table)")
+                                        .font(RedappType.section)
+                                        .foregroundStyle(RedappDesign.ink)
                                     Spacer()
                                     
                                     Button(action: {
@@ -18345,49 +18606,24 @@ struct BatchResultsView: View {
                                     .help("Copy overall summary")
                                     #endif
                                     
-                                    // Cloud TTS button
-                                    Button(action: speakOverallSummary) {
-                                        Image(systemName: isSynthesizingOverallSpeech ? "stop.circle" : "speaker.wave.3")
-                                            .font(.caption)
-                                    }
-                                    .buttonStyle(PlainButtonStyle())
-                                    #if os(macOS)
-                                    .help(isSynthesizingOverallSpeech ? "Stop speaking" : "Speak with cloud voice")
-                                    #endif
-                                    
-                                    // Local TTS button
-                                    Button(action: speakOverallSummaryLocally) {
-                                        Image(systemName: isSpeakingOverallLocally ? "stop.circle" : "speaker.wave.2")
-                                            .font(.caption)
-                                    }
-                                    .buttonStyle(PlainButtonStyle())
-                                    #if os(macOS)
-                                    .help(isSpeakingOverallLocally ? "Stop speaking" : "Speak with local voice")
-                                    #endif
+                                    batchListenMenu(
+                                        cloud: speakOverallSummary,
+                                        local: speakOverallSummaryLocally,
+                                        cloudActive: isSynthesizingOverallSpeech,
+                                        localActive: isSpeakingOverallLocally
+                                    )
                                 }
                                 
                                 ReadableReplyText(content: overallSummary, fontScale: 0.9, sourceLinks: batchSourceLinks)
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                     .fixedSize(horizontal: false, vertical: true)
-                                    .padding()
-                                    .background {
-                                        if isDarkMode {
-                                            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                                .fill(Color.black)
-                                        } else {
-                                            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                                .fill(.ultraThinMaterial)
-                                        }
-                                    }
-                                    .cornerRadius(10)
+                                    .padding(.vertical, 4)
                             }
                             .padding(.horizontal)
                         }
                         
                         if let error = overallSummaryError {
-                            Text(error)
-                                .font(.caption)
-                                .foregroundColor(.red)
+                            RedappInlineMessage(message: error)
                                 .padding(.horizontal)
                         }
 
@@ -18410,10 +18646,10 @@ struct BatchResultsView: View {
                                 HStack {
                                     Image(systemName: "chart.bar.doc.horizontal")
                                         .font(.title3)
-                                        .foregroundColor(.primary)
-                                    Text("Categorized LLM Summary")
-                                        .font(.title3)
-                                        .fontWeight(.semibold)
+                                        .foregroundStyle(RedappDesign.accent)
+                                    Text("Categorized summary")
+                                        .font(RedappType.section)
+                                        .foregroundStyle(RedappDesign.ink)
                                     Spacer()
                                     Button(action: {
                                         copyToClipboard(displayedLLMResponse)
@@ -18426,23 +18662,12 @@ struct BatchResultsView: View {
                                     .help("Copy categorized summary")
                                     #endif
                                     
-                                    Button(action: speakLLMSummary) {
-                                        Image(systemName: isSynthesizingLLMSummarySpeech ? "stop.circle" : "speaker.wave.3")
-                                            .font(.caption)
-                                    }
-                                    .buttonStyle(PlainButtonStyle())
-                                    #if os(macOS)
-                                    .help(isSynthesizingLLMSummarySpeech ? "Stop speaking" : "Speak with cloud voice")
-                                    #endif
-                                    
-                                    Button(action: speakLLMSummaryLocally) {
-                                        Image(systemName: isSpeakingLLMSummaryLocally ? "stop.circle" : "speaker.wave.2")
-                                            .font(.caption)
-                                    }
-                                    .buttonStyle(PlainButtonStyle())
-                                    #if os(macOS)
-                                    .help(isSpeakingLLMSummaryLocally ? "Stop speaking" : "Speak with local voice")
-                                    #endif
+                                    batchListenMenu(
+                                        cloud: speakLLMSummary,
+                                        local: speakLLMSummaryLocally,
+                                        cloudActive: isSynthesizingLLMSummarySpeech,
+                                        localActive: isSpeakingLLMSummaryLocally
+                                    )
                                 }
 
                                 let llmBlocks = parseBatchLLMBlocks(from: displayedLLMResponse)
@@ -18460,33 +18685,19 @@ struct BatchResultsView: View {
                                     }
                                 }
                                 .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding()
-                                .background {
-                                    if isDarkMode {
-                                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                            .fill(Color.black)
-                                    } else {
-                                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                            .fill(.ultraThinMaterial)
-                                    }
-                                }
-                                .cornerRadius(10)
+                                .padding(.vertical, 4)
                             }
                             .id("llmSummarySection")
                             .padding(.horizontal)
                         }
 
                         if let error = llmSummarySpeechSynthesisError {
-                            Text(error)
-                                .font(.caption)
-                                .foregroundColor(.red)
+                            RedappInlineMessage(message: error)
                                 .padding(.horizontal)
                         }
 
                         if let error = batchLLMError {
-                            Text(error)
-                                .font(.caption)
-                                .foregroundColor(.red)
+                            RedappInlineMessage(message: error)
                                 .padding(.horizontal)
                         }
                         
@@ -18502,9 +18713,9 @@ struct BatchResultsView: View {
                                     Image(systemName: "square.stack.3d.up")
                                         .font(.title3)
                                         .foregroundColor(.secondary)
-                                    Text("Individual Post Summaries")
-                                        .font(.title3)
-                                        .fontWeight(.semibold)
+                                    Text("Individual post summaries")
+                                        .font(RedappType.section)
+                                        .foregroundStyle(RedappDesign.ink)
                                     Spacer()
 	                                }
 	                                .padding(.horizontal)
@@ -18533,17 +18744,9 @@ struct BatchResultsView: View {
                                     .padding()
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                     .background {
-                                        if isDarkMode {
-                                            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                                .fill(Color.black)
-                                        } else {
-                                            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                                .fill(.ultraThinMaterial)
-                                        }
-                                    }
-                                    .overlay {
                                         RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                            .strokeBorder(AppColors.redditCardBorder, lineWidth: 0.8)
+                                            .fill(RedappDesign.card)
+                                            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(RedappDesign.hairline, lineWidth: 1))
                                     }
                                     .cornerRadius(10)
                                     #if os(iOS)
@@ -18556,19 +18759,19 @@ struct BatchResultsView: View {
 	                            .id("individualPostSummaries")
 	                        }
 
-                        batchBottomControlRow(proxy: proxy)
-                        
                         Color.clear
                             .frame(height: 0)
                             .id("batchSummaryBottom")
-                            .padding(.bottom, 20)
+                            .padding(.bottom, 80)
                         }
                     }
+                    )
                     .padding(.top)
                     #if os(iOS)
                     .padding(.horizontal, isBatchResultsCompactLayout ? 12 : 0)
                     #endif
                 }
+                .scrollPosition($batchScrollPosition)
                 .environment(\.askAISelectionHandler, askAIHandler)
                 .environment(\.askAIWebSelectionHandler, askAIWebHandler)
                 .onChange(of: isSendingBatchResultsToLLM) { isSending in
@@ -18589,10 +18792,19 @@ struct BatchResultsView: View {
 	                }
                 .overlay(alignment: .bottom) {
                     if showFloatingAskMenu && hasBatchQuestionContext {
-                        floatingBatchAskMenu(proxy: proxy)
+                        AnyView(floatingBatchAskMenu(proxy: proxy))
                             .transition(.move(edge: .bottom).combined(with: .opacity))
                             .padding(.horizontal, isBatchResultsCompactLayout ? 10 : 20)
                             .padding(.bottom, 18)
+                    }
+                }
+                .overlay(alignment: .bottomTrailing) {
+                    // Always reachable: Ask, jump to top, jump to bottom.
+                    if !showFloatingAskMenu {
+                        AnyView(batchBottomControlRow(proxy: proxy))
+                            .padding(.trailing, isBatchResultsCompactLayout ? 12 : 20)
+                            .padding(.bottom, 18)
+                            .transition(.opacity)
                     }
                 }
 		                }
@@ -18600,39 +18812,46 @@ struct BatchResultsView: View {
             .navigationTitle("Batch Summary Results")
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
-            .toolbarBackground(isDarkMode ? .visible : .hidden, for: .navigationBar)
-            .toolbarBackground(isDarkMode ? Color.black : Color.clear, for: .navigationBar)
+            .scrollEdgeEffectStyle(.soft, for: .top)
             #endif
             .toolbar {
-	                ToolbarItem(placement: .cancellationAction) {
-	                    if onMinimize != nil {
-	                        Button {
-	                            handleMinimize()
-                        } label: {
-                            Image(systemName: "arrow.down.right.and.arrow.up.left")
-                        }
-	                        .accessibilityLabel("Minimize")
-	                    }
-	                }
-	                ToolbarItem(placement: .confirmationAction) {
-	                    Button(onClose != nil ? "Close" : "Done") {
-	                        handleClose()
-                    }
-                    }
-                    ToolbarItem(placement: .primaryAction) {
+                ToolbarItem(placement: .cancellationAction) {
+                    if onMinimize != nil {
                         Button {
-                            viewModel.saveCurrentBatchToResearchLibrary()
+                            handleMinimize()
                         } label: {
-                            Label(
-                                viewModel.savedResearchRunID == nil ? "Save" : "Saved",
-                                systemImage: viewModel.savedResearchRunID == nil ? "books.vertical" : "checkmark.circle.fill"
-                            )
+                            Label("Minimize", systemImage: "chevron.down")
                         }
-                        .disabled(viewModel.savedResearchRunID != nil || (viewModel.batchSummaries.isEmpty && viewModel.batchFinalSummary == nil))
-                        .accessibilityLabel(viewModel.savedResearchRunID == nil ? "Save to Research Library" : "Saved to Research Library")
+                        .accessibilityHint("Keeps these results available while you browse")
                     }
                 }
+                // Save and Close are separate controls; sharing one glass pill
+                // made "📚 Close" read as a single button.
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        viewModel.saveCurrentBatchToResearchLibrary()
+                    } label: {
+                        Label(
+                            viewModel.savedResearchRunID == nil ? "Save" : "Saved",
+                            systemImage: viewModel.savedResearchRunID == nil ? "books.vertical" : "checkmark.circle.fill"
+                        )
+                        .labelStyle(.titleAndIcon)
+                    }
+                    .disabled(viewModel.savedResearchRunID != nil || (viewModel.batchSummaries.isEmpty && viewModel.batchFinalSummary == nil))
+                    .accessibilityLabel(viewModel.savedResearchRunID == nil ? "Save to Research Library" : "Saved to Research Library")
+                }
+                ToolbarSpacer(.fixed, placement: .primaryAction)
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(onClose != nil ? "Close" : "Done") {
+                        handleClose()
+                    }
+                    .fontWeight(.semibold)
+                }
+                }
             }
+            // Type-erasure breaks keep this very large view's generic type shallow;
+            // without them SwiftUI can overflow the stack resolving it.
+            .erased()
             .alert("Couldn’t Save Research", isPresented: Binding(
                 get: { viewModel.researchLibraryError != nil },
                 set: { if !$0 { viewModel.researchLibraryError = nil } }
@@ -18704,6 +18923,19 @@ struct BatchResultsView: View {
                 .interactiveDismissDisabled(false)
             }
 #if os(iOS)
+            .fullScreenCover(isPresented: $showBatchPodcast) {
+                if let batchPodcastContext {
+                    BatchPodcastView(
+                        context: batchPodcastContext,
+                        runID: batchPodcastRunID,
+                        session: batchPodcastSession,
+                        onMinimize: minimizeBatchPodcast,
+                        onClose: closeBatchPodcast
+                    )
+                }
+            }
+#endif
+#if os(iOS)
             .sheet(isPresented: $showSelectionAskAIResponse) {
                 AskAIResponseSheet(
                     isLoading: isSelectionAskAIInFlight,
@@ -18714,12 +18946,14 @@ struct BatchResultsView: View {
                 )
             }
 #endif
+            .erased()
             .sheet(item: $selectedGroundedAnswerSource) { source in
                 NavigationStack {
                     ResearchSourceDetailView(source: source)
                 }
             }
             // Clear stale infographic/whiteboard/table content when batch summaries change (new subreddit)
+            .erased()
             .onChange(of: viewModel.batchSummaries.count) { _, _ in
                 // Cancel any in-progress generation tasks
                 infographicTask?.cancel()
@@ -18744,6 +18978,9 @@ struct BatchResultsView: View {
                 showInfographic = false
                 showWhiteboard = false
                 showTableSummary = false
+#if os(iOS)
+                invalidateBatchPodcast()
+#endif
                 // Clear minimized state
                 isInfographicMinimized = false
                 isWhiteboardMinimized = false
@@ -18751,6 +18988,27 @@ struct BatchResultsView: View {
             // Floating restore buttons for minimized infographic/whiteboard
             .overlay(alignment: .bottomTrailing) {
                 HStack(spacing: 12) {
+#if os(iOS)
+                    if isBatchPodcastMinimized && batchPodcastContext != nil {
+                        Button(action: {
+                            withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                                isBatchPodcastMinimized = false
+                                showBatchPodcast = true
+                            }
+                        }) {
+                            Image(systemName: "waveform.and.mic")
+                                .font(.system(size: 18, weight: .semibold))
+                                .foregroundColor(.white)
+                                .padding(12)
+                        }
+                        .background(Circle().fill(RedappDesign.accent))
+                        .clipShape(Circle())
+                        .shadow(color: Color.black.opacity(0.18), radius: 8, x: 0, y: 4)
+                        .transition(.scale.combined(with: .opacity))
+                        .accessibilityLabel("Show batch podcast")
+                        .accessibilityHint("Return to podcast generation or playback")
+                    }
+#endif
                     if isInfographicMinimized && infographicContent != nil {
                         Button(action: {
                             withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
@@ -18763,18 +19021,9 @@ struct BatchResultsView: View {
                                 .foregroundColor(.white)
                                 .padding(12)
                         }
-                        .background {
-                            if isDarkMode {
-                                Color.black
-                            } else {
-                                Color.clear.background(.ultraThinMaterial)
-                            }
-                        }
+                        .background(Circle().fill(RedappDesign.accent))
                         .clipShape(Circle())
-                        .overlay(
-                            Circle().stroke(Color.white.opacity(0.18), lineWidth: 0.8)
-                        )
-                        .shadow(color: Color.black.opacity(0.25), radius: 6, x: 0, y: 4)
+                        .shadow(color: Color.black.opacity(0.18), radius: 8, x: 0, y: 4)
                         .transition(.scale.combined(with: .opacity))
                         .accessibilityLabel("Show infographic")
                     }
@@ -18791,18 +19040,9 @@ struct BatchResultsView: View {
                                 .foregroundColor(.white)
                                 .padding(12)
                         }
-                        .background {
-                            if isDarkMode {
-                                Color.black
-                            } else {
-                                Color.clear.background(.ultraThinMaterial)
-                            }
-                        }
+                        .background(Circle().fill(RedappDesign.accent))
                         .clipShape(Circle())
-                        .overlay(
-                            Circle().stroke(Color.white.opacity(0.18), lineWidth: 0.8)
-                        )
-                        .shadow(color: Color.black.opacity(0.25), radius: 6, x: 0, y: 4)
+                        .shadow(color: Color.black.opacity(0.18), radius: 8, x: 0, y: 4)
                         .transition(.scale.combined(with: .opacity))
                         .accessibilityLabel("Show whiteboard")
                     }
@@ -18830,7 +19070,10 @@ struct BatchResultsView: View {
             GlassBackgroundView(variant: .summary)
                 .ignoresSafeArea()
         } else {
+            // Always fill behind the navigation bar, so its glass sits on the
+            // page color instead of the window's black.
             GlassBackgroundView(variant: .summary)
+                .ignoresSafeArea(.container, edges: .top)
         }
     }
 #if os(iOS)
@@ -19723,7 +19966,7 @@ struct BatchResultsView: View {
         let postsHTML = displayPosts.prefix(5).map { post in
             let normalized = normalizeRedditPermalink(post.url)
             let safeUrl = escapeHTML(normalized)
-            let linkHTML = safeUrl.isEmpty ? "" : "<a class=\"post-link\" href=\"\(safeUrl)\" target=\"_blank\">View &rarr;</a>"
+            let linkHTML = safeUrl.isEmpty ? "" : "<a class=\"post-link\" href=\"\(safeUrl)\" target=\"_blank\">Open thread &#8599;</a>"
             return """
             <div class="post-item">
               <div class="post-title">\(escapeHTML(post.title))</div>
@@ -19741,14 +19984,16 @@ struct BatchResultsView: View {
           <meta name="viewport" content="width=device-width, initial-scale=1.0" />
           <style>
             :root {
-              --accent: #2563eb;
-              --highlight: #d97706;
-              --alert: #dc2626;
-              --gray-900: #0A0A0A;
-              --gray-700: #404040;
-              --gray-500: #6B6B6B;
-              --gray-300: #A3A3A3;
-              --gray-100: #E5E5E5;
+              color-scheme: light dark;
+              --bg: #F7F6F3;
+              --accent: #E8542A;
+              --highlight: #B7791F;
+              --alert: #D64532;
+              --gray-900: #1C1C1E;
+              --gray-700: #3A3936;
+              --gray-500: #6B6966;
+              --gray-300: #A8A49D;
+              --gray-100: #E6E3DD;
               --text-xs: 11px;
               --text-sm: 13px;
               --text-base: 14px;
@@ -19758,10 +20003,18 @@ struct BatchResultsView: View {
               --gutter: 24px;
               --margin: 48px;
             }
+            @media (prefers-color-scheme: dark) {
+              :root {
+                --bg: #111113; --accent: #FF6A3D; --highlight: #E3A21A; --alert: #FF6B5A;
+                --gray-900: #F4F4F5; --gray-700: #D4D4D8; --gray-500: #A1A1A6;
+                --gray-300: #6E6E73; --gray-100: rgba(255,255,255,0.08);
+              }
+            }
             * { box-sizing: border-box; margin: 0; padding: 0; }
             body {
               font-family: "SF Pro Text", -apple-system, system-ui, sans-serif;
-              background: #FFFFFF;
+              background: var(--bg);
+              -webkit-font-smoothing: antialiased;
               min-height: 100vh;
               padding: var(--margin);
               color: var(--gray-900);
@@ -19776,10 +20029,20 @@ struct BatchResultsView: View {
               padding-bottom: var(--gutter);
               border-bottom: 1px solid var(--gray-100);
             }
+            .header::before {
+              content: "Whiteboard";
+              display: block;
+              font-size: var(--text-xs);
+              font-weight: 600;
+              text-transform: uppercase;
+              letter-spacing: 0.1em;
+              color: var(--gray-500);
+              margin-bottom: var(--space-unit);
+            }
             .session-title {
               font-family: "SF Pro Display", -apple-system, system-ui, sans-serif;
-              font-size: var(--text-2xl);
-              font-weight: 600;
+              font-size: 34px;
+              font-weight: 700;
               color: var(--gray-900);
               letter-spacing: -0.02em;
               margin-bottom: calc(var(--space-unit) / 2);
@@ -19865,8 +20128,9 @@ struct BatchResultsView: View {
             .quote-item:last-child { border-bottom: none; }
             .quote-text {
               font-size: var(--text-base);
-              color: var(--gray-700);
-              font-style: italic;
+              color: var(--gray-900);
+              border-left: 3px solid var(--accent);
+              padding-left: 12px;
               margin-bottom: calc(var(--space-unit) / 2);
             }
             .quote-context {
@@ -19899,8 +20163,10 @@ struct BatchResultsView: View {
             .post-link:hover { text-decoration: underline; }
             .bottom-line {
               margin-top: var(--margin);
-              padding-top: var(--gutter);
-              border-top: 1px solid var(--gray-100);
+              padding: 18px 20px;
+              border-radius: 12px;
+              border-left: 4px solid var(--accent);
+              background: color-mix(in srgb, var(--accent) 10%, transparent);
             }
             .bottom-line-label {
               font-size: var(--text-xs);
@@ -19982,8 +20248,6 @@ struct BatchResultsView: View {
     }
 
     private func buildInfographicHTML(from payload: InfographicPayload, rankedPosts: [RankedVisualPostCandidate] = []) -> String {
-        let palette = payload.palette
-
         let statsHTML = payload.statTiles.prefix(4).map { tile in
             """
             <div class="stat">
@@ -20034,7 +20298,7 @@ struct BatchResultsView: View {
                 linkHTML = ""
             } else {
                 // Use same format as whiteboard - double quotes, no escapeHTML on URL
-                linkHTML = "<a class=\"post-url\" href=\"\(normalized)\" target=\"_blank\">🔗 Open in Reddit</a>"
+                linkHTML = "<a class=\"post-url\" href=\"\(normalized)\" target=\"_blank\">Open thread ↗</a>"
             }
             return """
             <li class="post">
@@ -20060,110 +20324,97 @@ struct BatchResultsView: View {
           <meta charset="UTF-8" />
           <meta name="viewport" content="width=device-width, initial-scale=1.0" />
           <style>
+            /* redapp design system: paper canvas, white cards, one orange accent. */
             :root {
-              --bg: \(palette.background);
-              --primary: \(palette.primary);
-              --accent: \(palette.accent);
-              --muted: \(palette.muted);
-              --text: #e2e8f0;
+              color-scheme: light dark;
+              --bg: #F7F6F3; --card: #FFFFFF; --border: #E6E3DD; --text: #1C1C1E;
+              --muted: #6B6966; --accent: #E8542A; --accent-soft: #FCEBE4;
+              --pos: #1F9D57; --neu: #8A8680; --neg: #D64532;
+            }
+            @media (prefers-color-scheme: dark) {
+              :root {
+                --bg: #111113; --card: #1C1C1F; --border: rgba(255,255,255,0.08); --text: #F4F4F5;
+                --muted: #A1A1A6; --accent: #FF6A3D; --accent-soft: rgba(255,106,61,0.16);
+                --pos: #3DD68C; --neu: #A1A1A6; --neg: #FF6B5A;
+              }
             }
             * { box-sizing: border-box; }
             body {
-              margin: 0;
-              padding: 0;
-              min-height: 100vh;
-              font-family: "SF Pro Display","Helvetica Neue","Segoe UI",sans-serif;
-              color: var(--text);
-              background: radial-gradient(120% 120% at 15% 20%, rgba(255,255,255,0.08), transparent),
-                          radial-gradient(120% 120% at 85% 0%, rgba(255,123,114,0.10), transparent),
-                          linear-gradient(145deg, var(--bg), #0c101f 55%, #0a0f1d 100%);
+              margin: 0; padding: 0; min-height: 100vh;
+              font-family: -apple-system, "SF Pro Text", "Helvetica Neue", sans-serif;
+              color: var(--text); background: var(--bg);
+              -webkit-font-smoothing: antialiased;
             }
-            .wrap {
-              max-width: 1040px;
-              margin: 0 auto;
-              padding: 28px 20px 44px;
-              position: relative;
-              overflow: hidden;
+            .wrap { max-width: 1040px; margin: 0 auto; padding: 32px 24px 48px; }
+            .glass { background: transparent; }
+            .glow { display: none; }
+            header { display: flex; flex-direction: column; gap: 10px; margin-bottom: 28px; }
+            header::before {
+              content: "Community pulse"; text-transform: uppercase; letter-spacing: 0.1em;
+              font-size: 12px; font-weight: 600; color: var(--muted);
             }
-            .glass {
-              background: rgba(255,255,255,0.03);
-              border: 1px solid rgba(255,255,255,0.07);
-              border-radius: 24px;
-              padding: 24px;
-              box-shadow: 0 20px 60px rgba(0,0,0,0.35);
-              backdrop-filter: blur(10px);
-              position: relative;
-              overflow: hidden;
+            .title { font-size: 36px; font-weight: 700; letter-spacing: -0.02em; line-height: 1.1; }
+            .subtitle { color: var(--muted); font-size: 17px; line-height: 1.4; }
+            .section-label {
+              text-transform: uppercase; letter-spacing: 0.1em; font-size: 12px; font-weight: 600;
+              color: var(--muted); margin: 26px 0 10px;
             }
-            .glow {
-              position: absolute;
-              inset: -120px;
-              background: radial-gradient(300px at 25% 20%, rgba(109,243,255,0.18), transparent 60%),
-                          radial-gradient(260px at 80% 10%, rgba(255,123,114,0.16), transparent 55%);
-              filter: blur(30px);
-              opacity: 0.9;
-              pointer-events: none;
+            .list-card .section-label { margin-top: 0; }
+            .chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0 0; }
+            .chip {
+              background: var(--accent-soft); color: var(--accent); border-radius: 8px;
+              padding: 6px 12px; font-size: 13px; font-weight: 500;
             }
-            header {
-              display: flex;
-              flex-direction: column;
-              gap: 8px;
-              margin-bottom: 18px;
-              position: relative;
-              z-index: 1;
+            .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin-top: 10px; }
+            .stat { padding: 16px; background: var(--card); border-radius: 12px; border: 1px solid var(--border); }
+            .stat-label { text-transform: uppercase; letter-spacing: 0.08em; font-size: 11px; font-weight: 600; color: var(--muted); }
+            .stat-value { font-size: 28px; font-weight: 700; margin: 6px 0 2px; color: var(--accent); }
+            .stat-note { font-size: 13px; color: var(--muted); }
+            .focus-pill {
+              display: inline-flex; align-self: flex-start; padding: 10px 14px; border-radius: 10px;
+              border: 1px solid var(--border); background: var(--card); font-size: 15px; line-height: 1.4;
             }
-            .title {
-              font-size: 34px;
-              font-weight: 800;
-              letter-spacing: -0.04em;
+            .themes-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+            .theme-card { padding: 18px; border-radius: 12px; border: 1px solid var(--border); background: var(--card); }
+            .theme-title { font-weight: 600; margin-bottom: 4px; font-size: 17px; }
+            .theme-sub { color: var(--muted); font-size: 13px; margin-bottom: 10px; }
+            .theme-bullets { list-style: none; padding: 0; margin: 0; display: grid; gap: 6px; }
+            .theme-bullets li { font-size: 14px; line-height: 1.45; position: relative; padding-left: 16px; }
+            .theme-bullets li::before { content: "•"; position: absolute; left: 2px; color: var(--accent); font-weight: 700; }
+            .sentiment-band { border-radius: 12px; overflow: hidden; border: 1px solid var(--border); background: var(--card); }
+            .band {
+              display: grid; grid-template-columns: 170px 1fr; gap: 12px; align-items: center;
+              padding: 14px 16px; font-size: 14px; border-left: 4px solid transparent;
             }
-            .subtitle {
-              color: var(--muted);
-              font-size: 16px;
-            }
-            .section-label { text-transform: uppercase; letter-spacing: 0.08em; font-size: 12px; color: var(--muted); margin-bottom: 8px; }
-            .chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 14px; }
-            .chip { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); border-radius: 999px; padding: 8px 12px; font-size: 13px; }
-            .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; margin-top: 8px; }
-            .stat { padding: 12px 14px; background: linear-gradient(145deg, rgba(255,255,255,0.05), rgba(255,255,255,0.02)); border-radius: 14px; border: 1px solid rgba(255,255,255,0.07); }
-            .stat-label { text-transform: uppercase; letter-spacing: 0.08em; font-size: 11px; color: var(--muted); }
-            .stat-value { font-size: 24px; font-weight: 800; margin: 6px 0 2px; color: var(--primary); }
-            .stat-note { font-size: 12px; color: var(--muted); }
-            .focus-pill { display: inline-flex; align-items: center; gap: 10px; padding: 10px 14px; border-radius: 14px; border: 1px solid rgba(255,255,255,0.08); background: rgba(255,255,255,0.04); font-size: 14px; margin-top: 6px; }
-            .themes-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; margin-top: 10px; }
-            .theme-card { padding: 14px; border-radius: 14px; border: 1px solid rgba(255,255,255,0.08); background: rgba(255,255,255,0.03); box-shadow: inset 0 1px 0 rgba(255,255,255,0.05); min-height: 160px; }
-            .theme-title { font-weight: 800; margin-bottom: 4px; font-size: 15px; }
-            .theme-sub { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
-            .theme-bullets { list-style: none; padding: 0; margin: 0; display: grid; gap: 4px; }
-            .theme-bullets li { font-size: 13px; line-height: 1.35; position: relative; padding-left: 14px; }
-            .theme-bullets li::before { content: "•"; position: absolute; left: 0; color: var(--accent); }
-            .sentiment-band { margin: 16px 0 10px; border-radius: 16px; overflow: hidden; border: 1px solid rgba(255,255,255,0.08); box-shadow: inset 0 1px 0 rgba(255,255,255,0.04); }
-            .band { display: grid; grid-template-columns: 120px 1fr; align-items: center; padding: 10px 12px; font-size: 13px; }
-            .band-label { font-weight: 800; text-transform: uppercase; letter-spacing: 0.05em; }
-            .band.up { background: linear-gradient(90deg, rgba(109,243,255,0.20), rgba(109,243,255,0.05)); color: #0b2130; }
-            .band.mid { background: linear-gradient(90deg, rgba(255,182,72,0.15), rgba(255,182,72,0.05)); color: #160f00; }
-            .band.down { background: linear-gradient(90deg, rgba(255,123,114,0.18), rgba(255,123,114,0.05)); color: #1f0e0e; }
-            .band .text { color: rgba(0,0,0,0.78); }
-            .sentiment-tags { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0 4px; }
-            .tag { padding: 6px 10px; border-radius: 12px; font-weight: 700; font-size: 12px; }
-            .tag.pos { background: rgba(109,243,255,0.14); color: #9bf5ff; border: 1px solid rgba(109,243,255,0.35); }
-            .tag.neu { background: rgba(148,163,184,0.12); color: #cbd5e1; border: 1px solid rgba(148,163,184,0.3); }
-            .tag.neg { background: rgba(255,123,114,0.12); color: #ffb4ac; border: 1px solid rgba(255,123,114,0.32); }
-            .topics-trends { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; }
-            .list-card { padding: 14px; border-radius: 14px; border: 1px solid rgba(255,255,255,0.07); background: rgba(255,255,255,0.03); }
-            .list-card ul { list-style: none; padding: 0; margin: 0; display: grid; gap: 6px; }
-            .list-card li { display: flex; align-items: flex-start; gap: 8px; font-size: 13px; line-height: 1.35; }
-            .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--primary); margin-top: 5px; flex-shrink: 0; }
+            .band + .band { border-top: 1px solid var(--border); }
+            .band-label { font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; }
+            .band.up { border-left-color: var(--pos); }
+            .band.mid { border-left-color: #E3A21A; }
+            .band.down { border-left-color: var(--neg); }
+            .band .text { color: var(--text); line-height: 1.4; }
+            .sentiment-tags { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0 4px; }
+            .tag { padding: 6px 12px; border-radius: 8px; font-weight: 600; font-size: 13px; border: 1px solid var(--border); background: var(--card); }
+            .tag.pos { color: var(--pos); }
+            .tag.neu { color: var(--neu); }
+            .tag.neg { color: var(--neg); }
+            .topics-trends { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
+            .list-card { padding: 18px; border-radius: 12px; border: 1px solid var(--border); background: var(--card); }
+            .list-card ul { list-style: none; padding: 0; margin: 0; display: grid; gap: 8px; }
+            .list-card li { display: flex; align-items: flex-start; gap: 10px; font-size: 14px; line-height: 1.45; }
+            .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); margin-top: 7px; flex-shrink: 0; }
             .dot.accent { background: var(--accent); }
             .line { flex: 1; }
-            .posts { list-style: none; padding: 0; margin: 0; display: grid; gap: 8px; }
-            .post { display: flex; align-items: flex-start; gap: 10px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.05); border-radius: 12px; padding: 10px 12px; }
-            .post-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); margin-top: 6px; flex-shrink: 0; }
+            .posts { list-style: none; padding: 0; margin: 0; border: 1px solid var(--border); border-radius: 12px; background: var(--card); overflow: hidden; }
+            .post { display: flex; align-items: flex-start; gap: 12px; padding: 14px 16px; }
+            .post + .post { border-top: 1px solid var(--border); }
+            .post-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); margin-top: 7px; flex-shrink: 0; }
             .post-content { flex: 1; display: flex; flex-direction: column; gap: 6px; }
-            .post-title { font-size: 14px; font-weight: 600; line-height: 1.3; }
-            .post-url { display: inline-block; color: var(--primary); font-size: 12px; text-decoration: none; padding: 4px 10px; background: rgba(109,243,255,0.1); border-radius: 6px; border: 1px solid rgba(109,243,255,0.2); }
-            .post-url:hover { background: rgba(109,243,255,0.2); }
-            .takeaway { margin-top: 10px; padding: 14px; border-radius: 16px; background: linear-gradient(120deg, rgba(109,243,255,0.12), rgba(255,123,114,0.10)); border: 1px solid rgba(255,255,255,0.07); font-weight: 650; font-size: 15px; }
+            .post-title { font-size: 15px; font-weight: 600; line-height: 1.35; }
+            .post-url { color: var(--accent); font-size: 14px; font-weight: 500; text-decoration: none; }
+            .takeaway {
+              margin-top: 26px; padding: 18px 20px; border-radius: 12px; background: var(--accent-soft);
+              border-left: 4px solid var(--accent); font-weight: 600; font-size: 16px; line-height: 1.45;
+            }
           </style>
         </head>
         <body>
@@ -20526,34 +20777,7 @@ struct BatchResultsView: View {
                     submitBatchQuestion()
                 }
 
-            Button(action: {
-                summarizeBatchQuestionTopics(proxy: proxy)
-            }) {
-                if isBatchQuestionTopicActionInFlight {
-                    ProgressView()
-                        .scaleEffect(0.8)
-                } else {
-                    Image(systemName: hasSubredditOverviewForQuestions ? "text.badge.star" : "arrow.down.circle")
-                }
-            }
-            .buttonStyle(BatchSummaryStandaloneGlassButtonStyle())
-            .disabled(isBatchQuestionTopicActionDisabled)
-            #if os(macOS)
-            .help(hasSubredditOverviewForQuestions ? "Summarize topics by subject" : "Scroll to individual post summaries")
-            #endif
-
-            Button(action: {
-                withAnimation(.spring(response: 0.26, dampingFraction: 0.86)) {
-                    showBatchSummaryActionsMenu.toggle()
-                }
-            }) {
-                Image(systemName: "line.3.horizontal")
-            }
-            .buttonStyle(BatchSummaryStandaloneGlassButtonStyle(isSelected: showBatchSummaryActionsMenu))
-            .accessibilityLabel(showBatchSummaryActionsMenu ? "Hide batch summary actions" : "Show batch summary actions")
-            #if os(macOS)
-            .help(showBatchSummaryActionsMenu ? "Hide batch summary actions" : "Show batch summary actions")
-            #endif
+            batchToolsMenu(proxy: proxy)
         }
         #if os(iOS)
         .padding(.horizontal, isBatchResultsCompactLayout ? 16 : 0)
@@ -20597,9 +20821,9 @@ struct BatchResultsView: View {
     private func floatingBatchAskMenu(proxy: ScrollViewProxy) -> some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 12) {
-                Text("Ask About This Subreddit")
-                    .font(.title3)
-                    .fontWeight(.semibold)
+                Text("Ask about this subreddit")
+                    .font(RedappType.section)
+                    .foregroundStyle(RedappDesign.ink)
                     .lineLimit(1)
                     .minimumScaleFactor(0.75)
 
@@ -20618,7 +20842,7 @@ struct BatchResultsView: View {
             }
 
             batchAskInputRow(proxy: proxy)
-            if showBatchSummaryActionsMenu {
+            if infographicError != nil || whiteboardError != nil {
                 if isWebBatchMode {
                     webBatchActionRow(proxy: proxy)
                 } else {
@@ -20628,25 +20852,52 @@ struct BatchResultsView: View {
         }
         .padding(16)
         .frame(maxWidth: 920, alignment: .leading)
-        .background {
-            if isDarkMode {
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .fill(Color.black)
-            } else {
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .fill(.ultraThinMaterial)
+        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+    }
+
+    /// Floating Ask · top · bottom controls on Liquid Glass.
+    /// One Listen menu (cloud or on-device voice); becomes Stop while reading.
+    @ViewBuilder
+    private func batchListenMenu(cloud: @escaping () -> Void, local: @escaping () -> Void, cloudActive: Bool, localActive: Bool) -> some View {
+        if cloudActive || localActive {
+            Button {
+                // Each speak action stops itself when called while active.
+                if cloudActive { cloud() } else { local() }
+            } label: {
+                Label("Stop", systemImage: "stop.fill")
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(RedappDesign.accent)
             }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Stop reading")
+        } else {
+            Menu {
+                Button(action: cloud) {
+                    Label("OpenAI voice", systemImage: "speaker.wave.2")
+                    Text("Cloud")
+                }
+                Button(action: local) {
+                    Label("System voice", systemImage: "speaker.wave.2.circle")
+                    Text("On device")
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "play.fill")
+                    Text("Listen")
+                    Image(systemName: "chevron.down")
+                        .font(.caption2.weight(.semibold))
+                }
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(RedappDesign.accent)
+            }
+            .menuStyle(.button)
+            .buttonStyle(.plain)
+            .accessibilityLabel("Listen")
         }
-        .overlay {
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .strokeBorder(AppColors.redditCardBorder, lineWidth: 1)
-        }
-        .shadow(color: .black.opacity(isDarkMode ? 0.35 : 0.16), radius: 18, y: 8)
     }
 
     private func batchBottomControlRow(proxy: ScrollViewProxy) -> some View {
-        HStack(spacing: 12) {
-            Spacer()
+        HStack(spacing: 2) {
             if hasBatchQuestionContext {
                 Button(action: {
                     withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
@@ -20655,258 +20906,169 @@ struct BatchResultsView: View {
                 }) {
                     Image(systemName: showFloatingAskMenu ? "questionmark.bubble.fill" : "questionmark.bubble")
                 }
-                .buttonStyle(BatchSummaryStandaloneGlassButtonStyle(isSelected: showFloatingAskMenu))
-                .accessibilityLabel("Show ask menu")
-                #if os(macOS)
-                .help("Show ask menu")
-                #endif
+                .accessibilityLabel("Ask about this subreddit")
             }
-
             Button(action: {
                 withAnimation(.easeInOut(duration: 0.5)) {
                     proxy.scrollTo("batchSummaryActionsTop", anchor: .top)
                 }
             }) {
-                Image(systemName: "arrow.up.circle")
+                Image(systemName: "arrow.up")
             }
-            .buttonStyle(BatchSummaryStandaloneGlassButtonStyle())
+            .accessibilityLabel("Scroll to top")
+            Button(action: {
+                withAnimation(.easeInOut(duration: 0.35)) {
+                    batchScrollPosition.scrollTo(edge: .bottom)
+                }
+            }) {
+                Image(systemName: "arrow.down")
+            }
+            .accessibilityLabel("Scroll to bottom")
         }
-        .padding(.horizontal)
+        .buttonStyle(RedappGlassPillButtonStyle())
+        .padding(4)
+        .glassEffect(.regular.interactive(), in: .capsule)
     }
 
     @ViewBuilder
+    /// Tool group for the batch report actions: a quiet field-colored bar.
     private func batchSummaryGlassToolbar<Content: View>(@ViewBuilder content: () -> Content) -> some View {
-        let cornerRadius: CGFloat = isBatchResultsCompactLayout ? 22 : 28
-        let iconSpacing: CGFloat = isBatchResultsCompactLayout ? 2 : 10
-        let horizontalPadding: CGFloat = isBatchResultsCompactLayout ? 4 : 8
-        let verticalPadding: CGFloat = isBatchResultsCompactLayout ? 4 : 6
-        let tint = Color.white
-
-        #if os(iOS)
-        if #available(iOS 26.0, *) {
-            GlassEffectContainer(spacing: iconSpacing) {
-                HStack(spacing: iconSpacing) {
-                    content()
-                }
-                .padding(.horizontal, horizontalPadding)
-                .padding(.vertical, verticalPadding)
-                .glassEffect(.regular.tint(tint.opacity(0.20)).interactive(), in: .rect(cornerRadius: cornerRadius))
-                .overlay {
-                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                        .strokeBorder(Color.white.opacity(0.16), lineWidth: 1)
-                }
-            }
-        } else {
-            HStack(spacing: iconSpacing) {
-                content()
-            }
-            .padding(.horizontal, horizontalPadding)
-            .padding(.vertical, verticalPadding)
-            .background {
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .fill(tint.opacity(isDarkMode ? 0.16 : 0.34))
-                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-                    .overlay {
-                        LinearGradient(
-                            colors: [
-                                Color.white.opacity(0.18),
-                                Color.white.opacity(0.04)
-                            ],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
-                        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-                    }
-                    .overlay {
-                        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                            .strokeBorder(Color.white.opacity(0.16), lineWidth: 1)
-                    }
-            }
-        }
-        #else
-        HStack(spacing: iconSpacing) {
+        let cornerRadius: CGFloat = 14
+        return HStack(spacing: isBatchResultsCompactLayout ? 2 : 6) {
             content()
         }
-        .padding(.horizontal, horizontalPadding)
-        .padding(.vertical, verticalPadding)
-        .background {
-            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                .fill(tint.opacity(isDarkMode ? 0.64 : 0.46))
-                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                        .strokeBorder(Color.white.opacity(0.16), lineWidth: 1)
-                }
-        }
-        #endif
+        .padding(.horizontal, isBatchResultsCompactLayout ? 4 : 6)
+        .padding(.vertical, 4)
+        .background(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous).fill(RedappDesign.field))
+        .overlay(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous).strokeBorder(RedappDesign.hairlineStrong, lineWidth: 1))
     }
 
     @ViewBuilder
     private func batchSummaryActionRow(proxy: ScrollViewProxy) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            if isBatchResultsCompactLayout {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    batchSummaryGlassToolbar {
-                        batchSummaryActionButtons(proxy: proxy)
-                    }
-                    .padding(.horizontal, 0)
-                    .padding(.vertical, 2)
+            if !hasBatchQuestionContext {
+                HStack {
+                    batchToolsMenu(proxy: proxy)
+                    Spacer()
                 }
-            } else {
-                batchSummaryGlassToolbar {
-                    batchSummaryActionButtons(proxy: proxy)
-                }
-                .padding(.horizontal)
+                #if os(iOS)
+                .padding(.horizontal, isBatchResultsCompactLayout ? 16 : 0)
+                #endif
             }
 
             if let infographicError {
-                Text(infographicError)
-                    .font(.caption)
-                    .foregroundColor(.red)
+                RedappInlineMessage(message: infographicError)
                     .padding(.horizontal)
             }
 
             if let whiteboardError {
-                Text(whiteboardError)
-                    .font(.caption)
-                    .foregroundColor(.red)
+                RedappInlineMessage(message: whiteboardError)
                     .padding(.horizontal)
+            }
+        }
+    }
+
+    /// "Tools ▾": every batch action in one dropdown, like the reader's Summarize menu.
+    private func batchToolsMenu(proxy: ScrollViewProxy) -> some View {
+        let isBusy = viewModel.isGeneratingBatchOverallSummary || isGeneratingOverallSummary
+            || isGeneratingInfographic || isGeneratingWhiteboard || isSendingBatchResultsToLLM || isSummarizingTopics
+        let modelName = isWebBatchMode
+            ? "\(summaryService.settings.selectedWebAIProvider.displayName) on the web"
+            : summaryService.settings.selectedSummaryProvider.displayName
+        return Menu {
+            Section {
+                Button {} label: {
+                    Label("Using \(modelName)", systemImage: "cpu")
+                    Text("Change the model in Settings")
+                }
+                .disabled(true)
+            }
+            if isWebBatchMode {
+                webBatchActionButtons(proxy: proxy)
+            } else {
+                batchSummaryActionButtons(proxy: proxy)
+            }
+        } label: {
+            HStack(spacing: 6) {
+                if isBusy {
+                    ProgressView().controlSize(.small).tint(RedappDesign.accent)
+                } else {
+                    Image(systemName: "sparkles")
+                }
+                Text("Tools")
+                Image(systemName: "chevron.down")
+                    .font(.caption.weight(.semibold))
+            }
+        }
+        .buttonStyle(RedappSecondaryButtonStyle(isCompact: isBatchResultsCompactLayout))
+        .accessibilityLabel("Batch tools")
+    }
+
+    /// One menu entry with a short description under the title.
+    @ViewBuilder
+    private func batchToolItem(_ title: String, _ subtitle: String, systemImage: String, isBusy: Bool = false, isDisabled: Bool = false, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Label(isBusy ? "\(title)…" : title, systemImage: systemImage)
+            Text(isBusy ? "Working…" : subtitle)
+        }
+        .disabled(isDisabled || isBusy)
+    }
+
+    @ViewBuilder
+    private func batchNavigationItems(proxy: ScrollViewProxy) -> some View {
+        Section {
+            batchToolItem("Scroll to Top", "Back to overview", systemImage: "arrow.up") {
+                withAnimation(.easeInOut(duration: 0.35)) { proxy.scrollTo("topSection", anchor: .top) }
+            }
+            batchToolItem("Scroll to Bottom", "Last post", systemImage: "arrow.down") {
+                withAnimation(.easeInOut(duration: 0.35)) { batchScrollPosition.scrollTo(edge: .bottom) }
             }
         }
     }
 
     @ViewBuilder
     private func batchSummaryActionButtons(proxy: ScrollViewProxy) -> some View {
-            Button(action: {
+        let hasResults = !(viewModel.batchSummaries.isEmpty && viewModel.batchFinalSummary == nil)
+        Section("Create") {
+            batchToolItem("Deep Summary", "Full analysis", systemImage: "sparkles",
+                          isBusy: viewModel.isGeneratingBatchOverallSummary, isDisabled: viewModel.batchSummaries.isEmpty) {
                 viewModel.generateOverallSummary()
-            }) {
-                Group {
-                    if viewModel.isGeneratingBatchOverallSummary {
-                        ProgressView()
-                            .scaleEffect(0.8)
-                    } else {
-                        Image(systemName: "sparkles")
-                    }
-                }
-                .frame(width: 22, height: 22)
             }
-            .buttonStyle(BatchSummaryGlassIconButtonStyle(isCompact: isBatchResultsCompactLayout))
-            .disabled(viewModel.isGeneratingBatchOverallSummary || viewModel.batchSummaries.isEmpty)
-
-            Button(action: {
-                copyOverallSummaryToClipboard()
-            }) {
-                if isBatchResultsCompactLayout || UIDevice.current.userInterfaceIdiom == .pad {
-                    Group {
-                        if isGeneratingOverallSummary {
-                            ProgressView()
-                                .scaleEffect(0.8)
-                        } else {
-                            Image(systemName: "tablecells")
-                        }
-                    }
-                    .frame(width: 22, height: 22)
-                } else {
-                    HStack {
-                        if isGeneratingOverallSummary {
-                            ProgressView()
-                                .scaleEffect(0.8)
-                        } else {
-                            Image(systemName: "tablecells")
-                        }
-                        Text("Overall Summary")
-                    }
-                }
-            }
-            .buttonStyle(BatchSummaryGlassIconButtonStyle(isCompact: isBatchResultsCompactLayout))
-            .disabled(isGeneratingOverallSummary)
-
-            Button(action: {
-                copyBatchResultsToClipboard()
-            }) {
-                Group {
-                    if UIDevice.current.userInterfaceIdiom == .phone {
-                        Image(systemName: "doc.on.clipboard")
-                    } else if UIDevice.current.userInterfaceIdiom == .pad {
-                        Image(systemName: "doc.on.clipboard")
-                    } else {
-                        HStack {
-                            Image(systemName: "doc.on.clipboard")
-                            Text("Copy All Results")
-                        }
-                    }
-                }
-                .frame(width: 22, height: 22)
-            }
-            .buttonStyle(BatchSummaryGlassIconButtonStyle(isCompact: isBatchResultsCompactLayout))
-
-            Button(action: {
+            batchToolItem("Themed Summary", "Grouped by theme", systemImage: "paperplane",
+                          isBusy: isSendingBatchResultsToLLM, isDisabled: !hasResults) {
                 sendBatchResultsToLLM()
-            }) {
-                Group {
-                    if isSendingBatchResultsToLLM {
-                        ProgressView()
-                            .scaleEffect(0.8)
-                    } else {
-                        Image(systemName: "paperplane")
-                    }
-                }
-                .frame(width: 22, height: 22)
             }
-            .buttonStyle(BatchSummaryGlassIconButtonStyle(isCompact: isBatchResultsCompactLayout))
-            .disabled(isSendingBatchResultsToLLM || (viewModel.batchSummaries.isEmpty && viewModel.batchFinalSummary == nil))
-
-            Button(action: {
-                withAnimation(.easeInOut(duration: 0.5)) {
-                    proxy.scrollTo("batchSummaryBottom", anchor: .bottom)
-                }
-            }) {
-                Image(systemName: "arrow.down.circle")
-                    .frame(width: 22, height: 22)
+            batchToolItem("Table", "Themes and examples", systemImage: "tablecells",
+                          isBusy: isGeneratingOverallSummary) {
+                copyOverallSummaryToClipboard()
             }
-            .buttonStyle(BatchSummaryGlassIconButtonStyle(isCompact: isBatchResultsCompactLayout))
-
-            Button(action: {
-                withAnimation(.easeInOut(duration: 0.5)) {
-                    proxy.scrollTo("topSection", anchor: .top)
+            if hasSubredditOverviewForQuestions {
+                batchToolItem("By Topic", "Topic breakdown", systemImage: "text.badge.star",
+                              isBusy: isSummarizingTopics) {
+                    summarizeTopics()
                 }
-            }) {
-                Image(systemName: "arrow.up.circle")
-                    .frame(width: 22, height: 22)
             }
-            .buttonStyle(BatchSummaryGlassIconButtonStyle(isCompact: isBatchResultsCompactLayout))
-
-            Button(action: {
+            batchToolItem("Infographic", "Visual one-pager", systemImage: "chart.pie",
+                          isBusy: isGeneratingInfographic, isDisabled: !hasResults) {
                 generateInfographic()
-            }) {
-	                Group {
-	                    if isGeneratingInfographic {
-	                        ProgressView()
-                            .scaleEffect(0.8)
-                    } else {
-                        Image(systemName: "chart.pie")
-                    }
-                }
-                .frame(width: 22, height: 22)
             }
-            .buttonStyle(BatchSummaryGlassIconButtonStyle(isCompact: isBatchResultsCompactLayout))
-            .disabled(viewModel.batchSummaries.isEmpty && viewModel.batchFinalSummary == nil)
-
-            Button(action: {
+            batchToolItem("Whiteboard", "Sketch board", systemImage: "square.grid.3x3",
+                          isBusy: isGeneratingWhiteboard, isDisabled: !hasResults) {
                 generateWhiteboard()
-            }) {
-                Group {
-                    if isGeneratingWhiteboard {
-                        ProgressView()
-                            .scaleEffect(0.8)
-                    } else {
-                        Image(systemName: "square.grid.3x3")
-                    }
-                }
-                .frame(width: 22, height: 22)
             }
-            .buttonStyle(BatchSummaryGlassIconButtonStyle(isCompact: isBatchResultsCompactLayout))
-            .disabled(viewModel.batchSummaries.isEmpty && viewModel.batchFinalSummary == nil)
+#if os(iOS)
+            batchToolItem("Podcast", "Two-host audio", systemImage: "waveform.and.mic",
+                          isDisabled: !hasBatchPodcastEvidence) {
+                openBatchPodcast()
+            }
+#endif
+        }
+        Section("Share") {
+            batchToolItem("Copy All", "Results as text", systemImage: "doc.on.clipboard") {
+                copyBatchResultsToClipboard()
+            }
+        }
+        batchNavigationItems(proxy: proxy)
     }
 
     private func webBatchModeSections(proxy: ScrollViewProxy) -> some View {
@@ -20916,8 +21078,10 @@ struct BatchResultsView: View {
                 webBatchQuestionSection(proxy: proxy)
             }
             webBatchIndividualPostSummariesSection
-            batchBottomControlRow(proxy: proxy)
+            Color.clear
+                .frame(height: 0)
                 .id("batchSummaryBottom")
+                .padding(.bottom, 80)
         }
     }
 
@@ -20934,10 +21098,10 @@ struct BatchResultsView: View {
                 HStack {
                     Image(systemName: "doc.text.magnifyingglass")
                         .font(.title3)
-                        .foregroundColor(.primary)
-                    Text("Subreddit Overview")
-                        .font(.title3)
-                        .fontWeight(.semibold)
+                        .foregroundStyle(RedappDesign.accent)
+                    Text("Subreddit overview")
+                        .font(RedappType.section)
+                        .foregroundStyle(RedappDesign.ink)
                     Spacer()
 
                     Button(action: {
@@ -20962,17 +21126,7 @@ struct BatchResultsView: View {
                     ReadableReplyText(content: finalSummary, fontScale: 0.9, sourceLinks: batchSourceLinks)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .fixedSize(horizontal: false, vertical: true)
-                        .padding()
-                        .background {
-                            if isDarkMode {
-                                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                    .fill(Color.black)
-                            } else {
-                                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                    .fill(.ultraThinMaterial)
-                            }
-                        }
-                        .cornerRadius(12)
+                        .padding(.vertical, 4)
                 }
             }
             .padding(.horizontal)
@@ -21002,10 +21156,10 @@ struct BatchResultsView: View {
                 HStack {
                     Image(systemName: "chart.bar.doc.horizontal")
                         .font(.title3)
-                        .foregroundColor(.primary)
-                    Text("Summary by Topics")
-                        .font(.title3)
-                        .fontWeight(.semibold)
+                        .foregroundStyle(RedappDesign.accent)
+                    Text("Summary by topic")
+                        .font(RedappType.section)
+                        .foregroundStyle(RedappDesign.ink)
                     Spacer()
 
                     Button(action: {
@@ -21032,32 +21186,18 @@ struct BatchResultsView: View {
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding()
-                .background {
-                    if isDarkMode {
-                        RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .fill(Color.black)
-                    } else {
-                        RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .fill(.ultraThinMaterial)
-                    }
-                }
-                .cornerRadius(12)
+                .padding(.vertical, 4)
             }
             .padding(.horizontal)
         }
 
         if let error = batchLLMError {
-            Text(error)
-                .font(.caption)
-                .foregroundColor(.red)
+            RedappInlineMessage(message: error)
                 .padding(.horizontal)
         }
 
         if let error = overallSummaryError {
-            Text(error)
-                .font(.caption)
-                .foregroundColor(.red)
+            RedappInlineMessage(message: error)
                 .padding(.horizontal)
         }
     }
@@ -21065,9 +21205,9 @@ struct BatchResultsView: View {
     private func webBatchQuestionSection(proxy: ScrollViewProxy) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("Ask About This Subreddit")
-                    .font(.title3)
-                    .fontWeight(.semibold)
+                Text("Ask about this subreddit")
+                    .font(RedappType.section)
+                    .foregroundStyle(RedappDesign.ink)
                 Spacer()
             }
 
@@ -21077,7 +21217,7 @@ struct BatchResultsView: View {
                 .frame(height: 0)
                 .id("batchSummaryActionsTop")
 
-            if showBatchSummaryActionsMenu {
+            if infographicError != nil || whiteboardError != nil {
                 webBatchActionRow(proxy: proxy)
                     .transition(.move(edge: .top).combined(with: .opacity))
             }
@@ -21128,32 +21268,18 @@ struct BatchResultsView: View {
                     renderedBatchAnswer(answer)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .fixedSize(horizontal: false, vertical: true)
-                        .padding()
-                        .background {
-                            if isDarkMode {
-                                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                    .fill(Color.black)
-                            } else {
-                                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                    .fill(.ultraThinMaterial)
-                            }
-                        }
-                        .cornerRadius(10)
+                        .padding(.vertical, 4)
                 }
                 .padding(.horizontal)
             }
 
             if let answerError {
-                Text(answerError)
-                    .font(.caption)
-                    .foregroundColor(.red)
+                RedappInlineMessage(message: answerError)
                     .padding(.horizontal)
             }
 
             if let batchError = viewModel.batchError {
-                Text(batchError)
-                    .font(.caption)
-                    .foregroundColor(.red)
+                RedappInlineMessage(message: batchError)
                     .padding(.horizontal)
             }
         }
@@ -21169,9 +21295,9 @@ struct BatchResultsView: View {
                     Image(systemName: "square.stack.3d.up")
                         .font(.title3)
                         .foregroundColor(.secondary)
-                    Text("Individual Post Summaries")
-                        .font(.title3)
-                        .fontWeight(.semibold)
+                    Text("Individual post summaries")
+                        .font(RedappType.section)
+                        .foregroundStyle(RedappDesign.ink)
                     Spacer()
                 }
                 .padding(.horizontal)
@@ -21205,17 +21331,9 @@ struct BatchResultsView: View {
         .padding()
         .frame(maxWidth: .infinity, alignment: .leading)
         .background {
-            if isDarkMode {
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(Color.black)
-            } else {
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(.ultraThinMaterial)
-            }
-        }
-        .overlay {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(AppColors.redditCardBorder, lineWidth: 0.8)
+                .fill(RedappDesign.card)
+                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(RedappDesign.hairline, lineWidth: 1))
         }
         .cornerRadius(10)
         #if os(iOS)
@@ -21228,32 +21346,23 @@ struct BatchResultsView: View {
     @ViewBuilder
     private func webBatchActionRow(proxy: ScrollViewProxy) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            if isBatchResultsCompactLayout {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    batchSummaryGlassToolbar {
-                        webBatchActionButtons(proxy: proxy)
-                    }
-                    .padding(.horizontal, 0)
-                    .padding(.vertical, 2)
+            if !hasBatchQuestionContext {
+                HStack {
+                    batchToolsMenu(proxy: proxy)
+                    Spacer()
                 }
-            } else {
-                batchSummaryGlassToolbar {
-                    webBatchActionButtons(proxy: proxy)
-                }
-                .padding(.horizontal)
+                #if os(iOS)
+                .padding(.horizontal, isBatchResultsCompactLayout ? 16 : 0)
+                #endif
             }
 
             if let infographicError {
-                Text(infographicError)
-                    .font(.caption)
-                    .foregroundColor(.red)
+                RedappInlineMessage(message: infographicError)
                     .padding(.horizontal)
             }
 
             if let whiteboardError {
-                Text(whiteboardError)
-                    .font(.caption)
-                    .foregroundColor(.red)
+                RedappInlineMessage(message: whiteboardError)
                     .padding(.horizontal)
             }
         }
@@ -21261,104 +21370,30 @@ struct BatchResultsView: View {
 
     @ViewBuilder
     private func webBatchActionButtons(proxy: ScrollViewProxy) -> some View {
-        Button(action: openWebOverallSummary) {
-            Group {
-                if viewModel.isGeneratingBatchOverallSummary {
-                    ProgressView()
-                        .scaleEffect(0.8)
-                } else {
-                    Image(systemName: "sparkles")
-                }
-            }
-            .frame(width: 22, height: 22)
+        let noPosts = viewModel.batchExtractedPosts.isEmpty
+        Section("Create on \(summaryService.settings.selectedWebAIProvider.displayName)") {
+            batchToolItem("Deep Summary", "Full analysis", systemImage: "sparkles",
+                          isBusy: viewModel.isGeneratingBatchOverallSummary, isDisabled: noPosts, action: openWebOverallSummary)
+            batchToolItem("Themed Summary", "Grouped by theme", systemImage: "paperplane",
+                          isBusy: isSendingBatchResultsToLLM, isDisabled: noPosts, action: openWebCategorizedSummary)
+            batchToolItem("Table", "Themes and examples", systemImage: "tablecells",
+                          isBusy: isGeneratingOverallSummary, isDisabled: noPosts, action: openWebTableSummary)
+            batchToolItem("Infographic", "Visual one-pager", systemImage: "chart.pie",
+                          isBusy: isGeneratingInfographic, isDisabled: noPosts, action: openWebInfographic)
+            batchToolItem("Whiteboard", "Sketch board", systemImage: "square.grid.3x3",
+                          isBusy: isGeneratingWhiteboard, isDisabled: noPosts, action: openWebWhiteboard)
+#if os(iOS)
+            batchToolItem("Podcast", "Two-host audio", systemImage: "waveform.and.mic",
+                          isDisabled: !hasBatchPodcastEvidence, action: openBatchPodcast)
+#endif
         }
-        .buttonStyle(BatchSummaryGlassIconButtonStyle(isCompact: isBatchResultsCompactLayout))
-        .disabled(viewModel.isGeneratingBatchOverallSummary || viewModel.batchExtractedPosts.isEmpty)
-
-        Button(action: openWebTableSummary) {
-            Group {
-                if isGeneratingOverallSummary {
-                    ProgressView()
-                        .scaleEffect(0.8)
-                } else {
-                    Image(systemName: "tablecells")
-                }
-            }
-            .frame(width: 22, height: 22)
+        Section("Share") {
+            batchToolItem("Copy All", "Results as text", systemImage: "doc.on.clipboard", action: copyBatchResultsToClipboard)
         }
-        .buttonStyle(BatchSummaryGlassIconButtonStyle(isCompact: isBatchResultsCompactLayout))
-        .disabled(isGeneratingOverallSummary || viewModel.batchExtractedPosts.isEmpty)
-
-        Button(action: copyBatchResultsToClipboard) {
-            Image(systemName: "doc.on.clipboard")
-                .frame(width: 22, height: 22)
-        }
-        .buttonStyle(BatchSummaryGlassIconButtonStyle(isCompact: isBatchResultsCompactLayout))
-
-        Button(action: openWebCategorizedSummary) {
-            Group {
-                if isSendingBatchResultsToLLM {
-                    ProgressView()
-                        .scaleEffect(0.8)
-                } else {
-                    Image(systemName: "paperplane")
-                }
-            }
-            .frame(width: 22, height: 22)
-        }
-        .buttonStyle(BatchSummaryGlassIconButtonStyle(isCompact: isBatchResultsCompactLayout))
-        .disabled(isSendingBatchResultsToLLM || viewModel.batchExtractedPosts.isEmpty)
-
-        Button(action: {
-            withAnimation(.easeInOut(duration: 0.5)) {
-                proxy.scrollTo("batchSummaryBottom", anchor: .bottom)
-            }
-        }) {
-            Image(systemName: "arrow.down.circle")
-                .frame(width: 22, height: 22)
-        }
-        .buttonStyle(BatchSummaryGlassIconButtonStyle(isCompact: isBatchResultsCompactLayout))
-
-        Button(action: {
-            withAnimation(.easeInOut(duration: 0.5)) {
-                proxy.scrollTo("topSection", anchor: .top)
-            }
-        }) {
-            Image(systemName: "arrow.up.circle")
-                .frame(width: 22, height: 22)
-        }
-        .buttonStyle(BatchSummaryGlassIconButtonStyle(isCompact: isBatchResultsCompactLayout))
-
-        Button(action: openWebInfographic) {
-            Group {
-                if isGeneratingInfographic {
-                    ProgressView()
-                        .scaleEffect(0.8)
-                } else {
-                    Image(systemName: "chart.pie")
-                }
-            }
-            .frame(width: 22, height: 22)
-        }
-        .buttonStyle(BatchSummaryGlassIconButtonStyle(isCompact: isBatchResultsCompactLayout))
-        .disabled(isGeneratingInfographic || viewModel.batchExtractedPosts.isEmpty)
-
-        Button(action: openWebWhiteboard) {
-            Group {
-                if isGeneratingWhiteboard {
-                    ProgressView()
-                        .scaleEffect(0.8)
-                } else {
-                    Image(systemName: "square.grid.3x3")
-                }
-            }
-            .frame(width: 22, height: 22)
-        }
-        .buttonStyle(BatchSummaryGlassIconButtonStyle(isCompact: isBatchResultsCompactLayout))
-        .disabled(isGeneratingWhiteboard || viewModel.batchExtractedPosts.isEmpty)
+        batchNavigationItems(proxy: proxy)
     }
     
-	    private func buildBatchResultsContent() -> String {
+    private func buildBatchResultsContent() -> String {
 	        if isWebBatchMode {
 	            var text = "## Subreddit Overview\n\n"
                 if let finalSummary = viewModel.batchFinalSummary?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -21760,6 +21795,7 @@ struct BatchResultsView: View {
             case .webAI: return "Web AI"
             case .summarizeDaemon: return "Codex/Summarize"
             case .applePCCGateway: return "Apple PCC Gateway"
+            case .chatGPT: return "ChatGPT"
             }
         }()
         if state.tokens == 0 && !state.isFinal {
@@ -21994,7 +22030,7 @@ struct BatchResultsView: View {
                     ForEach(Array(table.headers.enumerated()), id: \.offset) { index, header in
                         SelectableText(header)
                             .font(.subheadline)
-                            .fontWeight(.semibold)
+                            .textWeight(.semibold)
                             .frame(minWidth: 170, alignment: .leading)
                             .padding(.horizontal, 10)
                             .padding(.vertical, 10)
@@ -22362,16 +22398,15 @@ struct BatchResultsView: View {
         answerGenerationTask = Task {
             do {
                 let fetchedAnswer: String
-                if !viewModel.batchCapturedSources.isEmpty {
-                    fetchedAnswer = try await groundedBatchAnswer(for: questionToAsk)
-                } else {
-                    fetchedAnswer = try await fetchAskQuestionAnswer(
-                        for: questionToAsk,
-                        onPartial: { token in
-                            self.answer = (self.answer ?? "") + token
-                        }
-                    )
-                }
+                // Plain answer from the same content the summaries use (overview +
+                // post summaries). Fact-checked, source-linked reports stay in the
+                // Research Library.
+                fetchedAnswer = try await fetchAskQuestionAnswer(
+                    for: questionToAsk,
+                    onPartial: { token in
+                        self.answer = (self.answer ?? "") + token
+                    }
+                )
                 await MainActor.run {
                     self.answer = SummaryService.shared.settings.selectedSummaryProvider == .applePCCGateway
                         ? QuestionAnswerTextFormatter.displayText(from: fetchedAnswer)
@@ -22456,8 +22491,7 @@ struct BatchResultsView: View {
                                         Button(citation.sourceID) {
                                             selectedGroundedAnswerSource = source
                                         }
-                                        .buttonStyle(.bordered)
-                                        .controlSize(.small)
+                                        .buttonStyle(RedappChipButtonStyle())
                                         .accessibilityLabel("Open supporting source \(citation.sourceID)")
                                     }
                                 }
@@ -22474,9 +22508,7 @@ struct BatchResultsView: View {
                                             Button(sourceID) {
                                                 selectedGroundedAnswerSource = source
                                             }
-                                            .buttonStyle(.bordered)
-                                            .controlSize(.small)
-                                            .tint(.orange)
+                                            .buttonStyle(RedappChipButtonStyle(isFilled: false))
                                         }
                                     }
                                 }
@@ -24149,13 +24181,16 @@ struct BatchResultsView: View {
 // MARK: - Basic Table Cell
 struct BasicTableCell: View {
     let text: String
+    var isEmphasized = false
     
     var body: some View {
         SelectableText(text)
-            .font(.body)
+            .font(.subheadline)
+            .textWeight(isEmphasized ? .semibold : nil)
+            .foregroundColor(RedappDesign.ink)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 12)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 14)
     }
 }
 
@@ -24165,14 +24200,15 @@ struct HeaderTableCell: View {
     
     var body: some View {
         HStack {
-            SelectableText(text)
-                .font(.headline)
-                .foregroundColor(.white)
+            Text(text.uppercased())
+                .font(RedappType.eyebrow)
+                .tracking(0.8)
+                .foregroundStyle(RedappDesign.inkSecondary)
             Spacer()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 16)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
     }
 }
 
@@ -24192,9 +24228,8 @@ struct ExampleLink: View {
                 openURL(url)
             } label: {
                 Text(example.title)
-                    .font(.body)
-                    .foregroundColor(.blue)
-                    .underline()
+                    .font(.subheadline.weight(.medium))
+                    .foregroundColor(RedappDesign.accent)
                     .lineLimit(nil)
                     .multilineTextAlignment(.leading)
                     .fixedSize(horizontal: false, vertical: true)
@@ -24240,8 +24275,8 @@ struct ExampleLink: View {
             #endif
         } else {
             SelectableText(example.title)
-                .font(.body)
-                .foregroundColor(.secondary)
+                .font(.subheadline)
+                .foregroundColor(RedappDesign.inkSecondary)
                 .lineLimit(nil)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -24261,8 +24296,8 @@ struct ExamplesColumnView: View {
             
             if examples.isEmpty {
                 SelectableText("No examples")
-                    .font(.body)
-                    .foregroundColor(.secondary)
+                    .font(.subheadline)
+                    .foregroundColor(RedappDesign.inkTertiary)
             }
         }
     }
@@ -24276,48 +24311,31 @@ struct TableRowView: View {
     var body: some View {
         if useCompactLayout {
             // iPhone layout - vertical card
-            VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 14) {
                 // Subject Category as card title
                 Text(row.subject)
                     .font(.headline)
-                    .foregroundColor(.primary)
-                    .padding(.horizontal)
-                    .padding(.top)
-                
-                Divider()
-                    .padding(.horizontal)
-                
-                // Key Topics & Themes
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Key Topics & Themes")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .textCase(.uppercase)
+                    .foregroundStyle(RedappDesign.ink)
+
+                Rectangle()
+                    .fill(RedappDesign.hairline)
+                    .frame(height: 1)
+
+                compactField("Key topics & themes") {
                     SelectableText(row.topics)
-                        .font(.body)
+                        .font(.subheadline)
+                        .foregroundColor(RedappDesign.ink)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                .padding(.horizontal)
-                
-                // Common Challenges
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Common Challenges")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .textCase(.uppercase)
+
+                compactField("Common challenges") {
                     SelectableText(row.challenges)
-                        .font(.body)
+                        .font(.subheadline)
+                        .foregroundColor(RedappDesign.ink)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                .padding(.horizontal)
-                
-                // Examples
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Examples")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .textCase(.uppercase)
-                    
+
+                compactField("Examples") {
                     if !row.examples.isEmpty {
                         VStack(alignment: .leading, spacing: 8) {
                             ForEach(row.examples) { example in
@@ -24326,28 +24344,32 @@ struct TableRowView: View {
                         }
                     } else {
                         SelectableText("No examples")
-                            .font(.body)
-                            .foregroundColor(.secondary)
+                            .font(.subheadline)
+                            .foregroundColor(RedappDesign.inkTertiary)
                     }
                 }
-                .padding(.horizontal)
-                .padding(.bottom)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color.secondary.opacity(0.05))
-            .cornerRadius(12)
+            .redappCard()
         } else {
             // iPad/Mac layout - horizontal table
             HStack(alignment: .top, spacing: 0) {
-                BasicTableCell(text: row.subject)
-                Divider()
+                BasicTableCell(text: row.subject, isEmphasized: true)
+                RedappTableRule(axis: .vertical)
                 BasicTableCell(text: row.topics)
-                Divider()
+                RedappTableRule(axis: .vertical)
                 BasicTableCell(text: row.challenges)
-                Divider()
+                RedappTableRule(axis: .vertical)
                 ExamplesColumnCell(examples: row.examples)
             }
             .frame(maxWidth: .infinity)
+        }
+    }
+
+    private func compactField<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            RedappEyebrow(title)
+            content()
         }
     }
 }
@@ -24361,8 +24383,8 @@ struct ExamplesColumnCell: View {
             VStack(alignment: .leading, spacing: 8) {
                 if examples.isEmpty {
                     SelectableText("No examples")
-                        .font(.body)
-                        .foregroundColor(.secondary)
+                        .font(.subheadline)
+                        .foregroundColor(RedappDesign.inkTertiary)
                 } else {
                     ForEach(examples) { example in
                         ExampleLink(example: example)
@@ -24373,8 +24395,8 @@ struct ExamplesColumnCell: View {
             .padding(.vertical, 8)
         }
         .frame(maxWidth: .infinity, minHeight: 80, alignment: .topLeading)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 12)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 6)
         #if os(iOS)
         .scrollBounceBehavior(.basedOnSize)
         #endif
@@ -24387,9 +24409,11 @@ struct TableHeaderView: View {
     let onScrollToBottom: (() -> Void)?
     
     var body: some View {
-        HStack {
-            TableHeaderIcon()
-            TableHeaderTitle()
+        HStack(alignment: .bottom, spacing: 12) {
+            VStack(alignment: .leading, spacing: 6) {
+                RedappEyebrow("Table summary")
+                TableHeaderTitle()
+            }
             Spacer()
             TableHeaderCopyButton(onCopyAction: onCopyAction)
             TableHeaderScrollDownButton(onScrollToBottom: onScrollToBottom ?? {})
@@ -24402,16 +24426,16 @@ struct TableHeaderView: View {
 struct TableHeaderIcon: View {
     var body: some View {
         Image(systemName: "tablecells")
-            .font(.title2)
-            .foregroundColor(.primary)
+            .font(.title3)
+            .foregroundStyle(RedappDesign.accent)
     }
 }
 
 struct TableHeaderTitle: View {
     var body: some View {
-        Text("Overall Summary (Table Format)")
-            .font(.title2)
-            .fontWeight(.bold)
+        Text("Themes, challenges and examples")
+            .font(RedappType.display)
+            .foregroundStyle(RedappDesign.ink)
     }
 }
 
@@ -24420,11 +24444,9 @@ struct TableHeaderCopyButton: View {
     
     var body: some View {
         Button(action: onCopyAction) {
-            Image(systemName: "doc.on.doc")
-                .font(.title2)
-                .foregroundColor(.primary)
+            Label("Copy", systemImage: "doc.on.doc")
         }
-        .buttonStyle(PlainButtonStyle())
+        .buttonStyle(RedappSecondaryButtonStyle())
         #if os(macOS)
         .help("Copy table")
         #endif
@@ -24436,10 +24458,10 @@ struct TableHeaderScrollDownButton: View {
     
     var body: some View {
         Button(action: onScrollToBottom) {
-            Image(systemName: "arrow.down.circle")
+            Image(systemName: "arrow.down")
         }
-        .buttonStyle(LiquidGlassButtonStyle(isProminent: true))
-        .padding(.leading, 8)
+        .buttonStyle(BatchSummaryStandaloneGlassButtonStyle())
+        .accessibilityLabel("Scroll to bottom")
         #if os(macOS)
         .help("Scroll to bottom")
         #endif
@@ -24486,23 +24508,23 @@ struct TableContainer: View {
     var body: some View {
         Group {
             if shouldUseCompactLayout {
-                VStack(alignment: .leading, spacing: 16) {
+                VStack(alignment: .leading, spacing: 12) {
                     TableDataRows(tableData: tableData, useCompactLayout: true)
                 }
-                .padding(.horizontal)
+                .padding(.horizontal, 16)
             } else {
                 VStack(alignment: .leading, spacing: 0) {
                     TableHeaderRow()
-                    Divider()
+                    RedappTableRule(axis: .horizontal)
                     TableDataRows(tableData: tableData, useCompactLayout: false)
                 }
-                .padding()
-                .background(.ultraThinMaterial)
-                .clipShape(RoundedRectangle(cornerRadius: 12))
+                .background(RedappDesign.card)
+                .clipShape(RoundedRectangle(cornerRadius: RedappDesign.Radius.large, style: .continuous))
                 .overlay(
-                    RoundedRectangle(cornerRadius: 12)
-                        .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
+                    RoundedRectangle(cornerRadius: RedappDesign.Radius.large, style: .continuous)
+                        .strokeBorder(RedappDesign.hairline, lineWidth: 1)
                 )
+                .padding(.horizontal, 24)
             }
         }
         .background(
@@ -24536,10 +24558,21 @@ private struct TableWidthPreferenceKey: PreferenceKey {
     }
 }
 
+/// 1pt hairline used between table cells and rows.
+struct RedappTableRule: View {
+    let axis: Axis
+
+    var body: some View {
+        Rectangle()
+            .fill(RedappDesign.hairline)
+            .frame(width: axis == .vertical ? 1 : nil, height: axis == .horizontal ? 1 : nil)
+    }
+}
+
 // MARK: - Table Header Row
 struct TableHeaderRow: View {
     var body: some View {
-        let dividerColor = Color.white.opacity(0.25)
+        let dividerColor = RedappDesign.hairline
         
         return HStack(spacing: 0) {
             HeaderTableCell(text: "Subject Category")
@@ -24551,31 +24584,7 @@ struct TableHeaderRow: View {
             HeaderTableCell(text: "Examples")
         }
         .frame(maxWidth: .infinity)
-        .background(
-            ZStack {
-                LinearGradient(
-                    gradient: Gradient(colors: [
-                        Color(red: 0.11, green: 0.57, blue: 0.72),
-                        Color(red: 0.07, green: 0.42, blue: 0.69)
-                    ]),
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
-                LinearGradient(
-                    gradient: Gradient(colors: [
-                        Color.white.opacity(0.20),
-                        Color.clear
-                    ]),
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-            }
-        )
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(Color.white.opacity(0.18), lineWidth: 0.7)
-        )
+        .background(RedappDesign.elevated)
     }
     
     private func headerDivider(color: Color) -> some View {
@@ -24604,7 +24613,7 @@ struct TableDataRows: View {
                 TableRowView(row: row, useCompactLayout: false)
                 
                 if row.id != tableData.last?.id {
-                    Divider()
+                    RedappTableRule(axis: .horizontal)
                 }
             }
         }
@@ -24615,10 +24624,10 @@ struct TableDataRows: View {
 struct EmptyTableView: View {
     var body: some View {
         SelectableText("No data available")
-            .foregroundColor(.secondary)
-            .padding()
-            .background(.ultraThinMaterial)
-            .cornerRadius(12)
+            .foregroundColor(RedappDesign.inkSecondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .redappCard()
+            .padding(.horizontal, 24)
             .onAppear {
                 print("DEBUG: No table data available")
             }
@@ -24698,43 +24707,35 @@ struct TableNavigationContainer: View {
                         VStack(alignment: .leading, spacing: 20) {
                             // Table content section
                             VStack(alignment: .leading, spacing: 12) {
-                                HStack {
-                                    Image(systemName: "tablecells")
-                                        .font(.title2)
-                                        .foregroundColor(.primary)
-                                        #if os(iOS)
-                                        .padding(.leading, UIDevice.current.userInterfaceIdiom == .pad ? 16 : 0)
-                                        #endif
-                                    Text("Overall Summary (Table Format)")
-                                        .font(.title2)
-                                        .fontWeight(.bold)
-                                    Spacer()
-                                    
-                                    Button(action: onCopyAction) {
-                                        Image(systemName: "doc.on.doc")
-                                            .font(.title2)
-                                            .foregroundColor(.primary)
+                                HStack(alignment: .bottom, spacing: 12) {
+                                    VStack(alignment: .leading, spacing: 6) {
+                                        RedappEyebrow("Table summary")
+                                        Text("Themes, challenges and examples")
+                                            .font(RedappType.display)
+                                            .foregroundStyle(RedappDesign.ink)
                                     }
-                                    .buttonStyle(PlainButtonStyle())
+                                    Spacer()
+
+                                    Button(action: onCopyAction) {
+                                        Label("Copy", systemImage: "doc.on.doc")
+                                    }
+                                    .buttonStyle(RedappSecondaryButtonStyle())
                                     #if os(macOS)
                                     .help("Copy table")
                                     #endif
-                                    
+
                                     Button(action: {
                                         withAnimation(.easeInOut(duration: 0.5)) {
                                             proxy.scrollTo("bottomSection", anchor: .bottom)
                                         }
                                     }) {
-                                        Image(systemName: "arrow.down.circle")
+                                        Image(systemName: "arrow.down")
                                     }
-                                    .buttonStyle(LiquidGlassButtonStyle(isProminent: true))
-                                    .padding(.leading, 8)
-                                    #if os(macOS)
-                                    .help("Scroll to bottom")
-                                    #elseif os(iOS)
-                                    .padding(.trailing, UIDevice.current.userInterfaceIdiom == .pad ? 16 : 0)
-                                    #endif
+                                    .buttonStyle(BatchSummaryStandaloneGlassButtonStyle())
+                                    .accessibilityLabel("Scroll to bottom")
                                 }
+                                .padding(.horizontal, 24)
+                                .padding(.top, 8)
                                 .id("topSection")
                                 
                                 TableContentView(tableData: tableData)
@@ -24748,9 +24749,9 @@ struct TableNavigationContainer: View {
                                         proxy.scrollTo("topSection", anchor: .top)
                                     }
                                 }) {
-                                    Image(systemName: "arrow.up.circle")
+                                    Label("Back to top", systemImage: "arrow.up")
                                 }
-                                .buttonStyle(LiquidGlassButtonStyle(isProminent: true))
+                                .buttonStyle(RedappSecondaryButtonStyle())
                                 Spacer()
                             }
                             .padding(.horizontal)
@@ -24954,19 +24955,12 @@ private struct BatchResultsOverlay: View {
 
                 if isMinimized && !isPresented && viewModel.canRestoreBatchResults {
                     Button(action: restore) {
-                        Image(systemName: "tablecells")
-                            .font(.system(size: 20, weight: .semibold))
-                            .foregroundColor(.white)
-                            .padding(14)
+                        Label("Batch Results", systemImage: "rectangle.stack.fill")
                     }
-                    .background(Color.black)
-                    .clipShape(Circle())
-                    .overlay(
-                        Circle().stroke(Color.white.opacity(0.18), lineWidth: 0.8)
-                    )
-                    .padding(.trailing, 16)
+                    .buttonStyle(RedappPrimaryButtonStyle(isCapsule: true))
+                    .shadow(color: Color.black.opacity(0.18), radius: 8, x: 0, y: 4)
+                    .padding(.trailing, 24)
                     .padding(.bottom, 28)
-                    .shadow(color: Color.black.opacity(0.25), radius: 6, x: 0, y: 4)
                     .transition(.scale.combined(with: .opacity))
                     .accessibilityLabel("Show batch summary results")
                 }
@@ -25017,172 +25011,35 @@ private struct BatchResultsOverlay: View {
 }
 #endif
 
-// MARK: - Root Glass Chassis
-#if os(iOS)
-private struct AppGlassChassis<Content: View>: View {
-    @Environment(\.colorScheme) private var colorScheme
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-    @AppStorage("experimentalSettingsGlassEnabled") private var experimentalAppGlassEnabled = true
-
-    private let content: Content
-    private let safeAreaInsets: EdgeInsets
-    private let horizontalOuterInset: CGFloat = 3
-    private let rimWidth: CGFloat = 9
-    private let maximumContainerBottomInset: CGFloat = 34
-
-    init(safeAreaInsets: EdgeInsets, @ViewBuilder content: () -> Content) {
-        self.safeAreaInsets = safeAreaInsets
-        self.content = content()
-    }
-
-    var body: some View {
-        ZStack {
-            chassisSurface
-
-            content
-                .padding(.top, safeAreaInsets.top)
-                // GeometryProxy includes the software keyboard in its bottom
-                // safe-area inset. The chassis already continues to respect the
-                // keyboard region, so only restore the permanent window inset.
-                .padding(.bottom, min(safeAreaInsets.bottom, maximumContainerBottomInset))
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(experimentalAppGlassEnabled ? Color.black : Color(uiColor: .systemBackground))
-                .clipShape(innerShape)
-                .overlay {
-                    innerShape
-                        .strokeBorder(
-                            LinearGradient(
-                                colors: [
-                                    Color.white.opacity(colorScheme == .dark ? 0.38 : 0.62),
-                                    Color.white.opacity(0.08),
-                                    Color.black.opacity(colorScheme == .dark ? 0.78 : 0.30)
-                                ],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            ),
-                            lineWidth: 1
-                        )
-                }
-                .padding(rimWidth)
-        }
-        .padding(.horizontal, horizontalOuterInset)
-        .ignoresSafeArea(.container, edges: .vertical)
-        .background {
-            if reduceTransparency {
-                Color(uiColor: .systemBackground)
-            } else {
-                Color.clear
-            }
-        }
-    }
-
-    private var outerShape: ContainerRelativeShape {
-        ContainerRelativeShape()
-    }
-
-    private var innerShape: ContainerRelativeShape {
-        ContainerRelativeShape()
-    }
-
-    @ViewBuilder
-    private var chassisSurface: some View {
-        if reduceTransparency {
-            outerShape
-                .fill(Color(uiColor: .secondarySystemBackground))
-                .overlay { chassisHighlights }
-        } else if #available(iOS 26.0, *) {
-            outerShape
-                .fill(Color.white.opacity(0.012))
-                .glassEffect(
-                    .clear.tint(Color.white.opacity(colorScheme == .dark ? 0.24 : 0.34)),
-                    in: outerShape
-                )
-                .overlay { chassisHighlights }
-                .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.34 : 0.16), radius: 10, y: 3)
-        } else {
-            outerShape
-                .fill(.ultraThinMaterial)
-                .overlay { chassisHighlights }
-                .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.34 : 0.16), radius: 10, y: 3)
-        }
-    }
-
-    private var chassisHighlights: some View {
-        outerShape
-            .strokeBorder(
-                LinearGradient(
-                    colors: [
-                        Color.white.opacity(colorScheme == .dark ? 0.96 : 0.88),
-                        Color.white.opacity(0.28),
-                        Color.white.opacity(0.64),
-                        Color.black.opacity(colorScheme == .dark ? 0.24 : 0.10)
-                    ],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                ),
-                lineWidth: 1.4
-            )
-            .overlay {
-                outerShape
-                    .strokeBorder(
-                        LinearGradient(
-                            colors: [
-                                Color.white.opacity(colorScheme == .dark ? 0.42 : 0.56),
-                                Color.white.opacity(0.10),
-                                Color.white.opacity(colorScheme == .dark ? 0.30 : 0.44),
-                                Color.clear
-                            ],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        ),
-                        lineWidth: rimWidth
-                    )
-                    .blendMode(.screen)
-            }
-            .overlay {
-                outerShape
-                    .inset(by: rimWidth - 1)
-                    .strokeBorder(
-                        LinearGradient(
-                            colors: [
-                                Color.white.opacity(colorScheme == .dark ? 0.56 : 0.72),
-                                Color.white.opacity(0.10),
-                                Color.black.opacity(colorScheme == .dark ? 0.62 : 0.22)
-                            ],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        ),
-                        lineWidth: 1
-                    )
-            }
-    }
-}
-#endif
 
 // MARK: - Main View
 struct ContentView: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var comparisonJobs = ResearchComparisonGenerationCoordinator.shared
+    @ObservedObject private var savedPosts = SavedPostsStore.shared
     @State private var subreddit: String = "SwiftUI"
     @State private var selectedPost: SubredditPostData?
     @StateObject private var viewModel = RedditSubredditViewModel()
+    @State private var section: RedappSection = .browse
+    @State private var selectedResearchItemID: UUID?
     @State private var showSettings = false
     @State private var showCreatePost = false
-    @State private var showResearchLibrary = false
-    @State private var isResearchLibraryMinimized = false
-    @State private var isResearchLibraryExplicitlyClosing = false
     @State private var hiddenResearchComparisonStatusIDs = Set<String>()
     @State private var comparisonToResume: ResearchComparisonGenerationState?
     @State private var researchLibraryNavigationPath = NavigationPath()
-    @State private var sidebarOverlayHeight: CGFloat = 180
-    @State private var isSidebarScrolling = false
-    @State private var sidebarScrollRevealTask: Task<Void, Never>? = nil
     @State private var isBatchResultsMinimized = false
-    @State private var columnVisibility: NavigationSplitViewVisibility = .automatic
+    /// "Done" on results shown in the reader column hides them until the next batch.
+    @State private var isReaderBatchResultsDismissed = false
+    @State private var columnVisibility: NavigationSplitViewVisibility = .all
+    @State private var preferredCompactColumn: NavigationSplitViewColumn = .detail
     @State private var currentLayoutIsCompact = false
-    @AppStorage("experimentalSettingsGlassEnabled") private var experimentalAppGlassEnabled = true
-    @AppStorage("experimentalSettingsGlassVariant") private var experimentalAppGlassVariant = 11
+    @Environment(\.horizontalSizeClass) private var shellSizeClass
+    /// True whenever the split view shows one column at a time: iPhone, and iPad
+    /// in a narrow window (iPadOS collapses by size class, not by our width rule).
+    private var isSingleColumnLayout: Bool {
+        currentLayoutIsCompact || shellSizeClass == .compact
+    }
     @FocusState private var sidebarFocusedField: SidebarControls.Field?
 
     private func shouldUseCompactLayout(for width: CGFloat) -> Bool {
@@ -25200,13 +25057,19 @@ struct ContentView: View {
         colorScheme == .dark
     }
 
+    /// Whether the navigation sidebar is currently off screen, so feature
+    /// headers show a button to bring it back.
+    private var isSidebarHidden: Bool {
+        isSingleColumnLayout || columnVisibility == .detailOnly
+    }
+
     @ViewBuilder
     private func comparisonStatusIndicator(for job: ResearchComparisonGenerationState) -> some View {
         switch job.phase {
         case .running:
             ProgressView()
                 .controlSize(.small)
-                .tint(.blue)
+                .tint(RedappDesign.accent)
         case .completed:
             Image(systemName: "checkmark.circle.fill")
                 .foregroundStyle(.green)
@@ -25220,7 +25083,7 @@ struct ContentView: View {
         for phase: ResearchComparisonGenerationState.Phase
     ) -> Color {
         switch phase {
-        case .running: return .blue
+        case .running: return RedappDesign.accent
         case .completed: return .green
         case .failed: return .orange
         }
@@ -25234,108 +25097,14 @@ struct ContentView: View {
         }
     }
 
-#if os(iOS)
-    private func restoreMinimizedResearchLibrary() {
-        comparisonToResume = nil
-        isResearchLibraryMinimized = false
-        showResearchLibrary = true
-    }
-
-    private func closeMinimizedResearchLibrary() {
-        isResearchLibraryMinimized = false
-        researchLibraryNavigationPath = NavigationPath()
-    }
-
-    private var minimizedResearchLibraryLabel: some View {
-        HStack(spacing: 12) {
-            Image(systemName: "books.vertical.fill")
-                .foregroundStyle(.primary)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Research Library")
-                    .font(.subheadline.weight(.semibold))
-                Text("Minimized — tap to return")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Image(systemName: "chevron.up")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-        }
-    }
-
-    @ViewBuilder
-    private var minimizedResearchLibraryControls: some View {
-        if #available(iOS 26.0, *) {
-            GlassEffectContainer(spacing: 9) {
-                HStack(spacing: 9) {
-                    Button(action: restoreMinimizedResearchLibrary) {
-                        minimizedResearchLibraryLabel
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 11)
-                            .contentShape(Capsule())
-                            .glassEffect(
-                                .regular.interactive(),
-                                in: .capsule
-                            )
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Restore Research Library")
-                    .accessibilityHint("Returns to the minimized Research Library")
-
-                    Button(action: closeMinimizedResearchLibrary) {
-                        Image(systemName: "xmark")
-                            .font(.caption.weight(.bold))
-                            .frame(width: 44, height: 44)
-                            .contentShape(Circle())
-                            .glassEffect(.regular.interactive(), in: .circle)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Close minimized Research Library")
-                }
-            }
-        } else {
-            HStack(spacing: 9) {
-                Button(action: restoreMinimizedResearchLibrary) {
-                    minimizedResearchLibraryLabel
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 11)
-                        .background(.regularMaterial, in: Capsule())
-                        .overlay {
-                            Capsule()
-                                .stroke(Color.primary.opacity(0.16), lineWidth: 1)
-                        }
-                        .shadow(color: .black.opacity(0.18), radius: 14, y: 7)
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Restore Research Library")
-                .accessibilityHint("Returns to the minimized Research Library")
-
-                Button(action: closeMinimizedResearchLibrary) {
-                    Image(systemName: "xmark")
-                        .font(.caption.weight(.bold))
-                        .frame(width: 32, height: 32)
-                        .background(.regularMaterial, in: Circle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Close minimized Research Library")
-            }
-        }
-    }
-#endif
-
     var body: some View {
-        ZStack {
-            if experimentalAppGlassEnabled {
-                ExperimentalAppGlassBackdrop(variant: experimentalAppGlassVariant)
-            }
+        GeometryReader { geometry in
+            let useCompactLayout = shouldUseCompactLayout(for: geometry.size.width)
+            ZStack {
+                shell
+                    .modifier(shellPresentations)
 
-            GeometryReader { geometry in
-                let useCompactLayout = shouldUseCompactLayout(for: geometry.size.width)
-                appSurface(safeAreaInsets: geometry.safeAreaInsets) {
-                    ZStack {
-                    splitView(isCompactLayout: useCompactLayout)
-                
-                    if viewModel.showBatchResults || (isBatchResultsMinimized && viewModel.canRestoreBatchResults) {
+                if viewModel.showBatchResults || (isBatchResultsMinimized && viewModel.canRestoreBatchResults) {
                     BatchResultsOverlay(
                         viewModel: viewModel,
                         isPresented: Binding(
@@ -25347,230 +25116,371 @@ struct ContentView: View {
                     )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .clipped()
-                    }
-
-                    if !showResearchLibrary {
-                    if let job = comparisonJobs.latestStatusJob,
-                       !hiddenResearchComparisonStatusIDs.contains(job.id) {
-                        VStack {
-                            Spacer()
-                            HStack(spacing: 9) {
-                                Spacer()
-                                Button {
-                                    researchLibraryNavigationPath = NavigationPath()
-                                    comparisonToResume = job
-                                    isResearchLibraryMinimized = false
-                                    showResearchLibrary = true
-                                } label: {
-                                    HStack(spacing: 12) {
-                                        comparisonStatusIndicator(for: job)
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            Text(job.title)
-                                                .font(.subheadline.weight(.semibold))
-                                                .lineLimit(1)
-                                            Text(comparisonStatusSubtitle(for: job))
-                                                .font(.caption)
-                                                .foregroundStyle(.secondary)
-                                                .lineLimit(1)
-                                        }
-                                        Image(systemName: "chevron.up")
-                                            .font(.caption.weight(.semibold))
-                                            .foregroundStyle(.secondary)
-                                    }
-                                    .padding(.horizontal, 16)
-                                    .padding(.vertical, 11)
-                                    .frame(maxWidth: 340, alignment: .leading)
-                                    .background(.regularMaterial, in: Capsule())
-                                    .overlay {
-                                        Capsule()
-                                            .stroke(comparisonStatusColor(for: job.phase).opacity(0.8), lineWidth: 1.5)
-                                    }
-                                    .shadow(color: .black.opacity(0.18), radius: 14, y: 7)
-                                }
-                                .buttonStyle(.plain)
-                                .accessibilityLabel("Return to \(job.title)")
-                                .accessibilityHint(job.status)
-                                Button {
-                                    hiddenResearchComparisonStatusIDs.insert(job.id)
-                                    isResearchLibraryMinimized = false
-                                    researchLibraryNavigationPath = NavigationPath()
-                                    if job.phase != .running {
-                                        comparisonJobs.dismissStatus(key: job.id)
-                                    }
-                                } label: {
-                                    Image(systemName: "xmark")
-                                        .font(.caption.weight(.bold))
-                                        .frame(width: 32, height: 32)
-                                        .background(.regularMaterial, in: Circle())
-                                }
-                                .buttonStyle(.plain)
-                                .accessibilityLabel("Close minimized Research Library")
-                                .accessibilityHint(
-                                    job.phase == .running
-                                        ? "Hides this pill while the comparison continues in the background"
-                                        : "Hides this pill"
-                                )
-                            }
-                        }
-                        .padding(.trailing, 24)
-                        .padding(.bottom, 96)
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
-                        .zIndex(30)
-                    } else if isResearchLibraryMinimized {
-                        VStack {
-                            Spacer()
-                            HStack {
-                                Spacer()
-                                minimizedResearchLibraryControls
-                            }
-                        }
-                        .padding(.trailing, 24)
-                        .padding(.bottom, 96)
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
-                        .zIndex(30)
-                    }
                 }
 
-                    if appState.showFallbackNotification {
-                        VStack {
+                if section != .library,
+                   let job = comparisonJobs.latestStatusJob,
+                   !hiddenResearchComparisonStatusIDs.contains(job.id) {
+                    comparisonStatusPill(job)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                        .zIndex(30)
+                }
+
+                if appState.showFallbackNotification {
+                    VStack {
                         Spacer()
                         Text(appState.fallbackNotification)
                             .font(.caption)
                             .multilineTextAlignment(.center)
-                            .foregroundStyle(.white)
+                            .foregroundStyle(RedappDesign.toastText)
                             .padding(.horizontal, 12)
                             .padding(.vertical, 8)
-                            .background(Color.black.opacity(0.82))
+                            .background(RedappDesign.toast)
                             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                             .padding(.bottom, 16)
                     }
                     .padding(.horizontal)
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+            }
+            .onAppear {
+                currentLayoutIsCompact = useCompactLayout
+                updateColumnVisibility(width: geometry.size.width, animated: false)
+            }
+            .task {
+                // The split view settles its columns after first layout; apply
+                // the width rule once more so portrait starts without the sidebar.
+                try? await Task.sleep(for: .milliseconds(150))
+                updateColumnVisibility(width: geometry.size.width, animated: false)
+            }
+            .onChange(of: geometry.size.width) { _, width in
+                currentLayoutIsCompact = shouldUseCompactLayout(for: width)
+                updateColumnVisibility(width: width, animated: true)
+            }
+        }
+        .background(RedappDesign.canvas.ignoresSafeArea())
+    }
+
+    // MARK: Shell
+
+    private var shell: some View {
+        NavigationSplitView(columnVisibility: $columnVisibility, preferredCompactColumn: $preferredCompactColumn) {
+            RedappSidebar(
+                section: $section,
+                selectedResearchItemID: $selectedResearchItemID,
+                activeFeedTitle: viewModel.activeFeedTitle,
+                isHomeFeed: viewModel.selectedFeedMode == .home,
+                onSelectHome: {
+                    selectedPost = nil
+                    viewModel.fetchHomePosts()
+                    showDetailOnCompact()
+                },
+                onSelectCommunity: { name in
+                    subreddit = name
+                    selectedPost = nil
+                    viewModel.fetchSubredditPosts(subreddit: name)
+                    showDetailOnCompact()
+                },
+                onOpenSettings: { showSettings = true }
+            )
+            .navigationSplitViewColumnWidth(
+                min: RedappDesign.sidebarMinWidth,
+                ideal: RedappDesign.sidebarIdealWidth,
+                max: RedappDesign.sidebarMaxWidth
+            )
+            .toolbar(.hidden, for: .navigationBar)
+            .onChange(of: section) { _, _ in showDetailOnCompact() }
+            .onChange(of: selectedResearchItemID) { _, _ in showDetailOnCompact() }
+        } detail: {
+            workspace
+                .toolbar(section == .library ? .automatic : .hidden, for: .navigationBar)
+        }
+        .navigationSplitViewStyle(.balanced)
+    }
+
+    @ViewBuilder
+    private var workspace: some View {
+        switch section {
+        case .browse, .saved:
+            browseWorkspace
+        case .library:
+            ResearchLibraryWorkspace(
+                selectedItemID: $selectedResearchItemID,
+                navigationPath: $researchLibraryNavigationPath,
+                initialComparison: comparisonToResume,
+                onShowSidebar: isSidebarHidden ? showSidebar : nil
+            )
+        }
+    }
+
+    private var browseWorkspace: some View {
+        GeometryReader { proxy in
+            if currentLayoutIsCompact || proxy.size.width < 720 {
+                feedColumn
+                    // iPhone: swipe right from the left edge of the list to open the
+                    // sidebar (the system back swipe is off because the bar is custom).
+                    .simultaneousGesture(sidebarEdgeSwipe(whileReading: false))
+                    // A thin edge strip owns swipes that start at the left edge, so
+                    // they open the sidebar instead of tapping the post underneath.
+                    .overlay(alignment: .leading) {
+                        if isSidebarHidden && selectedPost == nil {
+                            Color.clear
+                                .frame(width: 32)
+                                .contentShape(Rectangle())
+                                .gesture(sidebarEdgeSwipe(whileReading: false))
+                                .accessibilityHidden(true)
+                        }
+                    }
+                    .overlay {
+                        if let activePost = selectedPost {
+                            CompactDetailContainer(post: activePost) {
+                                withAnimation(.easeInOut(duration: 0.2)) {
+                                    selectedPost = nil
+                                }
+                            }
+                            .transition(.move(edge: .trailing).combined(with: .opacity))
+                            .zIndex(1)
+                        }
+                    }
+                    .animation(.easeInOut(duration: 0.2), value: selectedPost?.id)
+            } else {
+                HStack(spacing: 0) {
+                    feedColumn
+                        // Sidebar hidden (half-screen iPad): swipe right on the list to show it.
+                        .simultaneousGesture(sidebarEdgeSwipe(whileReading: true))
+                        .overlay(alignment: .leading) {
+                            if isSidebarHidden {
+                                Color.clear
+                                    .frame(width: 32)
+                                    .contentShape(Rectangle())
+                                    .gesture(sidebarEdgeSwipe(whileReading: true))
+                                    .accessibilityHidden(true)
+                            }
+                        }
+                        .frame(width: min(RedappDesign.feedColumnWidth, proxy.size.width * 0.42))
+                    Rectangle()
+                        .fill(RedappDesign.hairline)
+                        .frame(width: 1)
+                        .ignoresSafeArea()
+                    readerColumn
+                }
+            }
+        }
+        .background(RedappDesign.canvas)
+    }
+
+    // MARK: Feed column
+
+    @ViewBuilder
+    private var feedColumn: some View {
+        if section == .saved {
+            savedColumn
+        } else {
+            PostsList(
+                viewModel: viewModel,
+                selectedPost: $selectedPost,
+                topInset: 0,
+                dismissKeyboard: { sidebarFocusedField = nil },
+                onOpenSettings: { showSettings = true },
+                onScrollActivityChanged: { _ in }
+            )
+            .background(RedappDesign.canvas)
+            .scrollEdgeEffectStyle(currentLayoutIsCompact ? .hard : .soft, for: .top)
+            .safeAreaBar(edge: .top, spacing: 0) {
+                SidebarControls(
+                    subreddit: $subreddit,
+                    viewModel: viewModel,
+                    focusedField: $sidebarFocusedField,
+                    onCompose: RedditAuthManager.shared.isAuthenticated ? { showCreatePost = true } : nil,
+                    onShowSidebar: isSidebarHidden ? showSidebar : nil
+                )
+            }
+
+        }
+    }
+
+    private var savedColumn: some View {
+        Group {
+            if savedPosts.posts.isEmpty {
+                ContentUnavailableView(
+                    "No Saved Posts",
+                    systemImage: "bookmark",
+                    description: Text("Tap the bookmark on any post to keep it here.")
+                )
+                .frame(maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(savedPosts.posts) { post in
+                            Button {
+                                selectedPost = post
+                            } label: {
+                                PostRowView(post: post, showsSubreddit: true, isSelected: selectedPost?.id == post.id)
+                            }
+                            .buttonStyle(.plain)
+                            .contextMenu {
+                                Button(role: .destructive) {
+                                    savedPosts.remove(post)
+                                } label: {
+                                    Label("Remove from Saved", systemImage: "bookmark.slash")
+                                }
+                            }
+                            Rectangle().fill(RedappDesign.hairline).frame(height: 1)
+                        }
                     }
                 }
             }
-                .onAppear {
-                    currentLayoutIsCompact = useCompactLayout
-                    updateColumnVisibility(animated: false)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .scrollEdgeEffectStyle(currentLayoutIsCompact ? .hard : .soft, for: .top)
+        .safeAreaBar(edge: .top, spacing: 0) {
+            HStack(alignment: .firstTextBaseline) {
+                if isSidebarHidden {
+                    Button(action: showSidebar) {
+                        Image(systemName: "sidebar.leading")
+                    }
+                    .buttonStyle(RedappIconButtonStyle())
+                    .accessibilityLabel("Show sidebar")
                 }
-                .onChange(of: useCompactLayout) { newValue in
-                    currentLayoutIsCompact = newValue
-                    updateColumnVisibility(animated: true)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Saved")
+                        .font(.title2.weight(.bold))
+                        .foregroundStyle(RedappDesign.ink)
+                    Text("\(savedPosts.posts.count) post\(savedPosts.posts.count == 1 ? "" : "s") on this device")
+                        .font(.subheadline)
+                        .foregroundStyle(RedappDesign.inkSecondary)
                 }
+                Spacer()
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 18)
+        }
+        .background(RedappDesign.canvas)
+    }
+
+    // MARK: Reader column
+
+    private var readerColumn: some View {
+        ZStack {
+            RedappDesign.canvas.ignoresSafeArea()
+
+            if let selectedPost = selectedPost {
+                RedditCommentsView(postPermalink: selectedPost.permalink, post: selectedPost, onBack: { self.selectedPost = nil })
+                    .id(selectedPost.id)
+            } else if section == .browse && viewModel.canRestoreBatchResults && !viewModel.showBatchResults && !isBatchResultsMinimized && !isReaderBatchResultsDismissed {
+                BatchResultsView(viewModel: viewModel, onClose: {
+                    withAnimation(.easeInOut(duration: 0.2)) { isReaderBatchResultsDismissed = true }
+                })
+            } else {
+                detailPlaceholder
+            }
+        }
+        .onChange(of: viewModel.showBatchResults) { _, isPresented in
+            // A new batch shows its results again.
+            if isPresented { isReaderBatchResultsDismissed = false }
+        }
+    }
+
+    /// Empty reader state. On first run it becomes a short setup guide instead
+    /// of asking the user to "select a post" that can't load yet.
+    @ViewBuilder
+    private var detailPlaceholder: some View {
+        if !RedditAuthManager.shared.hasStoredCredentials() {
+            ScrollView {
+                RedappOnboardingCard {
+                    showSettings = true
+                }
+                .padding(32)
+                .frame(maxWidth: .infinity)
+            }
+        } else {
+            ContentUnavailableView {
+                Label(section == .saved ? "Select a Saved Post" : "Select a Post", systemImage: "text.bubble")
+            } description: {
+                Text("Pick a post from the list to read it with its comments, summaries and analysis.")
             }
         }
     }
 
-    @ViewBuilder
-    private func appSurface<Surface: View>(
-        safeAreaInsets: EdgeInsets,
-        @ViewBuilder content: () -> Surface
-    ) -> some View {
-#if os(iOS)
-        if UIDevice.current.userInterfaceIdiom == .pad {
-            AppGlassChassis(safeAreaInsets: safeAreaInsets, content: content)
-        } else {
-            content()
-        }
-#else
-        content()
-#endif
+    // MARK: Presentations
+
+    private var shellPresentations: ShellPresentations {
+        ShellPresentations(
+            viewModel: viewModel,
+            showSettings: $showSettings,
+            showCreatePost: $showCreatePost,
+            isBatchResultsMinimized: $isBatchResultsMinimized,
+            subreddit: subreddit
+        )
     }
-    
-    private func splitView(isCompactLayout: Bool) -> some View {
-        let fallbackInset = CGFloat(viewModel.isBatchProcessing ? 260 : 180)
-        let visibleTopInset = max(sidebarOverlayHeight, fallbackInset)
-        let topInset = isSidebarScrolling ? 0 : visibleTopInset
-        
-        return Group {
-            if isCompactLayout {
-                compactLayout(topInset: topInset)
-            } else {
-                regularSplitLayout(topInset: topInset)
-            }
-        }
-            .onChange(of: viewModel.batchFinalSummary) { _, newSummary in
-                if newSummary != nil {
-                    // Batch results now show in modal, so keep selectedPost
-                } else if !viewModel.canRestoreBatchResults {
-                    isBatchResultsMinimized = false
-                }
-            }
-            .sheet(isPresented: $showSettings) {
-#if os(iOS)
-                if UIDevice.current.userInterfaceIdiom == .phone || isCompactLayout {
-                    SettingsView()
-                } else {
-                    SettingsView()
-                        .frame(width: 600, height: 700)
-                }
-#else
-                SettingsView()
-                    .frame(width: 600, height: 700)
-                    .fixedSize()
-#endif
-            }
-            .sheet(isPresented: $showCreatePost) {
-                PostComposer(isPresented: $showCreatePost, subreddit: subreddit)
-            }
-            .sheet(isPresented: $showResearchLibrary, onDismiss: {
-                comparisonToResume = nil
-                if isResearchLibraryExplicitlyClosing {
-                    isResearchLibraryMinimized = false
-                } else {
-                    isResearchLibraryMinimized = true
-                }
-                isResearchLibraryExplicitlyClosing = false
-            }) {
-                ResearchLibraryView(
-                    navigationPath: $researchLibraryNavigationPath,
-                    initialComparison: comparisonToResume,
-                    onMinimize: {
-                        isResearchLibraryExplicitlyClosing = false
-                        isResearchLibraryMinimized = true
-                    },
-                    onClose: {
-                        isResearchLibraryExplicitlyClosing = true
-                        isResearchLibraryMinimized = false
-                        researchLibraryNavigationPath = NavigationPath()
+
+    private func comparisonStatusPill(_ job: ResearchComparisonGenerationState) -> some View {
+        VStack {
+            Spacer()
+            HStack(spacing: 9) {
+                Spacer()
+                Button {
+                    researchLibraryNavigationPath = NavigationPath()
+                    comparisonToResume = job
+                    selectedResearchItemID = nil
+                    section = .library
+                } label: {
+                    HStack(spacing: 12) {
+                        comparisonStatusIndicator(for: job)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(job.title)
+                                .font(.subheadline.weight(.semibold))
+                                .lineLimit(1)
+                            Text(comparisonStatusSubtitle(for: job))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                        Image(systemName: "chevron.right")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
                     }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 11)
+                    .frame(maxWidth: 340, alignment: .leading)
+                    .background(RedappDesign.card, in: Capsule())
+                    .overlay {
+                        Capsule()
+                            .stroke(comparisonStatusColor(for: job.phase).opacity(0.8), lineWidth: 1.5)
+                    }
+                    .shadow(color: .black.opacity(0.14), radius: 14, y: 7)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Return to \(job.title)")
+                .accessibilityHint(job.status)
+                Button {
+                    hiddenResearchComparisonStatusIDs.insert(job.id)
+                    if job.phase != .running {
+                        comparisonJobs.dismissStatus(key: job.id)
+                    }
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption.weight(.bold))
+                        .frame(width: 36, height: 36)
+                        .background(RedappDesign.card, in: Circle())
+                        .overlay(Circle().stroke(RedappDesign.hairlineStrong, lineWidth: 1))
+                        .frame(width: 44, height: 44)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Hide comparison status")
+                .accessibilityHint(
+                    job.phase == .running
+                        ? "Hides this pill while the comparison continues in the background"
+                        : "Hides this pill"
                 )
-                .presentationBackground(Color(uiColor: .systemBackground))
             }
-            .confirmationDialog(
-                "Local batch is too large",
-                isPresented: Binding(
-                    get: { viewModel.pendingBatchReroute != nil },
-                    set: { if !$0 { viewModel.dismissPendingBatchReroute() } }
-                ),
-                titleVisibility: .visible,
-                presenting: viewModel.pendingBatchReroute
-            ) { _ in
-                ForEach(BatchRerouteProvider.allCases) { provider in
-                    Button(provider.displayName) {
-                        viewModel.reroutePendingBatch(to: provider)
-                    }
-                }
-                Button("Cancel", role: .cancel) {
-                    viewModel.dismissPendingBatchReroute()
-                }
-            } message: { request in
-                Text(request.message)
-            }
-            .onChange(of: viewModel.showBatchResults) { _, isPresented in
-                if isPresented {
-                    withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                        isBatchResultsMinimized = false
-                    }
-                }
-            }
-            .onAppear {
-                updateColumnVisibility(animated: false)
-            }
-            .onChange(of: selectedPost) { _, _ in
-                updateColumnVisibility(animated: true)
-            }
+        }
+        .padding(.trailing, 24)
+        .padding(.bottom, 28)
     }
+
+    // MARK: Actions
 
     private func closeBatchResults() {
         viewModel.batchFinalSummary = nil
@@ -25580,433 +25490,50 @@ struct ContentView: View {
         isBatchResultsMinimized = false
     }
 
-    private func updateColumnVisibility(animated: Bool) {
-#if os(iOS)
-        let target: NavigationSplitViewVisibility = currentLayoutIsCompact ? .automatic : .all
-
-        guard columnVisibility != target else { return }
-
-        if animated {
-            withAnimation(.easeInOut(duration: 0.2)) {
-                columnVisibility = target
+    private func showSidebar() {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            if isSingleColumnLayout {
+                preferredCompactColumn = .sidebar
+            } else {
+                columnVisibility = .all
             }
+        }
+    }
+
+    /// Swipe right on the post list to reveal a hidden sidebar. `whileReading`:
+    /// the reader sits beside the list, so an open post doesn't block it.
+    private func sidebarEdgeSwipe(whileReading: Bool) -> some Gesture {
+        // Measured in the feed's own space: on iPad the window can sit anywhere on
+        // screen, so screen coordinates never put the finger "at the edge".
+        DragGesture(minimumDistance: 20, coordinateSpace: .local)
+            .onEnded { value in
+                guard isSidebarHidden, whileReading || selectedPost == nil else { return }
+                // Anywhere on the list: a clear rightward swipe (not a scroll).
+                let horizontal = value.translation.width > 80
+                    && abs(value.translation.height) < value.translation.width * 0.5
+                if horizontal {
+                    showSidebar()
+                }
+            }
+    }
+
+    private func showDetailOnCompact() {
+        guard isSingleColumnLayout else { return }
+        preferredCompactColumn = .detail
+    }
+
+    /// Wide screens keep the navigation sidebar visible; narrower ones start
+    /// with it tucked away so the feed and reader get the room.
+    private func updateColumnVisibility(width: CGFloat, animated: Bool) {
+#if os(iOS)
+        let target: NavigationSplitViewVisibility = width >= 1100 ? .all : .detailOnly
+        guard columnVisibility != target else { return }
+        if animated {
+            withAnimation(.easeInOut(duration: 0.2)) { columnVisibility = target }
         } else {
             columnVisibility = target
         }
-#else
-        if columnVisibility != .automatic {
-            if animated {
-                withAnimation {
-                    columnVisibility = .automatic
-                }
-            } else {
-                columnVisibility = .automatic
-            }
-        }
 #endif
-    }
-
-    private func regularSplitLayout(topInset: CGFloat) -> some View {
-        NavigationSplitView(columnVisibility: $columnVisibility) {
-            sidebarContent(topInset: topInset)
-                .navigationTitle(viewModel.activeFeedTitle)
-#if os(iOS)
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar(.hidden, for: .navigationBar)
-                .toolbarBackground(
-                    experimentalAppGlassEnabled
-                        ? Color.clear
-                        : (isDarkMode ? Color.black : Color(uiColor: .systemBackground)),
-                    for: .navigationBar
-                )
-                .toolbarBackground(
-                    experimentalAppGlassEnabled || isSidebarScrolling ? .hidden : .visible,
-                    for: .navigationBar
-                )
-                .scrollEdgeEffectHidden(experimentalAppGlassEnabled, for: .top)
-                .toolbarColorScheme(isDarkMode ? .dark : .light, for: .navigationBar)
-#endif
-#if os(macOS)
-                .toolbarBackground(.hidden, for: .windowToolbar)
-#endif
-                .toolbar {
-#if !os(iOS)
-                    primaryToolbarContent
-#endif
-                }
-        } detail: {
-            detailColumn
-        }
-        .overlay(alignment: .topLeading) {
-#if os(iOS)
-            if columnVisibility == .detailOnly {
-                experimentalSidebarRevealButton
-                    .padding(.top, 12)
-                    .padding(.leading, 16)
-            }
-#endif
-        }
-    }
-
-    private func compactLayout(topInset: CGFloat) -> some View {
-        NavigationStack {
-            sidebarContent(topInset: topInset)
-                .navigationTitle(viewModel.activeFeedTitle)
-#if os(iOS)
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar(.hidden, for: .navigationBar)
-                .toolbarBackground(
-                    experimentalAppGlassEnabled
-                        ? Color.clear
-                        : (isDarkMode ? Color.black : Color(uiColor: .systemBackground)),
-                    for: .navigationBar
-                )
-                .toolbarBackground(
-                    experimentalAppGlassEnabled || isSidebarScrolling ? .hidden : .visible,
-                    for: .navigationBar
-                )
-                .scrollEdgeEffectHidden(experimentalAppGlassEnabled, for: .top)
-                .toolbarColorScheme(isDarkMode ? .dark : .light, for: .navigationBar)
-#endif
-                .toolbar {
-#if !os(iOS)
-                    primaryToolbarContent
-#endif
-                }
-        }
-        .overlay {
-            if let activePost = selectedPost {
-                CompactDetailContainer(post: activePost) {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        selectedPost = nil
-                    }
-                }
-                .transition(.move(edge: .trailing).combined(with: .opacity))
-                .zIndex(1)
-            }
-        }
-        .animation(.easeInOut(duration: 0.2), value: selectedPost?.id)
-    }
-
-    @ViewBuilder
-    private func sidebarContent(topInset: CGFloat) -> some View {
-        ZStack(alignment: .top) {
-            PostsList(
-                viewModel: viewModel,
-                selectedPost: $selectedPost,
-                topInset: topInset,
-                dismissKeyboard: { sidebarFocusedField = nil },
-                onScrollActivityChanged: handleSidebarScrollActivityChange
-            )
-            
-            VStack(spacing: 0) {
-                VStack {
-                    SidebarHeader()
-                    SidebarControls(
-                        subreddit: $subreddit,
-                        viewModel: viewModel,
-                        focusedField: $sidebarFocusedField
-                    )
-                }
-                .padding(.top, 82)
-                .background(
-                    GeometryReader { proxy in
-                        Color.clear
-                            .preference(key: SidebarOverlayHeightPreferenceKey.self, value: proxy.size.height)
-                    }
-                )
-                .background {
-                    sidebarOverlayBackground
-                }
-                .clipShape(sidebarOverlayShape)
-                .opacity(isSidebarScrolling ? 0 : 1)
-                .offset(y: isSidebarScrolling ? -(sidebarOverlayHeight + 12) : 0)
-                .animation(sidebarOverlayAnimation, value: isSidebarScrolling)
-                .allowsHitTesting(!isSidebarScrolling)
-                .accessibilityHidden(isSidebarScrolling)
-                
-                Spacer()
-            }
-
-#if os(iOS)
-            experimentalFloatingToolbar
-                .padding(.top, 12)
-                .padding(.trailing, 16)
-                .frame(maxWidth: .infinity, alignment: .topTrailing)
-                .zIndex(10)
-#endif
-        }
-        .onPreferenceChange(SidebarOverlayHeightPreferenceKey.self) { newValue in
-            if newValue > 0 {
-                sidebarOverlayHeight = newValue
-            }
-        }
-        .background {
-            if experimentalAppGlassEnabled {
-                Color.black
-            } else if isDarkMode {
-                Color.black
-            } else {
-                Color.clear.background(.ultraThinMaterial)
-            }
-        }
-    }
-
-    private func handleSidebarScrollActivityChange(_ isScrolling: Bool) {
-        sidebarScrollRevealTask?.cancel()
-        sidebarScrollRevealTask = nil
-
-        if isScrolling {
-            guard !isSidebarScrolling else { return }
-            withAnimation(.easeInOut(duration: 0.16)) {
-                isSidebarScrolling = true
-            }
-            return
-        }
-
-        guard isSidebarScrolling else { return }
-
-        sidebarScrollRevealTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 280_000_000)
-            guard !Task.isCancelled else { return }
-            withAnimation(sidebarOverlayAnimation) {
-                isSidebarScrolling = false
-            }
-            sidebarScrollRevealTask = nil
-        }
-    }
-
-    private var sidebarOverlayAnimation: Animation {
-        isSidebarScrolling
-            ? .easeInOut(duration: 0.16)
-            : .spring(response: 0.48, dampingFraction: 0.86, blendDuration: 0.12)
-    }
-
-    private var sidebarOverlayShape: RoundedRectangle {
-        RoundedRectangle(cornerRadius: 28, style: .continuous)
-    }
-
-    @ViewBuilder
-    private var sidebarOverlayBackground: some View {
-        if experimentalAppGlassEnabled {
-            sidebarOverlayShape
-                .fill(Color.clear)
-                .experimentalAppGlass(
-                    enabled: true,
-                    variant: experimentalAppGlassVariant,
-                    cornerRadius: 28
-                )
-                .overlay {
-                    sidebarOverlayShape
-                        .stroke(Color.white.opacity(isDarkMode ? 0.12 : 0.18), lineWidth: 0.75)
-                }
-                .shadow(color: Color.black.opacity(isDarkMode ? 0.24 : 0.10), radius: 18, y: 10)
-        } else {
-            sidebarOverlayShape
-                .fill(.ultraThinMaterial)
-                .overlay {
-                    sidebarOverlayShape
-                        .fill(isDarkMode ? Color.black.opacity(0.34) : Color.white.opacity(0.10))
-                }
-                .overlay {
-                    sidebarOverlayShape
-                        .stroke(Color.white.opacity(isDarkMode ? 0.10 : 0.16), lineWidth: 0.75)
-                }
-                .shadow(color: Color.black.opacity(isDarkMode ? 0.28 : 0.12), radius: 18, y: 10)
-        }
-    }
-
-#if os(iOS)
-    private var experimentalFloatingToolbar: some View {
-        GlassEffectContainer(spacing: 10) {
-            HStack(spacing: 10) {
-                HStack(spacing: 0) {
-                    experimentalToolbarButton(
-                        systemName: "books.vertical",
-                        accessibilityLabel: "Research Library"
-                    ) {
-                        comparisonToResume = nil
-                        researchLibraryNavigationPath = NavigationPath()
-                        isResearchLibraryExplicitlyClosing = false
-                        isResearchLibraryMinimized = false
-                        showResearchLibrary = true
-                    }
-
-                    if RedditAuthManager.shared.isAuthenticated {
-                        experimentalToolbarButton(
-                            systemName: "square.and.pencil",
-                            accessibilityLabel: "Create Post"
-                        ) {
-                            showCreatePost = true
-                        }
-                    }
-
-                    experimentalToolbarButton(
-                        systemName: "gearshape",
-                        accessibilityLabel: "Settings"
-                    ) {
-                        showSettings = true
-                    }
-                }
-                .padding(.horizontal, 4)
-                .padding(.vertical, 4)
-                .glassEffect(.regular, in: .capsule)
-
-                if !currentLayoutIsCompact {
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.2)) {
-                            columnVisibility = .detailOnly
-                        }
-                    } label: {
-                        Image(systemName: "sidebar.leading")
-                            .font(.system(size: 24, weight: .medium))
-                            .frame(width: 44, height: 44)
-                    }
-                    .buttonStyle(.glass)
-                    .accessibilityLabel("Hide Sidebar")
-                }
-            }
-        }
-    }
-
-    private func experimentalToolbarButton(
-        systemName: String,
-        accessibilityLabel: String,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button(action: action) {
-            Image(systemName: systemName)
-                .font(.system(size: 24, weight: .medium))
-                .frame(width: 58, height: 44)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(accessibilityLabel)
-    }
-
-    private var experimentalSidebarRevealButton: some View {
-        Button {
-            withAnimation(.easeInOut(duration: 0.2)) {
-                columnVisibility = .all
-            }
-        } label: {
-            Image(systemName: "sidebar.leading")
-                .font(.system(size: 24, weight: .medium))
-                .frame(width: 44, height: 44)
-        }
-        .buttonStyle(.glass)
-        .accessibilityLabel("Show Sidebar")
-    }
-#endif
-
-    @ToolbarContentBuilder
-    private var primaryToolbarContent: some ToolbarContent {
-        #if os(iOS)
-        ToolbarItemGroup(placement: .navigationBarTrailing) {
-            Button(action: {
-                comparisonToResume = nil
-                researchLibraryNavigationPath = NavigationPath()
-                isResearchLibraryExplicitlyClosing = false
-                isResearchLibraryMinimized = false
-                showResearchLibrary = true
-            }) {
-                Image(systemName: "books.vertical")
-            }
-            .help("Research Library")
-            .accessibilityLabel("Research Library")
-
-            if RedditAuthManager.shared.isAuthenticated {
-                Button(action: {
-                    showCreatePost = true
-                }) {
-                    Image(systemName: "square.and.pencil")
-                }
-                .help("Create Post")
-            }
-
-            Button(action: {
-                showSettings = true
-            }) {
-                Image(systemName: "gearshape")
-            }
-            .help("Settings")
-        }
-        #else
-        ToolbarItem(placement: .automatic) {
-            HStack(spacing: 16) {
-                Button(action: {
-                    comparisonToResume = nil
-                    researchLibraryNavigationPath = NavigationPath()
-                    isResearchLibraryExplicitlyClosing = false
-                    isResearchLibraryMinimized = false
-                    showResearchLibrary = true
-                }) {
-                    Image(systemName: "books.vertical")
-                }
-                .help("Research Library")
-                .accessibilityLabel("Research Library")
-
-                if RedditAuthManager.shared.isAuthenticated {
-                    Button(action: {
-                        showCreatePost = true
-                    }) {
-                        Image(systemName: "square.and.pencil")
-                    }
-                    .help("Create Post")
-                }
-
-                Button(action: {
-                    showSettings = true
-                }) {
-                    Image(systemName: "gearshape")
-                }
-                .help("Settings")
-            }
-        }
-        #endif
-    }
-
-    private var detailColumn: some View {
-        ZStack {
-            if experimentalAppGlassEnabled {
-                Color.black
-                    .ignoresSafeArea()
-            } else if isDarkMode {
-                Color.black
-                    .ignoresSafeArea()
-            } else {
-                Color.clear
-                    .background(.ultraThinMaterial)
-                    .ignoresSafeArea()
-            }
-            
-            if let selectedPost = selectedPost {
-                RedditCommentsView(postPermalink: selectedPost.permalink)
-                    .id(selectedPost.id)
-            } else if viewModel.canRestoreBatchResults && !viewModel.showBatchResults && !isBatchResultsMinimized {
-                BatchResultsView(viewModel: viewModel)
-            } else {
-                Text("Select a post to view comments")
-                    .foregroundColor(.secondary)
-            }
-        }
-#if os(macOS)
-        .toolbarBackground(.hidden, for: .windowToolbar)
-#endif
-        .toolbar {
-            if currentLayoutIsCompact && selectedPost != nil {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.2)) {
-                            selectedPost = nil
-                        }
-                    } label: {
-                        Label("Posts", systemImage: "chevron.backward")
-                            .labelStyle(.titleAndIcon)
-                    }
-                }
-            }
-        }
     }
 
     private struct CompactDetailContainer: View {
@@ -26014,51 +25541,19 @@ struct ContentView: View {
         let onClose: () -> Void
         @State private var dragOffset: CGFloat = 0
         @State private var isBackGestureActive = false
-        @AppStorage("experimentalSettingsGlassEnabled") private var experimentalAppGlassEnabled = true
-        @Environment(\.colorScheme) private var colorScheme
 
         var body: some View {
             ZStack {
-                Group {
-                    if experimentalAppGlassEnabled {
-                        Color.black
-                    } else if colorScheme == .dark {
-                        Color.black
-                    } else {
-                        Color.black.opacity(backgroundOpacity)
-                    }
-                }
-                .ignoresSafeArea()
+                Color.black.opacity(backgroundOpacity)
+                    .ignoresSafeArea()
 
                 NavigationStack {
-                    RedditCommentsView(postPermalink: post.permalink)
+                    RedditCommentsView(postPermalink: post.permalink, post: post, onBack: closeWithAnimation)
                         .id(post.id)
-                        .navigationBarTitleDisplayMode(.inline)
-                        .toolbar {
-                            ToolbarItem(placement: .navigationBarLeading) {
-                                Button(action: closeWithAnimation) {
-                                    Label("Posts", systemImage: "chevron.backward")
-                                        .labelStyle(.titleAndIcon)
-                                }
-                            }
-                            ToolbarItem(placement: .principal) {
-                                Text(post.title)
-                                    .font(.headline)
-                                    .lineLimit(1)
-                                    .truncationMode(.tail)
-                            }
-                        }
+                        .toolbar(.hidden, for: .navigationBar)
                 }
-                .background {
-                    if experimentalAppGlassEnabled {
-                        Color.black
-                    } else if colorScheme == .dark {
-                        Color.black
-                    } else {
-                        Color.clear.background(.ultraThinMaterial)
-                    }
-                }
-                .ignoresSafeArea()
+                .background(RedappDesign.canvas)
+                .ignoresSafeArea(edges: .bottom)
                 .offset(x: max(dragOffset, 0))
                 .simultaneousGesture(backSwipeGesture)
             }
@@ -26080,8 +25575,6 @@ struct ContentView: View {
         private var activationRegionWidth: CGFloat {
 #if os(iOS)
             return min(UIScreen.main.bounds.width * 0.45, 280)
-#elseif os(macOS)
-            return min(NSScreen.main?.frame.width ?? 600, 280)
 #else
             return 200
 #endif
@@ -26124,12 +25617,9 @@ struct ContentView: View {
         private func completeInteractiveDismissal(predictedEnd: CGFloat) {
 #if os(iOS)
             let screenWidth = UIScreen.main.bounds.width
-#elseif os(macOS)
-            let screenWidth = NSScreen.main?.frame.width ?? 600
 #else
             let screenWidth: CGFloat = 600
 #endif
-
             let target = max(screenWidth, predictedEnd + dragOffset)
 
             withAnimation(.easeOut(duration: 0.22)) {
@@ -26142,7 +25632,65 @@ struct ContentView: View {
             }
         }
     }
+}
 
+/// Sheets and dialogs owned by the app shell.
+private struct ShellPresentations: ViewModifier {
+    @ObservedObject var viewModel: RedditSubredditViewModel
+    @Binding var showSettings: Bool
+    @Binding var showCreatePost: Bool
+    @Binding var isBatchResultsMinimized: Bool
+    let subreddit: String
+
+    func body(content: Content) -> some View {
+        content
+            .onChange(of: viewModel.batchFinalSummary) { _, newSummary in
+                if newSummary == nil && !viewModel.canRestoreBatchResults {
+                    isBatchResultsMinimized = false
+                }
+            }
+            .sheet(isPresented: $showSettings) {
+#if os(iOS)
+                SettingsView()
+                    .presentationSizing(.form)
+                    .presentationCornerRadius(RedappDesign.Radius.sheet)
+#else
+                SettingsView()
+                    .frame(width: 600, height: 700)
+                    .fixedSize()
+#endif
+            }
+            .sheet(isPresented: $showCreatePost) {
+                PostComposer(isPresented: $showCreatePost, subreddit: subreddit)
+            }
+            .confirmationDialog(
+                "Local batch is too large",
+                isPresented: Binding(
+                    get: { viewModel.pendingBatchReroute != nil },
+                    set: { if !$0 { viewModel.dismissPendingBatchReroute() } }
+                ),
+                titleVisibility: .visible,
+                presenting: viewModel.pendingBatchReroute
+            ) { _ in
+                ForEach(BatchRerouteProvider.available) { provider in
+                    Button(provider.displayName) {
+                        viewModel.reroutePendingBatch(to: provider)
+                    }
+                }
+                Button("Cancel", role: .cancel) {
+                    viewModel.dismissPendingBatchReroute()
+                }
+            } message: { request in
+                Text(request.message)
+            }
+            .onChange(of: viewModel.showBatchResults) { _, isPresented in
+                if isPresented {
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                        isBatchResultsMinimized = false
+                    }
+                }
+            }
+    }
 }
 
 // MARK: - RedditCommentsView
@@ -26168,6 +25716,30 @@ struct RedditCommentsView: View {
         }
 
         let postPermalink: String
+        /// Listing data for the open post (author, subreddit, age, score) when
+        /// the reader was opened from the feed.
+        var post: SubredditPostData? = nil
+        /// Back action when the reader is pushed full screen (compact layouts).
+        var onBack: (() -> Void)? = nil
+        @ObservedObject private var savedPosts = SavedPostsStore.shared
+        @State private var commentSort: CommentSort = .best
+        @State private var postVote: VoteDirection = .none
+        @State private var isSubmittingPostVote = false
+        @State private var summaryPanelTab: SummaryPanelTab = .comments
+        private let discussionSectionID = "discussionSection"
+
+        enum CommentSort: String, CaseIterable, Identifiable {
+            case best = "Best"
+            case top = "Top"
+            case new = "New"
+            case old = "Old"
+            var id: String { rawValue }
+        }
+
+        enum SummaryPanelTab: String, CaseIterable, Hashable {
+            case post = "Post"
+            case comments = "Comments"
+        }
         @ObservedObject private var summaryService = SummaryService.shared
         @EnvironmentObject private var appState: AppState
         @Environment(\.colorScheme) private var colorScheme
@@ -26181,6 +25753,14 @@ struct RedditCommentsView: View {
         @State private var summaryError: String? = nil
         @State private var commentPromptNotice: String? = nil
         @State private var question: String = ""
+        /// Shows the "Ask about this thread" box under the post instead of at the end.
+        @State private var isAskPanelOpen = false
+        @Environment(\.horizontalSizeClass) private var readerSizeClass
+        /// Narrower margins on iPhone.
+        private var readerSideMargin: CGFloat { readerSizeClass == .compact ? 20 : 32 }
+        private let askPanelID = "askPanelTop"
+        /// Width available to the post column; picks how compact the action row is.
+        @State private var readerContentWidth: CGFloat = RedappDesign.readingWidth
         @State private var answer: String?
         @State private var isAnswering: Bool = false
         @State private var answerError: String? = nil
@@ -26283,6 +25863,749 @@ struct RedditCommentsView: View {
             return trimmedContent.isEmpty ? postTitle : trimmedContent
         }
 
+
+        // MARK: - Reader chrome
+
+        private var subredditName: String? {
+            post?.subreddit ?? extractSubreddit(from: postPermalink)
+        }
+
+        private var postURL: URL? {
+            post?.fullURL ?? URL(string: normalizeRedditPermalink(postPermalink))
+        }
+
+        /// Comments in the order chosen in "Sort"; Best keeps Reddit's order.
+        private var sortedComments: [CommentData] {
+            switch commentSort {
+            case .best: return allComments
+            case .top: return allComments.sorted { $0.score > $1.score }
+            case .new: return allComments.sorted { ($0.createdAt ?? .distantPast) > ($1.createdAt ?? .distantPast) }
+            case .old: return allComments.sorted { ($0.createdAt ?? .distantFuture) < ($1.createdAt ?? .distantFuture) }
+            }
+        }
+
+        private var readerTopBar: some View {
+            HStack(spacing: 6) {
+                if let onBack {
+                    Button(action: onBack) {
+                        Image(systemName: "chevron.left")
+                    }
+                    .buttonStyle(RedappIconButtonStyle())
+                    .accessibilityLabel("Back to posts")
+                }
+
+                HStack(spacing: 8) {
+                    Text(subredditName.map { "r/\($0)" } ?? "Reddit")
+                    Text("/").foregroundStyle(RedappDesign.inkTertiary)
+                    Text("Discussion")
+                }
+                .font(.subheadline)
+                .foregroundStyle(RedappDesign.inkSecondary)
+                .lineLimit(1)
+                .padding(.leading, onBack == nil ? 10 : 0)
+
+                Spacer()
+
+                if let post {
+                    Button {
+                        savedPosts.toggle(post)
+                    } label: {
+                        Image(systemName: savedPosts.isSaved(post) ? "bookmark.fill" : "bookmark")
+                            .foregroundStyle(savedPosts.isSaved(post) ? RedappDesign.accent : RedappDesign.ink)
+                    }
+                    .buttonStyle(RedappIconButtonStyle())
+                    .accessibilityLabel(savedPosts.isSaved(post) ? "Remove from Saved" : "Save post")
+                }
+
+                if let postURL {
+                    ShareLink(item: postURL) {
+                        Image(systemName: "square.and.arrow.up")
+                    }
+                    .buttonStyle(RedappIconButtonStyle())
+                    .accessibilityLabel("Share post")
+                }
+
+                Menu {
+                    Button {
+                        if RedditAuthManager.shared.isAuthenticated {
+                            isReplyingToPost = true
+                        } else {
+                            Task { await showLoginPrompt() }
+                        }
+                    } label: {
+                        Label("Reply to Post", systemImage: "arrowshape.turn.up.left")
+                    }
+                    Button(action: copyCommentsToClipboard) {
+                        Label("Copy Comments", systemImage: "doc.on.doc")
+                    }
+                    .disabled(allComments.isEmpty)
+                    if let postURL {
+                        Link(destination: postURL) {
+                            Label("Open on Reddit", systemImage: "safari")
+                        }
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(RedappDesign.ink)
+                        .frame(width: 40, height: 40)
+                        .contentShape(Circle())
+                }
+                .accessibilityLabel("More actions")
+            }
+            .padding(.horizontal, 14)
+            .frame(height: 60)
+        }
+
+        private func readerHeader(proxy: ScrollViewProxy) -> some View {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack(spacing: 12) {
+                    RedappCommunityBadge(name: subredditName ?? "r", size: 44)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(subredditName.map { "r/\($0)" } ?? "Reddit")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(RedappDesign.ink)
+                        if let post {
+                            Text([post.author.map { "u/\($0)" }, RedappTime.shortAge(fromUnix: post.created_utc).map { $0 == "now" ? "just now" : "\($0) ago" }]
+                                .compactMap { $0 }.joined(separator: " · "))
+                                .font(.subheadline)
+                                .foregroundStyle(RedappDesign.inkSecondary)
+                        }
+                    }
+                }
+
+                SelectableText(postTitle)
+                    .font(.largeTitle)
+                    .textWeight(.bold)
+                    .foregroundColor(RedappDesign.ink)
+                    .multilineTextAlignment(.leading)
+
+                readerActionRow(proxy: proxy)
+
+                if isAskPanelOpen {
+                    // Opens right under the actions, so no scrolling is needed.
+                    askThreadSection(
+                        askAIHandler: { askAIFromRedditSelection($0, useWebPath: false) },
+                        askAIWebHandler: { askAIFromRedditSelection($0, useWebPath: true) },
+                        onClose: {
+                            withAnimation(.easeInOut(duration: 0.2)) { isAskPanelOpen = false }
+                        }
+                    )
+                    .redappCard(cornerRadius: RedappDesign.Radius.large, padding: 18)
+                    .id(askPanelID)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                }
+
+                if !postContent.isEmpty {
+                    SelectableText(makeAttributedText(from: postContent) ?? AttributedString(postContent))
+                        .font(.body)
+                        .foregroundColor(RedappDesign.ink)
+                        .multilineTextAlignment(.leading)
+                        .lineLimit(nil)
+                }
+
+                if let imageURL = post?.bestImageURL {
+                    ClickableImage(url: imageURL, maxHeight: 420)
+                        .clipShape(RoundedRectangle(cornerRadius: RedappDesign.Radius.medium, style: .continuous))
+                }
+            }
+            .padding(.bottom, 12)
+        }
+
+        /// Summarize · Listen · Ask · votes · comments. Gets more compact
+        /// (shorter labels, then icons) before it ever wraps to two lines.
+        private func readerActionRow(proxy: ScrollViewProxy) -> some View {
+            // Chosen from the measured column width (not ViewThatFits, which loops
+            // when re-measured under a safe-area bar).
+            let width = readerContentWidth
+            // 0 full · 1 compact · 2 icons (phone width) · 3 icon-only Summarize (very narrow).
+            let level = width >= 680 ? 0 : (width >= 490 ? 1 : (width >= 335 ? 2 : 3))
+            return HStack(spacing: level >= 2 ? 6 : (level == 0 ? 10 : 8)) {
+                readerPrimaryActions(level: level)
+                if level < 2 {
+                    Rectangle()
+                        .fill(RedappDesign.hairlineStrong)
+                        .frame(width: 1, height: 24)
+                        .padding(.horizontal, level == 0 ? 2 : 0)
+                }
+                readerEngagement(proxy: proxy, level: level)
+            }
+            .padding(.vertical, 2)
+            .sheet(item: $activeAnalyticsLaunchMode) { launchMode in
+                CommentAnalyticsView(
+                    comments: allComments,
+                    forceWebAI: launchMode.forceWebAI
+                )
+                .webAIHandoffPresenter(appState: AppState.shared)
+                .presentationDetents([.large])
+                .presentationBackground(RedappDesign.canvas)
+            }
+        }
+
+        /// level 0: full labels · 1: compact · 2: compact with icon-only secondary actions.
+        @ViewBuilder
+        private func readerPrimaryActions(level: Int) -> some View {
+            Menu {
+                // Which model the items below use (informational).
+                Section {
+                    Button {} label: {
+                        Label("Using \(summaryModelName)", systemImage: "cpu")
+                        Text("Change the model in Settings")
+                    }
+                    .disabled(true)
+                }
+                Section("Comments") {
+                    commentSummaryMenuItems
+                }
+                Section("Post") {
+                    postSummaryMenuItems
+                }
+                Section("Analyze") {
+                    Button {
+                        activeAnalyticsLaunchMode = .standard
+                    } label: {
+                        Label("Deep analysis", systemImage: "chart.pie")
+                        Text("Sentiment and themes")
+                    }
+                    .disabled(allComments.isEmpty)
+                }
+                if summaryService.settings.selectedSummaryProvider != .webAI {
+                    Section {
+                        webSummaryMenu
+                    }
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    if isSummarizing || isSummarizingPost {
+                        ProgressView().controlSize(.small).tint(.white)
+                    } else if level != 2 {
+                        // Phone width shows the word only, so it stays on one line.
+                        Image(systemName: "sparkles")
+                    }
+                    if level < 3 {
+                        Text(level == 0 ? "Summarize thread" : "Summarize")
+                            .lineLimit(1)
+                            .fixedSize()
+                    }
+                }
+            }
+            .buttonStyle(RedappPrimaryButtonStyle(isCapsule: true, isCompact: level > 0))
+            .accessibilityLabel("Summarize thread")
+            .accessibilityHint("Summarize the comments or the post, or run a deep analysis")
+
+            if isReadingAllComments {
+                Button {
+                    stopReadingAllComments()
+                } label: {
+                    if level >= 1 { Image(systemName: "stop.fill") } else { Label("Stop", systemImage: "stop.fill") }
+                }
+                .buttonStyle(RedappSecondaryButtonStyle(isCompact: level > 0))
+                .accessibilityLabel("Stop reading comments")
+            } else {
+                Menu {
+                    readAloudMenuItems
+                } label: {
+                    if level >= 1 { Image(systemName: "play.fill") } else { Label("Listen", systemImage: "play.fill") }
+                }
+                .buttonStyle(RedappSecondaryButtonStyle(isCompact: level > 0))
+                .disabled(allComments.isEmpty)
+                .accessibilityLabel("Listen")
+                .accessibilityHint("Read the comments aloud")
+            }
+
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    isAskPanelOpen.toggle()
+                }
+            } label: {
+                if level >= 2 {
+                    Image(systemName: "questionmark.bubble")
+                } else {
+                    Label("Ask", systemImage: "questionmark.bubble")
+                }
+            }
+            .buttonStyle(RedappSecondaryButtonStyle(
+                foreground: isAskPanelOpen ? RedappDesign.accent : RedappDesign.ink,
+                isCompact: level > 0
+            ))
+            .disabled(allComments.isEmpty)
+            .accessibilityLabel(isAskPanelOpen ? "Hide question box" : "Ask about this thread")
+        }
+
+        @ViewBuilder
+        private func readerEngagement(proxy: ScrollViewProxy, level: Int) -> some View {
+            if let post {
+                HStack(spacing: level >= 2 ? 6 : 10) {
+                    Button {
+                        submitPostVote(postVote == .upvote ? .none : .upvote)
+                    } label: {
+                        Image(systemName: postVote == .upvote ? "arrowshape.up.fill" : "arrowshape.up")
+                            .foregroundStyle(postVote == .upvote ? RedappDesign.upvote : RedappDesign.ink)
+                    }
+                    .accessibilityLabel(postVote == .upvote ? "Remove upvote" : "Upvote post")
+                    Text(RedappNumber.compact(post.ups + postVote.rawValue))
+                        .font(.subheadline.weight(.semibold).monospacedDigit())
+                        .foregroundStyle(RedappDesign.ink)
+                    Button {
+                        submitPostVote(postVote == .downvote ? .none : .downvote)
+                    } label: {
+                        Image(systemName: postVote == .downvote ? "arrowshape.down.fill" : "arrowshape.down")
+                            .foregroundStyle(postVote == .downvote ? RedappDesign.downvote : RedappDesign.ink)
+                    }
+                    .accessibilityLabel(postVote == .downvote ? "Remove downvote" : "Downvote post")
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: level == 0 ? 16 : 14, weight: .semibold))
+                .padding(.horizontal, level == 0 ? 14 : (level >= 2 ? 9 : 10))
+                .padding(.vertical, level == 0 ? 10 : 8)
+                .background(Capsule().fill(RedappDesign.field))
+                .overlay(Capsule().strokeBorder(RedappDesign.hairlineStrong, lineWidth: 1))
+                .disabled(isSubmittingPostVote)
+            }
+
+            Button {
+                withAnimation(.easeInOut(duration: 0.25)) {
+                    proxy.scrollTo(discussionSectionID, anchor: .top)
+                }
+            } label: {
+                Label(RedappNumber.compact(post?.num_comments ?? allComments.count), systemImage: "bubble.left")
+            }
+            .buttonStyle(RedappSecondaryButtonStyle(isCompact: level > 0))
+            .accessibilityLabel("Jump to comments")
+        }
+
+        private var discussionHeader: some View {
+            VStack(spacing: 14) {
+                Rectangle().fill(RedappDesign.hairline).frame(height: 1)
+                HStack(alignment: .firstTextBaseline, spacing: 12) {
+                    Text("Discussion")
+                        .font(RedappType.section)
+                        .foregroundStyle(RedappDesign.ink)
+                        .lineLimit(1)
+                        .fixedSize()
+                    Text("\(post?.num_comments ?? allComments.count) comments")
+                        .font(.subheadline)
+                        .foregroundStyle(RedappDesign.inkSecondary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.85)
+                    Spacer(minLength: 8)
+                    Menu {
+                        Picker("Sort comments", selection: $commentSort) {
+                            ForEach(CommentSort.allCases) { sort in
+                                Text(sort.rawValue).tag(sort)
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text("Sort:").foregroundStyle(RedappDesign.inkSecondary)
+                            Text(commentSort.rawValue).foregroundStyle(RedappDesign.ink)
+                            Image(systemName: "chevron.down")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(RedappDesign.inkSecondary)
+                        }
+                        .font(.subheadline.weight(.medium))
+                    }
+                    .disabled(allComments.isEmpty)
+                }
+            }
+            .padding(.bottom, 8)
+        }
+
+        private func submitPostVote(_ direction: VoteDirection) {
+            guard let post, !isSubmittingPostVote else { return }
+            guard RedditAuthManager.shared.isAuthenticated else {
+                Task { await showLoginPrompt() }
+                return
+            }
+            let previous = postVote
+            postVote = direction
+            isSubmittingPostVote = true
+            Task {
+                do {
+                    try await RedditAPI.shared.vote(id: "t3_\(post.id)", direction: direction)
+                } catch {
+                    await MainActor.run { postVote = previous }
+                }
+                await MainActor.run { isSubmittingPostVote = false }
+            }
+        }
+
+        // MARK: - Thread summary panel
+
+        private var isSummaryPanelPresented: Binding<Bool> {
+            Binding(
+                get: { isShowingPostSummary || isShowingCommentSummary },
+                set: { isPresented in
+                    if !isPresented {
+                        isShowingPostSummary = false
+                        isShowingCommentSummary = false
+                    }
+                }
+            )
+        }
+
+        /// Post and comment summaries share one side panel, like the mockup's
+        /// "Thread summary" with its Post / Comments switch.
+        private var threadSummaryPanel: some View {
+            let panelHeader = VStack(alignment: .leading, spacing: 16) {
+                RedappPanelHeader(
+                    title: "Thread summary",
+                    subtitle: summaryPanelTab == .comments && (commentsSentToLLMCount ?? 0) > 0
+                        ? "\(commentsSentToLLMCount ?? 0) comments analyzed"
+                        : nil,
+                    onClose: {
+                        isShowingPostSummary = false
+                        isShowingCommentSummary = false
+                    }
+                )
+                RedappUnderlineTabs(tabs: SummaryPanelTab.allCases, selection: $summaryPanelTab) { $0.rawValue }
+            }
+
+            return VStack(alignment: .leading, spacing: 0) {
+                Group {
+                    switch summaryPanelTab {
+                    case .post:
+                        if postSummary != nil || isSummarizingPost {
+                            PostSummaryView(
+                                postSummary: postSummary ?? "",
+                                isGenerating: isSummarizingPost,
+                                onCloudSpeak: speakPostSummary,
+                                onLocalSpeak: speakPostSummaryLocally,
+                                onKokoroSpeak: speakPostSummaryWithKokoro,
+                                onAskAI: { selection, onPartial in
+                                    try await askAIResponseForRedditSelection(selection, useWebPath: false, onPartial: onPartial)
+                                },
+                                onAskAIWeb: { selection, onPartial in
+                                    try await askAIResponseForRedditSelection(selection, useWebPath: true, onPartial: onPartial)
+                                },
+                                isEmbeddedInPanel: true
+                            )
+                        } else {
+                            summaryPanelEmptyState(
+                                title: "No post summary yet",
+                                actionTitle: "Summarize post",
+                                isDisabled: postTitle.isEmpty && postContent.isEmpty
+                            ) {
+                                selectedSummaryType = .short
+                                summarizePost(isShort: true)
+                            }
+                        }
+                    case .comments:
+                        if summary != nil || isSummarizing {
+                            CommentSummaryView(
+                                commentSummary: summary ?? "",
+                                isGenerating: isSummarizing,
+                                commentCount: commentsSentToLLMCount ?? 0,
+                                summaryType: selectedSummaryType?.rawValue ?? "Summary",
+                                onCloudSpeak: speakSummary,
+                                onLocalSpeak: speakSummaryLocally,
+                                onKokoroSpeak: speakSummaryWithKokoro,
+                                allComments: allComments,
+                                promptNotice: commentPromptNotice,
+                                onAskAI: { selection, onPartial in
+                                    try await askAIResponseForRedditSelection(selection, useWebPath: false, onPartial: onPartial)
+                                },
+                                onAskAIWeb: { selection, onPartial in
+                                    try await askAIResponseForRedditSelection(selection, useWebPath: true, onPartial: onPartial)
+                                },
+                                isEmbeddedInPanel: true
+                            )
+                        } else {
+                            summaryPanelEmptyState(
+                                title: "No comment summary yet",
+                                actionTitle: "Summarize comments",
+                                isDisabled: allComments.isEmpty
+                            ) {
+                                selectedSummaryType = .short
+                                summarizeComments(isShort: true)
+                            }
+                        }
+                    }
+                }
+                .frame(maxHeight: .infinity, alignment: .top)
+            }
+            .padding(.horizontal, 20)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .background(RedappDesign.panel)
+            .safeAreaBar(edge: .top, spacing: 0) {
+                panelHeader
+                    .padding(.horizontal, 20)
+                    .padding(.top, 18)
+                    .padding(.bottom, 12)
+            }
+            .onChange(of: isShowingPostSummary) { _, isShowing in
+                if isShowing { summaryPanelTab = .post }
+            }
+            .onChange(of: isShowingCommentSummary) { _, isShowing in
+                if isShowing { summaryPanelTab = .comments }
+            }
+        }
+
+        /// "Ask about this thread": question box, answer and status. Shown under the
+        /// post when opened from the action row, otherwise at the end of the thread.
+        private func askThreadSection(
+            askAIHandler: @escaping (String) -> Void,
+            askAIWebHandler: @escaping (String) -> Void,
+            onClose: (() -> Void)? = nil
+        ) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .center) {
+                Text("Ask about this thread")
+                    .font(RedappType.section)
+                    .foregroundStyle(RedappDesign.ink)
+                Spacer()
+                if let onClose {
+                    Button(action: onClose) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 15, weight: .medium))
+                    }
+                    .buttonStyle(RedappIconButtonStyle())
+                    .accessibilityLabel("Close question box")
+                }
+            }
+            Text("Answers use the loaded comments.")
+                .font(.subheadline)
+                .foregroundStyle(RedappDesign.inkSecondary)
+
+            HStack(spacing: 10) {
+                RedappAskBar(
+                    placeholder: "Ask about this thread…",
+                    text: $question,
+                    isBusy: isAnswering,
+                    onSubmit: askQuestion
+                )
+                if summaryService.settings.selectedSummaryProvider != .webAI {
+                    Button(action: openWebCommentQuestion) {
+                        Label("Use web model", systemImage: "globe")
+                    }
+                    .buttonStyle(RedappSecondaryButtonStyle())
+                    .disabled(question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .accessibilityLabel("Ask on \(summaryService.settings.selectedWebAIProvider.displayName)")
+                }
+            }
+
+            if isAnswering {
+                ProgressView("Answering...")
+                    .padding(.horizontal)
+                if let throughput = summaryService.mlxThroughputState,
+                   throughput.provider == summaryService.settings.selectedSummaryProvider,
+                   throughput.provider != .appleCloud {
+                    Text(mlxThroughputInlineText(throughput))
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                        .padding(.horizontal)
+                }
+            }
+
+            if let answer = answer,
+               !answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                ResizableTextBox(
+                    title: "Answer:",
+                    content: showingSummary && answerSummary != nil ? answerSummary! : answer,
+                    isAnswer: true,
+                    onCloudSpeakClicked: speakAnswer,
+                    onLocalSpeakClicked: speakAnswerLocally,
+                    onKokoroSpeakClicked: speakAnswerWithKokoro,
+                    onSummarizeClicked: summarizeAnswer,
+                    onAskAI: askAIHandler,
+                    onAskAIWeb: askAIWebHandler
+                )
+                .padding(.horizontal)
+
+                if isSynthesizingAnswerSpeech {
+                    HStack {
+                        ProgressView()
+                            .scaleEffect(0.7)
+                            .padding(.trailing, 5)
+                        Text("Reading answer...")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    .padding(.horizontal)
+                    .padding(.bottom, 4)
+                }
+
+                if let answerSpeechSynthesisError = answerSpeechSynthesisError {
+                    RedappInlineMessage(message: answerSpeechSynthesisError)
+                        .padding(.horizontal)
+                        .padding(.bottom, 4)
+                }
+            } else if !isAnswering, let answerError = answerError {
+                RedappInlineMessage(title: "Couldn’t answer that question", message: answerError)
+                    .padding(.horizontal)
+            }
+
+            if let count = commentsSentToLLMCount {
+                Text("Sent \(count) comments to LLM")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal)
+            }
+
+            if let throughput = summaryService.mlxThroughputState,
+               throughput.provider == summaryService.settings.selectedSummaryProvider,
+               throughput.provider != .appleCloud {
+                Text(mlxThroughputInlineText(throughput))
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal)
+            }
+        }
+        }
+
+        private func summaryPanelEmptyState(
+            title: String,
+            actionTitle: String,
+            isDisabled: Bool,
+            action: @escaping () -> Void
+        ) -> some View {
+            VStack(alignment: .leading, spacing: 12) {
+                Text(title)
+                    .font(.headline)
+                    .foregroundStyle(RedappDesign.ink)
+                Button(action: action) {
+                    Label(actionTitle, systemImage: "sparkles")
+                }
+                .buttonStyle(RedappPrimaryButtonStyle())
+                .disabled(isDisabled)
+            }
+            .padding(.top, 8)
+        }
+
+        // MARK: - Action menu items
+
+        @ViewBuilder
+        private var commentSummaryMenuItems: some View {
+            Button {
+                selectedSummaryType = .short
+                summarizeComments(isShort: true)
+            } label: {
+                Label(shortSummaryLabel, systemImage: "text.badge.minus")
+                Text("2 paragraphs")
+            }
+            .disabled(isSummarizing)
+
+            Button {
+                selectedSummaryType = .long
+                summarizeComments(isShort: false)
+            } label: {
+                Label(longSummaryLabel, systemImage: "text.badge.plus")
+                Text("Detailed analysis")
+            }
+            .disabled(isSummarizing)
+        }
+
+        @ViewBuilder
+        private var postSummaryMenuItems: some View {
+            let postUnavailable = isSummarizingPost || (postTitle.isEmpty && postContent.isEmpty)
+            Button {
+                selectedSummaryType = .short
+                summarizePost(isShort: true)
+            } label: {
+                Label(shortSummaryLabel, systemImage: "text.badge.minus")
+                Text("2 paragraphs")
+            }
+            .disabled(postUnavailable)
+
+            Button {
+                selectedSummaryType = .long
+                summarizePost(isShort: false)
+            } label: {
+                Label(longSummaryLabel, systemImage: "text.badge.plus")
+                Text("Detailed analysis")
+            }
+            .disabled(postUnavailable)
+        }
+
+        /// iPhone menus are narrow; short labels avoid hyphenated line breaks.
+        private var isPhone: Bool { UIDevice.current.userInterfaceIdiom == .phone }
+        private var shortSummaryLabel: String { isPhone ? "Short" : "Short summary" }
+        private var longSummaryLabel: String { isPhone ? "Long" : "Long summary" }
+
+        /// Name of the model the normal Summarize items use.
+        private var summaryModelName: String {
+            let provider = summaryService.settings.selectedSummaryProvider
+            if provider == .webAI {
+                return "\(summaryService.settings.selectedWebAIProvider.displayName) on the web"
+            }
+            return provider.displayName
+        }
+
+        /// The same actions, run on the web model instead ("Run on ChatGPT ›").
+        @ViewBuilder
+        private var webSummaryMenu: some View {
+            let webName = summaryService.settings.selectedWebAIProvider.displayName
+            let postUnavailable = isSummarizingPost || (postTitle.isEmpty && postContent.isEmpty)
+            Menu {
+                Section("Comments") {
+                    Button {
+                        openWebCommentSummary(isShort: true)
+                    } label: {
+                        Label(shortSummaryLabel, systemImage: "text.badge.minus")
+                        Text("2 paragraphs")
+                    }
+                    .disabled(isSummarizing)
+                    Button {
+                        openWebCommentSummary(isShort: false)
+                    } label: {
+                        Label(longSummaryLabel, systemImage: "text.badge.plus")
+                        Text("Detailed analysis")
+                    }
+                    .disabled(isSummarizing)
+                }
+                Section("Post") {
+                    Button {
+                        openWebPostSummary(isShort: true)
+                    } label: {
+                        Label(shortSummaryLabel, systemImage: "text.badge.minus")
+                        Text("2 paragraphs")
+                    }
+                    .disabled(postUnavailable)
+                    Button {
+                        openWebPostSummary(isShort: false)
+                    } label: {
+                        Label(longSummaryLabel, systemImage: "text.badge.plus")
+                        Text("Detailed analysis")
+                    }
+                    .disabled(postUnavailable)
+                }
+                Section("Analyze") {
+                    Button {
+                        openWebCommentAnalysis()
+                    } label: {
+                        Label("Deep analysis", systemImage: "chart.pie")
+                        Text("Sentiment and themes")
+                    }
+                    .disabled(allComments.isEmpty)
+                }
+            } label: {
+                Label("Run on \(webName)", systemImage: "globe")
+                Text("Uses your web session")
+            }
+        }
+
+        @ViewBuilder
+        private var readAloudMenuItems: some View {
+            Button {
+                readAllCommentsCloud()
+            } label: {
+                Label("OpenAI Voice", systemImage: "speaker.wave.2")
+                Text("Cloud")
+            }
+            Button {
+                readAllCommentsLocally()
+            } label: {
+                Label("System Voice", systemImage: "speaker.wave.2.circle")
+                Text("On device")
+            }
+            Button {
+                readAllCommentsWithKokoro()
+            } label: {
+                Label("MLX Voice", systemImage: "waveform")
+                Text("On device")
+            }
+        }
+
         var body: some View {
             let askAIHandler: (String) -> Void = { selection in
                 askAIFromRedditSelection(selection, useWebPath: false)
@@ -26294,860 +26617,71 @@ struct RedditCommentsView: View {
                 ScrollViewReader { proxy in
                     ScrollView {
                         VStack {
+                        Color.clear.frame(height: 0)
+                            .onChange(of: isAskPanelOpen) { _, isOpen in
+                                guard isOpen else { return }
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                                    withAnimation(.easeInOut(duration: 0.25)) {
+                                        proxy.scrollTo(askPanelID, anchor: .top)
+                                    }
+                                }
+                            }
                         if isLoading {
-                            ProgressView()
-                                .padding()
+                            ProgressView("Loading post…")
+                                .padding(.top, 120)
+                                .frame(maxWidth: .infinity)
                         } else if let error = error {
-                            Text(error)
-                                .foregroundColor(.red)
-                                .padding()
+                            ContentUnavailableView {
+                                Label("Couldn’t Load Comments", systemImage: "exclamationmark.bubble")
+                            } description: {
+                                Text(error)
+                            }
+                            .padding(.top, 80)
                         } else {
                             // Display post content first
                             if !postTitle.isEmpty {
-                                VStack(alignment: .leading, spacing: 12) {
-                                    // Post title
-                                    SelectableText(postTitle)
-                                        .font(.title2)
-                                        .fontWeight(.bold)
-                                        .multilineTextAlignment(.leading)
-                                        .padding(.horizontal)
-                                    
-                                    // Post content (if any)
-                                    if !postContent.isEmpty {
-                                        SelectableText(makeAttributedText(from: postContent) ?? AttributedString(postContent))
-                                            .font(.body)
-                                            .multilineTextAlignment(.leading)
-                                            .padding(.horizontal)
-                                            .lineLimit(nil)
-                                    }
-                                    
-                                    // Reply button for the post
-                                    HStack {
-                                        Spacer()
-                                        Button(action: {
-                                            if RedditAuthManager.shared.isAuthenticated {
-                                                isReplyingToPost = true
-                                            } else {
-                                                // Show login prompt
-                                                Task {
-                                                    await showLoginPrompt()
-                                                }
-                                            }
-                                        }) {
-                                            Label("Reply to Post", systemImage: "bubble.left")
-                                        }
-                                        .buttonStyle(LiquidGlassButtonStyle())
-                                        .padding(.horizontal)
-                                    }
-                                    
-                                }
-                                .padding(.vertical)
-                                .background {
-                                    if experimentalAppGlassEnabled {
-                                        Color.black
-                                    } else if isDarkMode {
-                                        Color.black
-                                    } else {
-                                        Color.clear.background(.ultraThinMaterial)
-                                    }
-                                }
-                                .cornerRadius(12)
-                                .padding(.horizontal, 8)
-                                .padding(.bottom)
+                                readerHeader(proxy: proxy)
+                                    .redappReadableColumn(RedappDesign.readingWidth)
+                                    .padding(.horizontal, readerSideMargin)
+                                    .padding(.top, 20)
                             }
-                            
-                            // Add buttons at the top of comments (only when comments exist)
-                            if !allComments.isEmpty {
-                                VStack(spacing: 8) {
-                                    // Add "Summarize" label
-                                    Text("Summarize")
-                                        .font(.system(size: 16, weight: .semibold))
-                                        .foregroundColor(.secondary)
-                                    
-                                    ScrollView(.horizontal, showsIndicators: false) {
-                                        HStack(spacing: 8) {
 
-                                        // Summary Button with dropdown menu
-                                        Menu {
-                                            Button {
-                                                selectedSummaryType = .short
-                                                summarizeComments(isShort: true)
-                                            } label: {
-                                                Label("Short Summary", systemImage: "text.badge.minus")
-                                                Text("2 paragraphs max")
-                                            }
 
-                                            Button {
-                                                selectedSummaryType = .long
-                                                summarizeComments(isShort: false)
-                                            } label: {
-                                                Label("Long Summary", systemImage: "text.badge.plus")
-                                                Text("Detailed analysis")
-                                            }
+                            discussionHeader
+                                .redappReadableColumn(RedappDesign.readingWidth)
+                                .padding(.horizontal, readerSideMargin)
+                                .padding(.top, 8)
+                                .id(discussionSectionID)
 
-                                            if summaryService.settings.selectedSummaryProvider != .webAI {
-                                                Divider()
-
-                                                Button {
-                                                    openWebCommentSummary(isShort: true)
-                                                } label: {
-                                                    Label("Web Short Summary", systemImage: "globe")
-                                                    Text("Send to \(summaryService.settings.selectedWebAIProvider.displayName)")
-                                                }
-
-                                                Button {
-                                                    openWebCommentSummary(isShort: false)
-                                                } label: {
-                                                    Label("Web Long Summary", systemImage: "globe")
-                                                    Text("Send to \(summaryService.settings.selectedWebAIProvider.displayName)")
-                                                }
-                                            }
-                                        } label: {
-                                            Text("Comments")
-                                                .font(.system(size: 14, weight: .medium))
-                                        }
-                                        .buttonStyle(AdaptiveLiquidGlassButtonStyle(cornerRadius: 20, isCompact: true))
-                                        .fixedSize()
-                                        .disabled(isSummarizing)
-
-                                    // Deep Analysis button
-                                    Button(action: {
-                                        activeAnalyticsLaunchMode = .standard
-                                    }) {
-                                        Image(systemName: "chart.pie.fill")
-                                    }
-                                    .buttonStyle(LiquidGlassButtonStyle(isProminent: true))
-                                    .accessibilityLabel("Deep Analysis")
-                                    .sheet(item: $activeAnalyticsLaunchMode) { launchMode in
-                                        CommentAnalyticsView(
-                                            comments: allComments,
-                                            forceWebAI: launchMode.forceWebAI
-                                        )
-                                            .webAIHandoffPresenter(appState: AppState.shared)
-                                            .presentationDetents([.large])
-                                            .presentationCornerRadius(32)
-                                            .presentationBackground(.clear)   // remove system chrome
-                                            .clearModalBackground()           // make modal truly transparent
-                                    }
-
-                                    if summaryService.settings.selectedSummaryProvider != .webAI {
-                                        Menu {
-                                            Button {
-                                                openWebCommentAnalysis()
-                                            } label: {
-                                                Label("Web Deep Analysis", systemImage: "globe")
-                                                Text("Send dashboard prompt to \(summaryService.settings.selectedWebAIProvider.displayName)")
-                                            }
-                                        } label: {
-                                            Image(systemName: "globe")
-                                        }
-                                        .buttonStyle(LiquidGlassButtonStyle(isProminent: true))
-                                        .accessibilityLabel("Web Deep Analysis")
-                                    }
-
-                                    // Summarize Post Button with dropdown menu
-                                    Menu {
-                                        Button {
-                                            selectedSummaryType = .short
-                                            summarizePost(isShort: true)
-                                        } label: {
-                                            Label("Short Summary", systemImage: "text.badge.minus")
-                                            Text("2 paragraphs max")
-                                        }
-
-                                        Button {
-                                            selectedSummaryType = .long
-                                            summarizePost(isShort: false)
-                                        } label: {
-                                            Label("Long Summary", systemImage: "text.badge.plus")
-                                            Text("Detailed analysis")
-                                        }
-
-                                        if summaryService.settings.selectedSummaryProvider != .webAI {
-                                            Divider()
-
-                                            Button {
-                                                openWebPostSummary(isShort: true)
-                                            } label: {
-                                                Label("Web Short Summary", systemImage: "globe")
-                                                Text("Send to \(summaryService.settings.selectedWebAIProvider.displayName)")
-                                            }
-
-                                            Button {
-                                                openWebPostSummary(isShort: false)
-                                            } label: {
-                                                Label("Web Long Summary", systemImage: "globe")
-                                                Text("Send to \(summaryService.settings.selectedWebAIProvider.displayName)")
-                                            }
-                                        }
-                                    } label: {
-                                        Text("Post")
-                                            .font(.system(size: 14, weight: .medium))
-                                    }
-                                    .buttonStyle(AdaptiveLiquidGlassButtonStyle(cornerRadius: 20, isCompact: true))
-                                    .fixedSize()
-                                    .disabled(isSummarizingPost || (postTitle.isEmpty && postContent.isEmpty))
-
-                                    // Read All Comments TTS button
-                                    if isReadingAllComments {
-                                        Button {
-                                            stopReadingAllComments()
-                                        } label: {
-                                            Label("Stop", systemImage: "stop.circle.fill")
-                                                .font(.system(size: 14, weight: .medium))
-                                                .foregroundColor(.red)
-                                        }
-                                        .buttonStyle(AdaptiveLiquidGlassButtonStyle(cornerRadius: 20, isCompact: true))
-                                        .fixedSize()
-                                    } else {
-                                        Menu {
-                                            Button {
-                                                readAllCommentsCloud()
-                                            } label: {
-                                                Label("OpenAI TTS", systemImage: "speaker.wave.2")
-                                            }
-                                            Button {
-                                                readAllCommentsLocally()
-                                            } label: {
-                                                Label("Local TTS", systemImage: "speaker.wave.2.circle")
-                                            }
-                                            Button {
-                                                readAllCommentsWithKokoro()
-                                            } label: {
-                                                Label("MLX TTS", systemImage: "waveform")
-                                            }
-                                        } label: {
-                                            Label("Read", systemImage: "speaker.wave.2")
-                                                .font(.system(size: 14, weight: .medium))
-                                        }
-                                        .buttonStyle(AdaptiveLiquidGlassButtonStyle(cornerRadius: 20, isCompact: true))
-                                        .fixedSize()
-                                        .disabled(allComments.isEmpty)
-                                    }
-
-                                    Button {
-                                        withAnimation(.easeInOut(duration: 0.25)) {
-                                            proxy.scrollTo(askQuestionSectionID, anchor: .center)
-                                        }
-                                    } label: {
-                                        Image(systemName: "arrow.down.circle.fill")
-                                            .font(.system(size: 18, weight: .semibold))
-                                    }
-                                    .buttonStyle(AdaptiveLiquidGlassButtonStyle(cornerRadius: 20, isCompact: true))
-                                    .accessibilityLabel("Jump to Ask a Question")
-
-                                        }
-                                        .padding(.horizontal)
-                                    }
-                                }
+                            if allComments.isEmpty {
+                                ContentUnavailableView(
+                                    "No Comments Yet",
+                                    systemImage: "bubble.left.and.bubble.right",
+                                    description: Text("Nobody has replied to this post yet.")
+                                )
+                                .padding(.vertical, 40)
                             } else {
-                                // Show reddit image when no comments
-                                VStack {
-                                    Spacer()
-                                    Image("reddit")
-                                        .resizable()
-                                        .scaledToFit()
-                                        .frame(maxWidth: 200, maxHeight: 200)
-                                        .opacity(0.8)
-                                    Text("No comments yet")
-                                        .font(.title2)
-                                        .foregroundColor(.secondary)
-                                        .padding(.top)
-                                    Spacer()
-                                }
-                                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                            }
-                            
-                            if !allComments.isEmpty {
-                                ExperimentalAppGlassContainer(enabled: experimentalAppGlassEnabled, spacing: 18) {
-                                    LazyVStack(alignment: .leading, spacing: 12) {
-                                        ForEach(allComments.prefix(visibleCount)) { comment in
-                                            CommentView(comment: comment, postPermalink: postPermalink)
+                                LazyVStack(alignment: .leading, spacing: 0) {
+                                    ForEach(sortedComments.prefix(visibleCount)) { comment in
+                                        CommentView(comment: comment, postPermalink: postPermalink)
+                                    }
+                                    if visibleCount < allComments.count {
+                                        Button("Load more comments") {
+                                            visibleCount += 10
                                         }
-                                        if visibleCount < allComments.count {
-                                            Button("Load More Comments") {
-                                                visibleCount += 10
-                                            }
-                                            .buttonStyle(LiquidGlassButtonStyle())
-                                            .padding()
-                                        }
+                                        .buttonStyle(RedappSecondaryButtonStyle())
+                                        .padding(.vertical, 18)
+                                        .frame(maxWidth: .infinity)
                                     }
                                 }
-                                .padding(.vertical)
-                                .padding(.horizontal, 8)
+                                .redappReadableColumn(RedappDesign.readingWidth)
+                                .padding(.horizontal, readerSideMargin)
+                                .padding(.bottom, 12)
                             }
                         }
                         
-                        // Bottom controls section
-                        VStack(spacing: 16) {
-                            #if os(iOS)
-                            if UIDevice.current.userInterfaceIdiom == .phone {
-                                // iPhone layout - vertical stack
-                                VStack(spacing: 12) {
-                                    // Main actions button
-                                    if !showBottomActions {
-                                        HStack {
-                                            Spacer()
-                                            Button(action: {
-                                                withAnimation(.easeInOut(duration: 0.2)) {
-                                                    showBottomActions = true
-                                                }
-                                            }) {
-                                                Image(systemName: "ellipsis.circle")
-                                                    .font(.system(size: 20))
-                                                    .foregroundColor(.primary)
-                                                    .frame(width: 44, height: 44)
-                                                    .background {
-                                                        Circle()
-                                                            .fill(.ultraThinMaterial)
-                                                            .overlay {
-                                                                Circle()
-                                                                    .stroke(Color.white.opacity(0.2), lineWidth: 0.5)
-                                                            }
-                                                    }
-                                            }
-                                            .buttonStyle(PlainButtonStyle())
-                                            Spacer()
-                                        }
-                                        .transition(.opacity.combined(with: .scale))
-                                    }
-                                    
-                                    // Action buttons (shown when showBottomActions is true)
-                                    if showBottomActions {
-                                        // Copy Comments button - centered
-                                        HStack {
-                                            Spacer()
-                                            Button(action: copyCommentsToClipboard) {
-                                                HStack {
-                                                    Image(systemName: "doc.on.doc")
-                                                    Text("Copy Comments")
-                                                }
-                                            }
-                                            .buttonStyle(LiquidGlassButtonStyle())
-                                            Spacer()
-                                        }
-                                    
-                                    // Summarize buttons in horizontal stack - matching top button style
-                                    HStack(spacing: 16) {
-                                        Spacer()
-                                        
-                                        // Summarize Comments button with dropdown menu
-                                        Menu {
-                                            Button {
-                                                selectedSummaryType = .short
-                                                summarizeComments(isShort: true)
-                                            } label: {
-                                                Label("Short Summary", systemImage: "text.badge.minus")
-                                                Text("2 paragraphs max")
-                                            }
-                                            
-                                            Button {
-                                                selectedSummaryType = .long
-                                                summarizeComments(isShort: false)
-                                            } label: {
-                                                Label("Long Summary", systemImage: "text.badge.plus")
-                                                Text("Detailed analysis")
-                                            }
-
-                                            if summaryService.settings.selectedSummaryProvider != .webAI {
-                                                Divider()
-
-                                                Button {
-                                                    openWebCommentSummary(isShort: true)
-                                                } label: {
-                                                    Label("Web Short Summary", systemImage: "globe")
-                                                    Text("Send to \(summaryService.settings.selectedWebAIProvider.displayName)")
-                                                }
-
-                                                Button {
-                                                    openWebCommentSummary(isShort: false)
-                                                } label: {
-                                                    Label("Web Long Summary", systemImage: "globe")
-                                                    Text("Send to \(summaryService.settings.selectedWebAIProvider.displayName)")
-                                                }
-                                            }
-                                        } label: {
-                                            if isSummarizing {
-                                                ProgressView()
-                                                    .scaleEffect(0.7)
-                                                    .frame(width: 36, height: 36)
-                                                    .background {
-                                                        Circle()
-                                                            .fill(.ultraThinMaterial)
-                                                            .overlay {
-                                                                Circle()
-                                                                    .stroke(Color.white.opacity(0.2), lineWidth: 0.5)
-                                                            }
-                                                    }
-                                            } else {
-                                                Image(systemName: "bubble.left.and.bubble.right")
-                                                    .font(.system(size: 16))
-                                                    .foregroundColor(.primary)
-                                                    .frame(width: 36, height: 36)
-                                                    .background {
-                                                        Circle()
-                                                            .fill(.ultraThinMaterial)
-                                                            .overlay {
-                                                                Circle()
-                                                                    .stroke(Color.white.opacity(0.2), lineWidth: 0.5)
-                                                            }
-                                                    }
-                                            }
-                                        }
-                                        .disabled(isSummarizing)
-                                        
-                                        // Summarize Post button with dropdown menu
-                                        Menu {
-                                            Button {
-                                                selectedSummaryType = .short
-                                                summarizePost(isShort: true)
-                                            } label: {
-                                                Label("Short Summary", systemImage: "text.badge.minus")
-                                                Text("2 paragraphs max")
-                                            }
-                                            
-                                            Button {
-                                                selectedSummaryType = .long
-                                                summarizePost(isShort: false)
-                                            } label: {
-                                                Label("Long Summary", systemImage: "text.badge.plus")
-                                                Text("Detailed analysis")
-                                            }
-
-                                            if summaryService.settings.selectedSummaryProvider != .webAI {
-                                                Divider()
-
-                                                Button {
-                                                    openWebPostSummary(isShort: true)
-                                                } label: {
-                                                    Label("Web Short Summary", systemImage: "globe")
-                                                    Text("Send to \(summaryService.settings.selectedWebAIProvider.displayName)")
-                                                }
-
-                                                Button {
-                                                    openWebPostSummary(isShort: false)
-                                                } label: {
-                                                    Label("Web Long Summary", systemImage: "globe")
-                                                    Text("Send to \(summaryService.settings.selectedWebAIProvider.displayName)")
-                                                }
-                                            }
-                                        } label: {
-                                            if isSummarizingPost {
-                                                ProgressView()
-                                                    .scaleEffect(0.7)
-                                                    .frame(width: 36, height: 36)
-                                                    .background {
-                                                        Circle()
-                                                            .fill(.ultraThinMaterial)
-                                                            .overlay {
-                                                                Circle()
-                                                                    .stroke(Color.white.opacity(0.2), lineWidth: 0.5)
-                                                            }
-                                                    }
-                                            } else {
-                                                Image(systemName: "doc.richtext")
-                                                    .font(.system(size: 16))
-                                                    .foregroundColor(.primary)
-                                                    .frame(width: 36, height: 36)
-                                                    .background {
-                                                        Circle()
-                                                            .fill(.ultraThinMaterial)
-                                                            .overlay {
-                                                                Circle()
-                                                                    .stroke(Color.white.opacity(0.2), lineWidth: 0.5)
-                                                            }
-                                                    }
-                                            }
-                                        }
-                                        .disabled(isSummarizingPost || (postTitle.isEmpty && postContent.isEmpty))
-                                        
-                                        Button {
-                                            withAnimation(.easeInOut(duration: 0.25)) {
-                                                proxy.scrollTo(askQuestionSectionID, anchor: .center)
-                                            }
-                                        } label: {
-                                            Image(systemName: "arrow.down.circle.fill")
-                                                .font(.system(size: 16))
-                                                .foregroundColor(.primary)
-                                                .frame(width: 36, height: 36)
-                                                .background {
-                                                    Circle()
-                                                        .fill(.ultraThinMaterial)
-                                                        .overlay {
-                                                            Circle()
-                                                                .stroke(Color.white.opacity(0.2), lineWidth: 0.5)
-                                                        }
-                                                }
-                                        }
-                                        .buttonStyle(PlainButtonStyle())
-                                        .accessibilityLabel("Jump to Ask a Question")
-                                        
-                                        Spacer()
-                                        
-                                        // Close button for actions menu
-                                        if showBottomActions {
-                                            Button(action: {
-                                                withAnimation(.easeInOut(duration: 0.2)) {
-                                                    showBottomActions = false
-                                                }
-                                            }) {
-                                                Image(systemName: "xmark.circle.fill")
-                                                    .font(.system(size: 20))
-                                                    .foregroundColor(.gray)
-                                            }
-                                            .buttonStyle(PlainButtonStyle())
-                                        }
-                                    }
-                                    .transition(.move(edge: .bottom).combined(with: .opacity))
-                                    
-                                    // Help text for buttons
-                                    if showBottomActions {
-                                        HStack(spacing: 0) {
-                                            Spacer()
-                                            
-                                            // Comments label - positioned under Comments button
-                                            Text("Comments")
-                                                .font(.caption2)
-                                                .foregroundColor(.secondary)
-                                                .frame(width: 70)
-                                            
-                                            // Space between the two labels
-                                            Spacer()
-                                                .frame(width: 16)
-                                            
-                                            // Post label - positioned under Post button
-                                            Text("Post")
-                                                .font(.caption2)
-                                                .foregroundColor(.secondary)
-                                                .frame(width: 70)
-                                            
-                                            Spacer()
-                                        }
-                                        .opacity(0.6)
-                                    }
-                                    }
-                                }
-                                .padding(.horizontal)
-                                .padding(.bottom)
-                                .animation(.easeInOut(duration: 0.2), value: showBottomActions)
-                            } else {
-                                // iPad layout - same as Mac
-                                VStack {
-                                    // Main actions button
-                                    if !showBottomActions {
-                                        HStack {
-                                            Spacer()
-                                            Button(action: {
-                                                withAnimation(.easeInOut(duration: 0.2)) {
-                                                    showBottomActions = true
-                                                }
-                                            }) {
-                                                Image(systemName: "ellipsis.circle")
-                                                    .font(.system(size: 20))
-                                                    .foregroundColor(.primary)
-                                                    .frame(width: 44, height: 44)
-                                                    .background {
-                                                        Circle()
-                                                            .fill(.ultraThinMaterial)
-                                                            .overlay {
-                                                                Circle()
-                                                                    .stroke(Color.white.opacity(0.2), lineWidth: 0.5)
-                                                            }
-                                                    }
-                                            }
-                                            .buttonStyle(PlainButtonStyle())
-                                            Spacer()
-                                        }
-                                        .transition(.opacity.combined(with: .scale))
-                                    }
-                                    
-                                    if showBottomActions {
-                                        HStack(spacing: 8) {
-                                            Button(action: copyCommentsToClipboard) {
-                                                Image(systemName: "doc.on.doc")
-                                            }
-                                            .buttonStyle(LiquidGlassButtonStyle())
-                                            .accessibilityLabel("Copy Comments")
-
-                                        Menu {
-                                            Button {
-                                                selectedSummaryType = .short
-                                                summarizePost(isShort: true)
-                                            } label: {
-                                                Label("Short Summary", systemImage: "text.badge.minus")
-                                                Text("2 paragraphs max")
-                                            }
-
-                                            Button {
-                                                selectedSummaryType = .long
-                                                summarizePost(isShort: false)
-                                            } label: {
-                                                Label("Long Summary", systemImage: "text.badge.plus")
-                                                Text("Detailed analysis")
-                                            }
-                                        } label: {
-                                            if isSummarizingPost {
-                                                ProgressView()
-                                            } else {
-                                                Image(systemName: "doc.richtext")
-                                            }
-                                        }
-                                        .buttonStyle(LiquidGlassButtonStyle())
-                                        .disabled(isSummarizingPost || (postTitle.isEmpty && postContent.isEmpty))
-                                        .accessibilityLabel("Summarize Post")
-
-                                        if isReadingAllComments {
-                                            Button {
-                                                stopReadingAllComments()
-                                            } label: {
-                                                Image(systemName: "stop.circle.fill")
-                                                    .foregroundColor(.red)
-                                            }
-                                            .buttonStyle(LiquidGlassButtonStyle())
-                                            .accessibilityLabel("Stop Reading Comments")
-                                        } else {
-                                        Menu {
-                                            Button {
-                                                readAllCommentsCloud()
-                                            } label: {
-                                                Label("OpenAI TTS", systemImage: "speaker.wave.2")
-                                            }
-                                            Button {
-                                                readAllCommentsLocally()
-                                            } label: {
-                                                Label("Local TTS", systemImage: "speaker.wave.2.circle")
-                                            }
-                                            Button {
-                                                readAllCommentsWithKokoro()
-                                            } label: {
-                                                Label("MLX TTS", systemImage: "waveform")
-                                            }
-                                        } label: {
-                                            Image(systemName: "speaker.wave.2")
-                                        }
-                                        .buttonStyle(LiquidGlassButtonStyle())
-                                        .disabled(allComments.isEmpty)
-                                        .accessibilityLabel("Read Comments")
-                                        }
-
-                                        Button {
-                                            withAnimation(.easeInOut(duration: 0.25)) {
-                                                proxy.scrollTo(askQuestionSectionID, anchor: .center)
-                                            }
-                                        } label: {
-                                            Image(systemName: "arrow.down.circle.fill")
-                                        }
-                                        .buttonStyle(LiquidGlassButtonStyle())
-                                        .accessibilityLabel("Jump to Ask a Question")
-
-                                        Menu {
-                                            Button {
-                                                selectedSummaryType = .short
-                                                summarizeComments(isShort: true)
-                                            } label: {
-                                                Label("Short Summary", systemImage: "text.badge.minus")
-                                                Text("2 paragraphs max")
-                                            }
-
-                                            Button {
-                                                selectedSummaryType = .long
-                                                summarizeComments(isShort: false)
-                                            } label: {
-                                                Label("Long Summary", systemImage: "text.badge.plus")
-                                                Text("Detailed analysis")
-                                            }
-                                        } label: {
-                                            if isSummarizing {
-                                                ProgressView()
-                                            } else {
-                                                Image(systemName: "bubble.left.and.bubble.right")
-                                            }
-                                        }
-                                        .buttonStyle(LiquidGlassButtonStyle())
-                                        .disabled(isSummarizing)
-                                        .accessibilityLabel("Summarize Comments")
-
-                                        Button(action: {
-                                            withAnimation(.easeInOut(duration: 0.2)) {
-                                                showBottomActions = false
-                                            }
-                                        }) {
-                                            Image(systemName: "xmark")
-                                                .foregroundColor(.secondary)
-                                        }
-                                        .buttonStyle(LiquidGlassButtonStyle())
-                                        .accessibilityLabel("Close Actions")
-                                    }
-                                    .frame(maxWidth: .infinity)
-                                    .transition(.move(edge: .bottom).combined(with: .opacity))
-                                }
-                                }
-                                .padding(.horizontal)
-                                .padding(.bottom)
-                                .animation(.easeInOut(duration: 0.2), value: showBottomActions)
-                            }
-                            #else
-                            // macOS layout
-                            VStack {
-                                // Main actions button
-                                if !showBottomActions {
-                                    HStack {
-                                        Spacer()
-                                        Button(action: {
-                                            withAnimation(.easeInOut(duration: 0.2)) {
-                                                showBottomActions = true
-                                            }
-                                        }) {
-                                            Image(systemName: "ellipsis.circle")
-                                                .font(.system(size: 20))
-                                                .foregroundColor(.primary)
-                                                .frame(width: 44, height: 44)
-                                                .background {
-                                                    Circle()
-                                                        .fill(.ultraThinMaterial)
-                                                        .overlay {
-                                                            Circle()
-                                                                .stroke(Color.white.opacity(0.2), lineWidth: 0.5)
-                                                        }
-                                                }
-                                        }
-                                        .buttonStyle(PlainButtonStyle())
-                                        Spacer()
-                                    }
-                                    .transition(.opacity.combined(with: .scale))
-                                }
-                                
-                                if showBottomActions {
-                                    HStack {
-                                        Button(action: copyCommentsToClipboard) {
-                                            Text("Copy Comments")
-                                        }
-                                        .buttonStyle(LiquidGlassButtonStyle())
-                                        
-                                        Spacer()
-                                
-                                // Summarize Post button with dropdown menu
-                                Menu {
-                                    Button {
-                                        selectedSummaryType = .short
-                                        summarizePost(isShort: true)
-                                    } label: {
-                                        Label("Short Summary", systemImage: "text.badge.minus")
-                                        Text("2 paragraphs max")
-                                    }
-                                    
-                                    Button {
-                                        selectedSummaryType = .long
-                                        summarizePost(isShort: false)
-                                    } label: {
-                                        Label("Long Summary", systemImage: "text.badge.plus")
-                                        Text("Detailed analysis")
-                                    }
-                                } label: {
-                                    if isSummarizingPost {
-                                        ProgressView()
-                                    } else {
-                                        Text("Summarize Post")
-                                    }
-                                }
-                                .buttonStyle(LiquidGlassButtonStyle())
-                                .disabled(isSummarizingPost || (postTitle.isEmpty && postContent.isEmpty))
-
-                                // Read All Comments TTS button
-                                if isReadingAllComments {
-                                    Button {
-                                        stopReadingAllComments()
-                                    } label: {
-                                        Label("Stop", systemImage: "stop.circle.fill")
-                                            .font(.system(size: 14, weight: .medium))
-                                            .foregroundColor(.red)
-                                    }
-                                    .buttonStyle(LiquidGlassButtonStyle())
-                                } else {
-                                    Menu {
-                                        Button {
-                                            readAllCommentsCloud()
-                                        } label: {
-                                            Label("OpenAI TTS", systemImage: "speaker.wave.2")
-                                        }
-                                        Button {
-                                            readAllCommentsLocally()
-                                        } label: {
-                                            Label("Local TTS", systemImage: "speaker.wave.2.circle")
-                                        }
-                                        Button {
-                                            readAllCommentsWithKokoro()
-                                        } label: {
-                                            Label("MLX TTS", systemImage: "waveform")
-                                        }
-                                    } label: {
-                                        Label("Read", systemImage: "speaker.wave.2")
-                                            .font(.system(size: 14, weight: .medium))
-                                    }
-                                    .buttonStyle(LiquidGlassButtonStyle())
-                                    .disabled(allComments.isEmpty)
-                                }
-
-                                Button {
-                                    withAnimation(.easeInOut(duration: 0.25)) {
-                                        proxy.scrollTo(askQuestionSectionID, anchor: .center)
-                                    }
-                                } label: {
-                                    Image(systemName: "arrow.down.circle.fill")
-                                        .font(.system(size: 18, weight: .semibold))
-                                }
-                                .buttonStyle(LiquidGlassButtonStyle())
-                                .accessibilityLabel("Jump to Ask a Question")
-
-                                Spacer()
-                                // Summarize Comments button with dropdown menu
-                                Menu {
-                                    Button {
-                                        selectedSummaryType = .short
-                                        summarizeComments(isShort: true)
-                                    } label: {
-                                        Label("Short Summary", systemImage: "text.badge.minus")
-                                        Text("2 paragraphs max")
-                                    }
-                                    
-                                    Button {
-                                        selectedSummaryType = .long
-                                        summarizeComments(isShort: false)
-                                    } label: {
-                                        Label("Long Summary", systemImage: "text.badge.plus")
-                                        Text("Detailed analysis")
-                                    }
-                                } label: {
-                                    if isSummarizing {
-                                        ProgressView()
-                                    } else {
-                                        Text("Summarize Comments")
-                                    }
-                                }
-                                .buttonStyle(LiquidGlassButtonStyle())
-                                .disabled(isSummarizing)
-                                
-                                Spacer()
-                                
-                                // Close button
-                                Button(action: {
-                                    withAnimation(.easeInOut(duration: 0.2)) {
-                                        showBottomActions = false
-                                    }
-                                }) {
-                                    Image(systemName: "xmark.circle.fill")
-                                        .font(.system(size: 20))
-                                        .foregroundColor(.gray)
-                                }
-                                .buttonStyle(PlainButtonStyle())
-                            }
-                            .transition(.move(edge: .bottom).combined(with: .opacity))
-                            }
-                            }
-                            .padding(.horizontal)
-                            .padding(.bottom)
-                            .animation(.easeInOut(duration: 0.2), value: showBottomActions)
-                            #endif
+                        // Summary status, errors and the Ask section
+                        VStack(alignment: .leading, spacing: 16) {
 
                             if let count = commentsSentToLLMCount {
                     Text("Sent \(count) comments to LLM")
@@ -27158,15 +26692,15 @@ struct RedditCommentsView: View {
 
                             // Post Summary error display only
                             if let postSummaryError = postSummaryError {
-                                Text("Post Summary Error: \(postSummaryError)")
-                                    .foregroundColor(.red)
+                                RedappInlineMessage(title: "Couldn’t summarize the post", message: postSummaryError)
+                                    .redappReadableColumn(RedappDesign.readingWidth)
                                     .padding()
                             }
 
                             // Comment Summary error display only
                             if let summaryError = summaryError {
-                                Text("Summary Error: \(summaryError)")
-                                    .foregroundColor(.red)
+                                RedappInlineMessage(title: "Couldn’t summarize the comments", message: summaryError)
+                                    .redappReadableColumn(RedappDesign.readingWidth)
                                     .padding()
                             }
 
@@ -27186,119 +26720,32 @@ struct RedditCommentsView: View {
                                 .padding(.bottom, 4)
                             }
 
-                            Divider().padding(.vertical, 4)
-
-                            VStack(alignment: .leading) {
-                                Text("Ask a question about the comments:")
-                                    .font(.headline)
-                                    .padding(.horizontal)
-
-                                HStack {
-                                    TextField("Enter your question", text: $question)
-                                        .textFieldStyle(LiquidGlassTextFieldStyle())
-                                        .padding(.horizontal)
-                                        .disabled(isAnswering)
-                                        .onSubmit {
-                                            askQuestion()
-                                        }
-
-                                    Button(action: askQuestion) {
-                                        if isAnswering {
-                                            ProgressView()
-                                        } else {
-                                            Text("Ask")
-                                        }
-                                    }
-                                    .buttonStyle(LiquidGlassButtonStyle())
-                                    .disabled(isAnswering || question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                                    .padding(.trailing, 16)
-
-                                    if summaryService.settings.selectedSummaryProvider != .webAI {
-                                        Button(action: openWebCommentQuestion) {
-                                            Image(systemName: "globe")
-                                        }
-                                        .buttonStyle(LiquidGlassButtonStyle())
-                                        .disabled(question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                                        .padding(.trailing, 16)
-                                    }
-                                }
-                                .padding(.bottom)
-
-                                if isAnswering {
-                                    ProgressView("Answering...")
-                                        .padding(.horizontal)
-                                    if let throughput = summaryService.mlxThroughputState,
-                                       throughput.provider == summaryService.settings.selectedSummaryProvider,
-                                       throughput.provider != .appleCloud {
-                                        Text(mlxThroughputInlineText(throughput))
-                                            .font(.caption2)
-                                            .foregroundColor(.secondary)
-                                            .padding(.horizontal)
-                                    }
-                                }
-
-                                if let answer = answer,
-                                   !answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                    ResizableTextBox(
-                                        title: "Answer:",
-                                        content: showingSummary && answerSummary != nil ? answerSummary! : answer,
-                                        isAnswer: true,
-                                        onCloudSpeakClicked: speakAnswer,
-                                        onLocalSpeakClicked: speakAnswerLocally,
-                                        onKokoroSpeakClicked: speakAnswerWithKokoro,
-                                        onSummarizeClicked: summarizeAnswer,
-                                        onAskAI: askAIHandler,
-                                        onAskAIWeb: askAIWebHandler
-                                    )
-                                    .padding(.horizontal)
-
-                                    if isSynthesizingAnswerSpeech {
-                                        HStack {
-                                            ProgressView()
-                                                .scaleEffect(0.7)
-                                                .padding(.trailing, 5)
-                                            Text("Reading answer...")
-                                                .font(.caption)
-                                                .foregroundColor(.secondary)
-                                        }
-                                        .padding(.horizontal)
-                                        .padding(.bottom, 4)
-                                    }
-
-                                    if let answerSpeechSynthesisError = answerSpeechSynthesisError {
-                                        Text(answerSpeechSynthesisError)
-                                            .font(.caption)
-                                            .foregroundColor(.red)
-                                            .padding(.horizontal)
-                                            .padding(.bottom, 4)
-                                    }
-                                } else if !isAnswering, let answerError = answerError {
-                                    Text("Question Error: \(answerError)")
-                                        .foregroundColor(.red)
-                                        .padding(.horizontal)
-                                }
-
-                                if let count = commentsSentToLLMCount {
-                                    Text("Sent \(count) comments to LLM")
-                                        .font(.caption2)
-                                        .foregroundColor(.secondary)
-                                        .padding(.horizontal)
-                                }
-
-                                if let throughput = summaryService.mlxThroughputState,
-                                   throughput.provider == summaryService.settings.selectedSummaryProvider,
-                                   throughput.provider != .appleCloud {
-                                    Text(mlxThroughputInlineText(throughput))
-                                        .font(.caption2)
-                                        .foregroundColor(.secondary)
-                                        .padding(.horizontal)
-                                }
+                            if !isAskPanelOpen {
+                                askThreadSection(askAIHandler: askAIHandler, askAIWebHandler: askAIWebHandler)
+                                    .id(askQuestionSectionID)
                             }
-                            .id(askQuestionSectionID)
                         }
+                        .redappReadableColumn(RedappDesign.readingWidth)
+                        .padding(.horizontal, readerSideMargin)
+                        .padding(.top, 24)
+                        .padding(.bottom, 40)
                     }
                     }
                 }
+            }
+            .background(RedappDesign.canvas)
+            // On iPhone the soft edge lets bright text show through the bar; a harder
+            // edge keeps the header readable while content scrolls under it.
+            .scrollEdgeEffectStyle(readerSizeClass == .compact ? .hard : .soft, for: .top)
+            .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width in
+                readerContentWidth = min(RedappDesign.readingWidth, width - readerSideMargin * 2)
+            }
+            .safeAreaBar(edge: .top, spacing: 0) {
+                readerTopBar
+            }
+            .inspector(isPresented: isSummaryPanelPresented) {
+                threadSummaryPanel
+                    .inspectorColumnWidth(min: 340, ideal: RedappDesign.panelWidth, max: 480)
             }
             .sheet(isPresented: $isReplyingToPost, onDismiss: {
                 savePostReplyDraftImmediately()
@@ -27320,64 +26767,6 @@ struct RedditCommentsView: View {
                 .onAppear(perform: restorePostReplyDraft)
                 .onChange(of: postReplyText) { _, _ in schedulePostReplyDraftSave() }
             }
-            .sheet(isPresented: $isShowingPostSummary) {
-                PostSummaryView(
-                    postSummary: postSummary ?? "",
-                    isGenerating: isSummarizingPost,
-                    onCloudSpeak: speakPostSummary,
-                    onLocalSpeak: speakPostSummaryLocally,
-                    onKokoroSpeak: speakPostSummaryWithKokoro,
-                    onAskAI: { selection, onPartial in
-                        try await askAIResponseForRedditSelection(
-                            selection,
-                            useWebPath: false,
-                            onPartial: onPartial
-                        )
-                    },
-                    onAskAIWeb: { selection, onPartial in
-                        try await askAIResponseForRedditSelection(
-                            selection,
-                            useWebPath: true,
-                            onPartial: onPartial
-                        )
-                    }
-                )
-                .presentationDetents([.large])
-                .presentationCornerRadius(32)
-                .presentationBackground(.clear)
-                .clearModalBackground()
-            }
-            .sheet(isPresented: $isShowingCommentSummary) {
-                CommentSummaryView(
-                    commentSummary: summary ?? "",
-                    isGenerating: isSummarizing,
-                    commentCount: commentsSentToLLMCount ?? 0,
-                    summaryType: selectedSummaryType?.rawValue ?? "Summary",
-                    onCloudSpeak: speakSummary,
-                    onLocalSpeak: speakSummaryLocally,
-                    onKokoroSpeak: speakSummaryWithKokoro,
-                    allComments: allComments,
-                    promptNotice: commentPromptNotice,
-                    onAskAI: { selection, onPartial in
-                        try await askAIResponseForRedditSelection(
-                            selection,
-                            useWebPath: false,
-                            onPartial: onPartial
-                        )
-                    },
-                    onAskAIWeb: { selection, onPartial in
-                        try await askAIResponseForRedditSelection(
-                            selection,
-                            useWebPath: true,
-                            onPartial: onPartial
-                        )
-                    }
-                )
-                .presentationDetents([.large])
-                .presentationCornerRadius(32)
-                .presentationBackground(.clear)
-                .clearModalBackground()
-            }
             .confirmationDialog(
                 "Local request is too large",
                 isPresented: Binding(
@@ -27387,7 +26776,7 @@ struct RedditCommentsView: View {
                 titleVisibility: .visible,
                 presenting: pendingLocalReroute
             ) { request in
-                ForEach(BatchRerouteProvider.allCases) { provider in
+                ForEach(BatchRerouteProvider.available) { provider in
                     Button(provider.displayName) {
                         rerouteLocalRequest(request, to: provider)
                     }
@@ -27398,59 +26787,37 @@ struct RedditCommentsView: View {
             } message: { request in
                 Text(request.message)
             }
-            .overlay {
-                // Loading overlay for summaries and Q&A
+            .overlay(alignment: .bottom) {
+                // Status for summaries and Q&A. Non-blocking, so the Thread
+                // summary panel can stream its text while you keep reading.
                 if isSummarizing || isAnswering || isSummarizingPost {
-                    ZStack {
-                        Color.black.opacity(0.3)
-                            .ignoresSafeArea()
-                            .onTapGesture { } // Prevent interactions
-                        
-                        VStack(spacing: 20) {
-                            // Spinning wheel
-                            ProgressView()
-                                .progressViewStyle(CircularProgressViewStyle(tint: .white))
-                                .scaleEffect(2.0)
-                            
-                            Text(isSummarizing ? "Summarizing comments..." : 
-                                 isAnswering ? "Generating answer..." : 
-                                 "Summarizing post...")
-                                .font(.headline)
-                                .foregroundColor(.white)
-                                .padding(.horizontal, 30)
-                                .padding(.vertical, 15)
-                                .background {
-                                    if isDarkMode {
-                                        RoundedRectangle(cornerRadius: 20)
-                                            .fill(Color.black)
-                                    } else {
-                                        RoundedRectangle(cornerRadius: 20)
-                                            .fill(.ultraThinMaterial)
-                                    }
-                                }
-
+                    HStack(spacing: 12) {
+                        ProgressView()
+                            .controlSize(.small)
+                            .tint(RedappDesign.accent)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(isSummarizing ? "Summarizing comments…" :
+                                 isAnswering ? "Generating answer…" :
+                                 "Summarizing post…")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(RedappDesign.ink)
                             if let throughput = summaryService.mlxThroughputState,
                                throughput.provider == summaryService.settings.selectedSummaryProvider,
                                throughput.provider != .appleCloud {
                                 Text(mlxThroughputInlineText(throughput))
-                                    .font(.caption2)
-                                    .foregroundColor(.white.opacity(0.95))
-                                    .padding(.horizontal, 12)
-                                    .padding(.vertical, 6)
-                                    .background {
-                                        if isDarkMode {
-                                            Capsule()
-                                                .fill(Color.black)
-                                        } else {
-                                            Capsule()
-                                                .fill(.ultraThinMaterial)
-                                        }
-                                    }
+                                    .font(.caption)
+                                    .foregroundStyle(RedappDesign.inkSecondary)
                             }
                         }
-                        .transition(.opacity.combined(with: .scale))
-                        .animation(.easeInOut(duration: 0.3), value: isSummarizing || isAnswering || isSummarizingPost)
                     }
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 12)
+                    .background(Capsule().fill(RedappDesign.card).shadow(color: .black.opacity(0.12), radius: 14, y: 6))
+                    .overlay(Capsule().strokeBorder(RedappDesign.hairlineStrong, lineWidth: 1))
+                    .padding(.bottom, 24)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .animation(.easeInOut(duration: 0.3), value: isSummarizing || isAnswering || isSummarizingPost)
+                    .accessibilityElement(children: .combine)
                 }
             }
             .environment(\.askAISelectionHandler, askAIHandler)
@@ -28658,9 +28025,17 @@ struct RedditCommentsView: View {
 	            pendingLocalReroute = nil
 	            commentPromptNotice = nil
 	            summary = ""
+	            let isGeminiProvider = summaryService.settings.selectedSummaryProvider == .gemini
+	            let selectedProviderName = summaryService.settings.selectedSummaryProvider.displayName
 	            let allRawCommentsFlattened = flattenComments(comments: allComments)
-	            self.commentsSentToLLMCount = allRawCommentsFlattened.count
-	            let allRawComments = allRawCommentsFlattened.joined(separator: "\n\n")
+	            let commentsForPrompt: [String]
+	            if isGeminiProvider {
+	                commentsForPrompt = Array(allRawCommentsFlattened.prefix(800))
+	            } else {
+	                commentsForPrompt = allRawCommentsFlattened
+	            }
+	            self.commentsSentToLLMCount = commentsForPrompt.count
+	            let allRawComments = commentsForPrompt.joined(separator: "\n\n")
 
 	            let prompt = commentSummaryPrompt(isShort: isShort, commentsText: allRawComments)
 
@@ -28703,7 +28078,7 @@ struct RedditCommentsView: View {
 	                            return
 	                        }
 	                        self.summaryError = error.localizedDescription
-	                        self.summary = "CoreAI MLX comment summary failed:\n\n\(error.localizedDescription)"
+	                        self.summary = "\(selectedProviderName) comment summary failed:\n\n\(error.localizedDescription)"
 	                        self.isSummarizing = false
                     }
                 }
@@ -29419,6 +28794,7 @@ struct RedditCommentsView: View {
                 case .webAI: return "Web AI"
                 case .summarizeDaemon: return "Codex/Summarize"
             case .applePCCGateway: return "Apple PCC Gateway"
+            case .chatGPT: return "ChatGPT"
                 }
             }()
             if state.tokens == 0 && !state.isFinal {
@@ -29440,6 +28816,7 @@ struct RedditCommentsView: View {
     @main
     struct RedditApp: App {
         @StateObject private var summaryService = SummaryService.shared
+        @AppStorage("experimentalSettingsGlassEnabled") private var glassEnabled = true
 
         #if os(iOS)
         init() {
@@ -29479,6 +28856,11 @@ struct RedditCommentsView: View {
                 ContentView()
                     .environmentObject(AppState.shared)
                     .webAIHandoffPresenter(appState: AppState.shared)
+                    .tint(RedappDesign.accent)
+                    // Soft, fading glass under every top bar (iPadOS otherwise draws a
+                    // solid band behind toolbars that sits lower than the buttons).
+                    .scrollEdgeEffectStyle(.soft, for: .all)
+                    // Follows the system appearance; Force Dark Mode still overrides it.
                     .preferredColorScheme(summaryService.settings.isDarkMode ? .dark : nil)
                     .onOpenURL { url in
                         handleURLCallback(url)
@@ -29788,100 +29170,39 @@ struct PostSummaryModalView: View {
     @Binding var isPresented: Bool
     
     var body: some View {
-        ZStack {
-            // Liquid glass background
-            LinearGradient(
-                colors: [
-                    Color.blue.opacity(0.3),
-                    Color.blue.opacity(0.15),
-                    Color.white.opacity(0.05)
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-            .ignoresSafeArea()
-            .liquidGlassBackground()
-            
-            VStack(spacing: 0) {
-                // Header
-                HStack {
-                    Text("Post Summary")
-                        .font(.largeTitle)
-                        .fontWeight(.bold)
-                        .foregroundColor(.primary)
-                    
-                    Spacer()
-                    
-                    Button(action: {
-                        isPresented = false
-                    }) {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.title2)
-                            .foregroundColor(.secondary)
-                    }
-                    .buttonStyle(PlainButtonStyle())
+        VStack(spacing: 0) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 6) {
+                    RedappEyebrow("Post summary")
+                    Text(postTitle)
+                        .font(.title3.weight(.bold))
+                        .foregroundStyle(RedappDesign.ink)
                 }
-                .padding()
-                
-                Divider()
-                    .padding(.horizontal)
-                
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 16) {
-                        // Post Title
-                        Text("Post Title:")
-                            .font(.headline)
-                            .foregroundColor(.secondary)
-                        
-                        Text(postTitle)
-                            .font(.title3)
-                            .fontWeight(.medium)
-                            .foregroundColor(.primary)
-                        
-                        Divider()
-                        
-                        // Summary
-                        Text("Summary:")
-                            .font(.headline)
-                            .foregroundColor(.secondary)
-                        
-                        ReadableReplyText(content: postSummary)
-                    }
-                    .padding()
-                }
-                
-                Divider()
-                    .padding(.horizontal)
-                
-                // Close button at bottom
+
+                Spacer()
+
                 Button(action: {
                     isPresented = false
                 }) {
-                    Text("Close")
-                        .font(.headline)
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 40)
-                        .padding(.vertical, 12)
-                        .background(
-                            LinearGradient(
-                                colors: [Color.blue.opacity(0.8), Color.blue.opacity(0.6)],
-                                startPoint: .leading,
-                                endPoint: .trailing
-                            )
-                        )
-                        .clipShape(Capsule())
-                        .shadow(color: Color.blue.opacity(0.3), radius: 10, x: 0, y: 5)
+                    Image(systemName: "xmark")
+                        .font(.system(size: 16, weight: .medium))
                 }
-                .buttonStyle(LiquidGlassButtonStyle(isProminent: true))
-                .padding()
+                .buttonStyle(RedappIconButtonStyle())
+                .accessibilityLabel("Close")
             }
-            .background(
-                RoundedRectangle(cornerRadius: 32)
-                    .fill(AppColors.background.opacity(0.9))
-                    .shadow(color: Color.black.opacity(0.2), radius: 20, x: 0, y: 10)
-            )
-            .padding(40)
+            .padding(20)
+
+            Rectangle()
+                .fill(RedappDesign.hairline)
+                .frame(height: 1)
+
+            ScrollView {
+                ReadableReplyText(content: postSummary)
+                    .padding(20)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
+        .background(RedappDesign.canvas.ignoresSafeArea())
     }
 }
 
@@ -29895,25 +29216,29 @@ struct ImagePicker: View {
     var body: some View {
         NavigationView {
             VStack(spacing: 20) {
-                Text("Choose Image Source")
-                    .font(.title2)
+                Text("Choose image source")
+                    .font(RedappType.section)
+                    .foregroundStyle(RedappDesign.ink)
                     .padding(.top, 40)
                 
                 VStack(spacing: 16) {
                     Button(action: {
                         showPhotoPicker = true
                     }) {
-                        HStack {
+                        HStack(spacing: 12) {
                             Image(systemName: "photo.fill")
-                                .font(.title2)
-                            Text("Photo Library")
                                 .font(.title3)
+                                .foregroundStyle(RedappDesign.accent)
+                            Text("Photo Library")
+                                .font(.headline)
+                                .foregroundStyle(RedappDesign.ink)
                         }
                         .frame(maxWidth: .infinity)
                         .padding()
                         .background {
-                            RoundedRectangle(cornerRadius: 12)
-                                .fill(.ultraThinMaterial)
+                            RoundedRectangle(cornerRadius: RedappDesign.Radius.medium, style: .continuous)
+                                .fill(RedappDesign.card)
+                                .overlay(RoundedRectangle(cornerRadius: RedappDesign.Radius.medium, style: .continuous).strokeBorder(RedappDesign.hairline, lineWidth: 1))
                         }
                     }
                     .buttonStyle(PlainButtonStyle())
@@ -29921,17 +29246,20 @@ struct ImagePicker: View {
                     Button(action: {
                         showDocumentPicker = true
                     }) {
-                        HStack {
+                        HStack(spacing: 12) {
                             Image(systemName: "folder.fill")
-                                .font(.title2)
-                            Text("Files")
                                 .font(.title3)
+                                .foregroundStyle(RedappDesign.accent)
+                            Text("Files")
+                                .font(.headline)
+                                .foregroundStyle(RedappDesign.ink)
                         }
                         .frame(maxWidth: .infinity)
                         .padding()
                         .background {
-                            RoundedRectangle(cornerRadius: 12)
-                                .fill(.ultraThinMaterial)
+                            RoundedRectangle(cornerRadius: RedappDesign.Radius.medium, style: .continuous)
+                                .fill(RedappDesign.card)
+                                .overlay(RoundedRectangle(cornerRadius: RedappDesign.Radius.medium, style: .continuous).strokeBorder(RedappDesign.hairline, lineWidth: 1))
                         }
                     }
                     .buttonStyle(PlainButtonStyle())
@@ -29940,6 +29268,8 @@ struct ImagePicker: View {
                 
                 Spacer()
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(RedappDesign.canvas.ignoresSafeArea())
             .navigationTitle("Add Images")
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)

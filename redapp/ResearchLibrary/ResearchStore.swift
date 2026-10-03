@@ -204,6 +204,10 @@ final class ResearchLibraryStore: ObservableObject {
     @Published private(set) var isReady = false
     @Published private(set) var storageURL: URL?
     @Published var lastError: String?
+    /// Set when the saved library could not be opened and a temporary in-memory
+    /// store is used instead. Unlike `lastError` it is never cleared, because
+    /// everything saved in this state disappears when the app quits.
+    @Published private(set) var storageFailure: String?
 
     let modelContainer: ModelContainer
     private let context: ModelContext
@@ -257,6 +261,7 @@ final class ResearchLibraryStore: ObservableObject {
                 modelContainer = try ModelContainer(for: schema, configurations: [fallback])
                 context = ModelContext(modelContainer)
                 lastError = ResearchStoreError.unavailable(error.localizedDescription).localizedDescription
+                storageFailure = "Your saved research couldn’t be opened, so it isn’t shown and anything you save now will be lost when the app quits. Your existing files haven’t been deleted. Quit and reopen the app; if this message stays, keep a backup before updating. (\(error.localizedDescription))"
             } catch {
                 fatalError("Unable to create Research Library model container: \(error)")
             }
@@ -337,11 +342,16 @@ final class ResearchLibraryStore: ObservableObject {
             context.insert(item)
         }
 
-        let sourceDigest = ResearchDigest.sha256Hex(
-            request.sources
-                .sorted { $0.sourceOrder < $1.sourceOrder }
-                .map(\.contentDigest)
-                .joined(separator: "|")
+        let sourceDigest = BatchPodcastContextBuilder.sourceDigest(
+            sources: request.sources,
+            summaries: request.perPostSummaries.map {
+                BatchPodcastPostSummaryInput(
+                    title: $0.title,
+                    summary: $0.summary,
+                    permalink: $0.permalink
+                )
+            },
+            overallSummary: request.overallSummary
         )
         let hasIncompleteCoverage = !request.coverage.failureMessages.isEmpty
             || request.coverage.postsAnalyzed < request.coverage.postsRequested
@@ -810,6 +820,23 @@ final class ResearchLibraryStore: ObservableObject {
         return turn
     }
 
+    /// Removes a turn, for example a question whose answer could not be created,
+    /// so the conversation doesn't keep a question with no reply.
+    func deleteTurn(id: UUID) throws {
+        var descriptor = FetchDescriptor<ResearchConversationTurnRecord>(
+            predicate: #Predicate { $0.id == id }
+        )
+        descriptor.fetchLimit = 1
+        guard let turn = try context.fetch(descriptor).first else { return }
+        let conversationID = turn.conversationID
+        context.delete(turn)
+        if try turns(conversationID: conversationID).allSatisfy({ $0.id == id }),
+           let conversation = try conversation(id: conversationID) {
+            context.delete(conversation)
+        }
+        try context.save()
+    }
+
     func offlineAssets(runID: UUID) throws -> [ResearchOfflineAssetRecord] {
         let descriptor = FetchDescriptor<ResearchOfflineAssetRecord>(
             predicate: #Predicate { $0.runID == runID },
@@ -1021,7 +1048,7 @@ final class ResearchLibraryStore: ObservableObject {
         var markdown = "# \(detail.item.title)\n\n"
         markdown += "- Scope: \(detail.item.scope)\n"
         markdown += "- Captured: \(detail.run.capturedAt.formatted(date: .abbreviated, time: .shortened))\n"
-        markdown += "- Revision: \(detail.run.revision)\n"
+        markdown += "- Snapshot: \(detail.run.revision)\n"
         markdown += "- Source digest: `\(detail.run.sourceDigest)`\n"
         markdown += "- Posts analyzed: \(detail.run.coverage.postsAnalyzed) of \(detail.run.coverage.postsRequested)\n"
         markdown += "- Comments analyzed: \(detail.run.coverage.commentsAnalyzed) of \(detail.run.coverage.commentsFetched) fetched\n\n"

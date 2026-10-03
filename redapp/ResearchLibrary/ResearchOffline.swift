@@ -370,6 +370,70 @@ actor ResearchOfflinePackManager {
         }
     }
 
+    /// Saves an episode WAV by copying a bounded temporary file instead of
+    /// materializing the complete episode as one Data value. The existing
+    /// `ttsVoice` field stores a versioned JSON object for the two MLX voices;
+    /// older single-voice assets continue to use their existing string value.
+    func saveSpeechFile(
+        _ sourceURL: URL,
+        runID: UUID,
+        artifactID: UUID?,
+        voiceMetadata: BatchPodcastSpeechVoiceMetadata,
+        speed: Double,
+        duration: Double?,
+        sourceTextDigest: String
+    ) async throws -> UUID {
+        guard fileManager.fileExists(atPath: sourceURL.path) else {
+            throw ResearchOfflineError.unavailable
+        }
+
+        let root = try assetsRoot()
+        let runDirectory = root.appendingPathComponent(runID.uuidString, isDirectory: true)
+        let speechDirectory = runDirectory.appendingPathComponent("speech", isDirectory: true)
+        try fileManager.createDirectory(at: speechDirectory, withIntermediateDirectories: true)
+
+        let filename = "speech-\(UUID().uuidString).wav"
+        let stagingURL = speechDirectory.appendingPathComponent(".staging-\(filename)")
+        let finalURL = speechDirectory.appendingPathComponent(filename)
+        var persisted = false
+        defer {
+            if !persisted {
+                try? fileManager.removeItem(at: stagingURL)
+                try? fileManager.removeItem(at: finalURL)
+            }
+        }
+
+        try fileManager.copyItem(at: sourceURL, to: stagingURL)
+        try fileManager.moveItem(at: stagingURL, to: finalURL)
+        let attributes = try fileManager.attributesOfItem(atPath: finalURL.path)
+        let byteCount = (attributes[.size] as? NSNumber)?.int64Value ?? 0
+        let checksum = try checksum(of: finalURL)
+        let savedRelativePath = relativePath(runID: runID, filename: "speech/\(filename)")
+        let voiceJSON = ResearchJSON.encode(voiceMetadata)
+
+        let assetID = try await MainActor.run {
+            let record = ResearchOfflineAssetRecord(
+                runID: runID,
+                artifactID: artifactID,
+                kind: .speech,
+                relativePath: savedRelativePath,
+                mimeType: "audio/wav",
+                checksum: checksum,
+                byteCount: byteCount,
+                state: .ready,
+                sourceTextDigest: sourceTextDigest,
+                ttsEngine: "MLX Pocket TTS",
+                ttsVoice: voiceJSON,
+                ttsSpeed: speed,
+                duration: duration
+            )
+            try ResearchLibraryStore.shared.insertOfflineAsset(record)
+            return record.id
+        }
+        persisted = true
+        return assetID
+    }
+
     func deletePack(runID: UUID) async throws {
         let directory = try assetsRoot().appendingPathComponent(runID.uuidString, isDirectory: true)
         if fileManager.fileExists(atPath: directory.path) {
@@ -392,6 +456,20 @@ actor ResearchOfflinePackManager {
             .appendingPathComponent("Assets", isDirectory: true)
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
         return directory
+    }
+
+    private func checksum(of url: URL) throws -> String {
+#if canImport(CryptoKit)
+        var hasher = SHA256()
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        while let data = try handle.read(upToCount: 1_024 * 1_024), !data.isEmpty {
+            hasher.update(data: data)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+#else
+        return ResearchDigest.sha256Hex(try Data(contentsOf: url, options: .mappedIfSafe))
+#endif
     }
 
     private func relativePath(runID: UUID, filename: String) -> String {

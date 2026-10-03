@@ -14,6 +14,7 @@ enum ResearchArtifactKind: String, Codable, CaseIterable, Sendable {
     case tableReport
     case infographic
     case whiteboard
+    case podcastScript
     case questionAnswer
     case conversationAnswer
     case changeReport
@@ -29,6 +30,7 @@ enum ResearchArtifactKind: String, Codable, CaseIterable, Sendable {
         case .tableReport: return "Table Report"
         case .infographic: return "Infographic"
         case .whiteboard: return "Whiteboard"
+        case .podcastScript: return "Podcast Script"
         case .questionAnswer: return "Q&A"
         case .conversationAnswer: return "Conversation Answer"
         case .changeReport: return "What Changed"

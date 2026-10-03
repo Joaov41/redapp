@@ -1,5 +1,214 @@
 import AVFoundation
+import Foundation
 import SwiftUI
+#if os(iOS)
+import UIKit
+#endif
+
+private final class ResearchSpeechApplicationGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var active: Bool
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    init(isActive: Bool) {
+        active = isActive
+    }
+
+    func setActive(_ isActive: Bool) {
+        lock.lock()
+        active = isActive
+        let continuations = isActive ? waiters : []
+        if isActive {
+            waiters.removeAll(keepingCapacity: false)
+        }
+        lock.unlock()
+        continuations.forEach { $0.resume() }
+    }
+
+    func waitUntilActive() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if active {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                waiters.append(continuation)
+                lock.unlock()
+            }
+        }
+    }
+}
+
+private final class ResearchSpeechMLXActivity: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var inFlightCount = 0
+
+    func begin() {
+        condition.lock()
+        inFlightCount += 1
+        condition.unlock()
+    }
+
+    func end() {
+        condition.lock()
+        inFlightCount = max(0, inFlightCount - 1)
+        if inFlightCount == 0 {
+            condition.broadcast()
+        }
+        condition.unlock()
+    }
+
+    func waitUntilIdle() {
+        condition.lock()
+        while inFlightCount > 0 {
+            condition.wait()
+        }
+        condition.unlock()
+    }
+}
+
+#if os(iOS)
+private final class ResearchSpeechSynthesisCoordinator: @unchecked Sendable {
+    static let shared = ResearchSpeechSynthesisCoordinator()
+
+    private let applicationGate = ResearchSpeechApplicationGate(
+        isActive: UIApplication.shared.applicationState == .active
+    )
+    private let mlxActivity = ResearchSpeechMLXActivity()
+    private var observers: [NSObjectProtocol] = []
+
+    private init() {
+        let applicationGate = self.applicationGate
+        let mlxActivity = self.mlxActivity
+        observers = [
+            NotificationCenter.default.addObserver(
+                forName: UIApplication.willResignActiveNotification,
+                object: nil,
+                queue: .main
+            ) { _ in
+                applicationGate.setActive(false)
+            },
+            NotificationCenter.default.addObserver(
+                forName: UIApplication.didEnterBackgroundNotification,
+                object: nil,
+                queue: .main
+            ) { _ in
+                mlxActivity.waitUntilIdle()
+            },
+            NotificationCenter.default.addObserver(
+                forName: UIApplication.didBecomeActiveNotification,
+                object: nil,
+                queue: .main
+            ) { _ in
+                applicationGate.setActive(true)
+            }
+        ]
+    }
+
+    func synthesize(
+        text: String,
+        voice: String,
+        speed: Float,
+        playbackToken: UUID
+    ) async throws -> Data {
+        await applicationGate.waitUntilActive()
+        try Task.checkCancellation()
+        guard KokoroTTSService.shared.isPlaybackTokenCurrent(playbackToken) else {
+            throw CancellationError()
+        }
+
+        let mlxActivity = self.mlxActivity
+        mlxActivity.begin()
+        let synthesisTask = Task.detached(priority: .userInitiated) {
+            defer { mlxActivity.end() }
+            return try await KokoroTTSService.shared.synthesize(
+                text: text,
+                voice: voice,
+                speed: speed
+            )
+        }
+        return try await withTaskCancellationHandler {
+            try await synthesisTask.value
+        } onCancel: {
+            synthesisTask.cancel()
+        }
+    }
+}
+#endif
+
+private func synthesizeResearchSpeechChunk(
+    text: String,
+    voice: String,
+    speed: Float,
+    playbackToken: UUID
+) async throws -> Data {
+    #if os(iOS)
+    return try await ResearchSpeechSynthesisCoordinator.shared.synthesize(
+        text: text,
+        voice: voice,
+        speed: speed,
+        playbackToken: playbackToken
+    )
+    #else
+    return try await KokoroTTSService.shared.synthesize(
+        text: text,
+        voice: voice,
+        speed: speed
+    )
+    #endif
+}
+
+@MainActor
+func playResearchSpeechChunks(
+    _ chunks: [String],
+    voice: String,
+    speed: Float,
+    playbackToken: UUID,
+    onPreparing: @escaping (_ current: Int, _ total: Int) -> Void,
+    playData: @escaping (_ data: Data, _ current: Int, _ total: Int, _ token: UUID) async throws -> Void
+) async throws {
+    guard let firstChunk = chunks.first else { throw KokoroTTSServiceError.emptyText }
+    var nextSynthesisTask: Task<Data, Error>?
+    defer { nextSynthesisTask?.cancel() }
+
+    onPreparing(1, chunks.count)
+    var currentData = try await synthesizeResearchSpeechChunk(
+        text: firstChunk,
+        voice: voice,
+        speed: speed,
+        playbackToken: playbackToken
+    )
+    var index = 0
+
+    while index < chunks.count {
+        try Task.checkCancellation()
+        guard KokoroTTSService.shared.isPlaybackTokenCurrent(playbackToken) else {
+            throw CancellationError()
+        }
+
+        let nextIndex = index + 1
+        if nextIndex < chunks.count {
+            let nextChunk = chunks[nextIndex]
+            nextSynthesisTask = Task {
+                try await synthesizeResearchSpeechChunk(
+                    text: nextChunk,
+                    voice: voice,
+                    speed: speed,
+                    playbackToken: playbackToken
+                )
+            }
+        } else {
+            nextSynthesisTask = nil
+        }
+
+        try await playData(currentData, index + 1, chunks.count, playbackToken)
+        guard let task = nextSynthesisTask else { break }
+        onPreparing(nextIndex + 1, chunks.count)
+        currentData = try await task.value
+        nextSynthesisTask = nil
+        index = nextIndex
+    }
+}
 
 @MainActor
 struct ResearchMLXSpeechControls: View {
@@ -32,14 +241,23 @@ struct ResearchMLXSpeechControls: View {
             VStack(alignment: .trailing, spacing: 4) {
                 HStack(spacing: 12) {
                     Button {
-                        activity.isPlayback ? stop() : play()
+                        play()
                     } label: {
-                        Image(systemName: activity.isPlayback ? "stop.circle.fill" : "play.circle.fill")
+                        Image(systemName: "play.circle.fill")
                     }
                     .buttonStyle(.borderless)
-                    .disabled(activity.isBusy && !activity.isPlayback)
-                    .help(activity.isPlayback ? "Stop MLX speech" : "Read this \(label) aloud with MLX TTS")
-                    .accessibilityLabel(activity.isPlayback ? "Stop \(label) speech" : "Play \(label) with MLX speech")
+                    .disabled(activity.isBusy)
+                    .help("Read this \(label) aloud")
+                    .accessibilityLabel("Read \(label) aloud")
+
+                    Button {
+                        stop()
+                    } label: {
+                        Image(systemName: "stop.circle.fill")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Stop reading")
+                    .accessibilityLabel("Stop \(label) speech")
 
                     if runID != nil {
                         Button {
@@ -49,7 +267,7 @@ struct ResearchMLXSpeechControls: View {
                         }
                         .buttonStyle(.borderless)
                         .disabled(activity.isBusy || speechSaved)
-                        .help(speechSaved ? "MLX speech saved offline" : "Save MLX speech offline")
+                        .help(speechSaved ? "Spoken version saved offline" : "Save spoken version for offline")
                         .accessibilityLabel(speechSaved ? "Speech saved offline" : "Save speech offline")
                     }
                 }
@@ -71,7 +289,6 @@ struct ResearchMLXSpeechControls: View {
             } message: {
                 Text(errorMessage ?? "Unknown error")
             }
-            .onDisappear { stop() }
         }
     }
 
@@ -90,22 +307,20 @@ struct ResearchMLXSpeechControls: View {
         let playbackToken = KokoroTTSService.shared.newPlaybackToken()
         task = Task {
             do {
-                for (index, chunk) in chunks.enumerated() {
-                    try Task.checkCancellation()
-                    guard KokoroTTSService.shared.isPlaybackTokenCurrent(playbackToken) else {
-                        throw CancellationError()
-                    }
-                    activity = .preparing(current: index + 1, total: chunks.count)
-                    let data = try await KokoroTTSService.shared.synthesize(
-                        text: chunk,
-                        voice: settings.kokoroVoice,
-                        speed: Float(settings.kokoroSpeed)
-                    )
+                try configureSpeechAudioSession()
+                try await playResearchSpeechChunks(
+                    chunks,
+                    voice: settings.kokoroVoice,
+                    speed: Float(settings.kokoroSpeed),
+                    playbackToken: playbackToken
+                ) { current, total in
+                    activity = .preparing(current: current, total: total)
+                } playData: { data, current, total, token in
                     try await play(
                         data: data,
-                        current: index + 1,
-                        total: chunks.count,
-                        playbackToken: playbackToken
+                        current: current,
+                        total: total,
+                        playbackToken: token
                     )
                 }
             } catch is CancellationError {
@@ -115,6 +330,26 @@ struct ResearchMLXSpeechControls: View {
             }
             finish(id)
         }
+    }
+
+    private func configureSpeechAudioSession() throws {
+        #if os(iOS)
+        let audioSession = AVAudioSession.sharedInstance()
+        do {
+            try audioSession.setCategory(
+                .playback,
+                mode: .spokenAudio,
+                options: [.duckOthers, .allowBluetooth, .allowBluetoothA2DP]
+            )
+        } catch {
+            try audioSession.setCategory(
+                .playback,
+                mode: .spokenAudio,
+                options: [.duckOthers]
+            )
+        }
+        try audioSession.setActive(true)
+        #endif
     }
 
     private func saveOffline() {
@@ -175,7 +410,7 @@ struct ResearchMLXSpeechControls: View {
             throw NSError(
                 domain: "ResearchMLXSpeech",
                 code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "The MLX speech audio could not start playing."]
+                userInfo: [NSLocalizedDescriptionKey: "The spoken version could not start playing."]
             )
         }
         player = audioPlayer

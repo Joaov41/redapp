@@ -1110,17 +1110,16 @@ class GeminiService {
     /// Summarize text using the configured provider.
     /// - Parameters:
     ///   - text: The text to summarize
-    ///   - forceGemini: If true, bypasses Apple Cloud shortcuts and uses Gemini API directly.
-    ///                  This is essential for batch operations where shortcuts would background the app.
+    ///   - forceGemini: If true, bypasses Apple Cloud and uses Gemini API directly.
+    ///                  This is useful when a batch explicitly requests Gemini.
     func summarize(
         text: String,
         forceGemini: Bool = false,
         onPartial: (@MainActor @Sendable (String) -> Void)? = nil
     ) async throws -> String {
         if forceGemini {
-            // For batch processing: Apple Cloud shortcuts are incompatible because they
-            // open the Shortcuts app, backgrounding this app and stopping extraction.
-            // Always use Gemini API directly for batch operations.
+            // Explicit Gemini requests stay on Gemini and do not consult the
+            // selected Apple Cloud provider.
             return try await summaryService.summarizeWithGeminiDirect(text: text)
         }
         return try await summaryService.summarize(text: text, onPartial: onPartial)
@@ -2914,7 +2913,7 @@ class SummaryService: ObservableObject {
         case .appleLocal:
             return try await summarizeWithAppleLocal(prompt: text, onPartial: onPartial)
         case .appleCloud:
-            return try await summarizeWithAppleCloud(prompt: text)
+            return try await summarizeWithAppleCloud(prompt: text, onPartial: onPartial)
         case .mlxLocal:
             return try await summarizeWithMLXLocal(prompt: text, onPartial: onPartial)
         case .coreAIMLXLocal:
@@ -2929,13 +2928,13 @@ class SummaryService: ObservableObject {
     }
 
     /// Direct Gemini API call, bypassing provider selection.
-    /// Use this for batch operations where Apple Cloud shortcuts would background the app.
+    /// Use this when batch logic explicitly needs Gemini instead of the selected provider.
     func summarizeWithGeminiDirect(text: String) async throws -> String {
         guard !settings.geminiApiKey.isEmpty else {
             throw NSError(
                 domain: "SummaryService",
                 code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "Gemini API key is required for batch processing. Apple Cloud shortcuts cannot be used for batch operations as they would background the app."]
+                userInfo: [NSLocalizedDescriptionKey: "Gemini API key is required for this direct Gemini batch operation."]
             )
         }
         return try await summarizeWithGemini(text: text)
@@ -3142,11 +3141,6 @@ class SummaryService: ObservableObject {
                         ["text": text]
                     ]
                 ]
-            ],
-            "generationConfig": [
-                "thinkingConfig": [
-                    "thinkingBudget": 0
-                ]
             ]
         ]
 
@@ -3208,11 +3202,6 @@ class SummaryService: ObservableObject {
                     "parts": [
                         ["text": text]
                     ]
-                ]
-            ],
-            "generationConfig": [
-                "thinkingConfig": [
-                    "thinkingBudget": 0
                 ]
             ]
         ]
@@ -3583,7 +3572,59 @@ class SummaryService: ObservableObject {
         return generatedText
     }
 
-		    private func summarizeWithAppleCloud(prompt: String, maxRetries: Int = 2) async throws -> String {
+	    private func summarizeWithAppleCloud(
+	        prompt: String,
+	        maxRetries: Int = 2,
+	        onPartial: (@MainActor @Sendable (String) -> Void)? = nil
+	    ) async throws -> String {
+	        // Apple Cloud is backed exclusively by Private Cloud Compute on the
+	        // native Mac app. Never fall back to Shortcuts: launching a
+	        // shortcuts:// URL brings the Shortcuts app to the foreground and
+	        // makes this provider behave like the legacy automation bridge.
+	        _ = maxRetries
+	        #if canImport(FoundationModels)
+	        if #available(iOS 27.0, macOS 27.0, *) {
+	            return try await summarizeWithPrivateCloudCompute(prompt: prompt, onPartial: onPartial)
+	        }
+	        #endif
+
+	        throw NSError(
+	            domain: "SummaryService.AppleCloud",
+	            code: 6,
+	            userInfo: [NSLocalizedDescriptionKey: "Apple Cloud requires Private Cloud Compute on macOS/iOS 27 or later. Shortcuts are not used."]
+	        )
+	    }
+
+	    #if canImport(FoundationModels)
+	    @available(iOS 27.0, macOS 27.0, *)
+	    private func summarizeWithPrivateCloudCompute(
+	        prompt: String,
+	        onPartial: (@MainActor @Sendable (String) -> Void)? = nil
+	    ) async throws -> String {
+	        print("☁️ [AppleCloud] Using Apple Private Cloud Compute (prompt: \(prompt.count) chars)")
+        let model = PrivateCloudComputeLanguageModel()
+        guard model.isAvailable else {
+            throw NSError(
+                domain: "SummaryService.AppleCloud",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Apple Private Cloud Compute is unavailable: \(model.availability)"]
+            )
+        }
+
+        let session = LanguageModelSession(model: model)
+        let response = try await session.respond(
+            to: prompt,
+            contextOptions: ContextOptions(reasoningLevel: .moderate)
+        )
+        let content = response.content.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let onPartial, !content.isEmpty {
+            await emitTextInChunks(content, chunkSize: 56, delayNanoseconds: 10_000_000, onPartial: onPartial)
+        }
+        return content
+    }
+    #endif
+
+	    private func summarizeWithAppleCloudShortcut(prompt: String, maxRetries: Int = 2) async throws -> String {
 		        // On Mac (iOS-on-Mac), use RSS shortcut which copies to clipboard
 		        // On iPad, use the configured shortcut which uses callback URL
 		        #if os(iOS)
@@ -4525,7 +4566,6 @@ struct SettingsView: View {
     #if os(iOS)
     #endif
     @State private var showApiKeyHelp = false
-    @State private var showAppleShortcutHelp = false
     @State private var showAuthError = false
     @State private var authError: String = ""
     @State private var isAuthenticating = false
@@ -4563,7 +4603,6 @@ struct SettingsView: View {
     @State private var showDownloadLocationPicker = false
     @State private var externalDownloadTarget: ExternalModelDownloadTarget? = nil
     @AppStorage("summarizeDaemonToken") private var summarizeDaemonTokenStorage: String = ""
-    @AppStorage("macBridgeSecret") private var summarizeBridgeSecretStorage: String = ""
     @AppStorage("experimentalSettingsGlassEnabled") private var experimentalSettingsGlassEnabled = true
     @AppStorage("experimentalSettingsGlassVariant") private var experimentalSettingsGlassVariant = 11
     
@@ -4726,56 +4765,15 @@ struct SettingsView: View {
                             }
                         }
                         
-                        if summaryService.settings.selectedSummaryProvider == .appleCloud {
-                            VStack(alignment: .leading, spacing: 8) {
-                                TextField("Apple Cloud Shortcut Name", text: Binding(
-                                    get: { summaryService.settings.appleCloudShortcutName },
-                                    set: { summaryService.setAppleCloudShortcutName($0) }
-                                ))
-                                .textFieldStyle(LiquidGlassTextFieldStyle())
-                                
-                                Button("Shortcut Setup Help") {
-                                    showAppleShortcutHelp = true
-                                }
-                                .buttonStyle(LiquidGlassButtonStyle())
-                            }
-                        }
-
                         if summaryService.settings.selectedSummaryProvider == .summarizeDaemon {
                             VStack(alignment: .leading, spacing: 10) {
-                                Text("Summarize Bridge")
+                                Text("Summarize Daemon")
                                     .font(.subheadline)
                                     .fontWeight(.semibold)
 
-                                Text("Use the same bridge secret/pass on Mac and iPad. Keep this Mac redapp app open so the iPad can relay to the local Summarize daemon.")
+                                Text("Connects directly to the local Summarize daemon on this Mac.")
                                     .font(.caption)
                                     .foregroundColor(.secondary)
-
-                                TextField("Mac host or IP", text: Binding(
-                                    get: { summaryService.settings.summarizeBridgeHost },
-                                    set: { summaryService.setSummarizeBridgeHost($0) }
-                                ))
-                                .textFieldStyle(LiquidGlassTextFieldStyle())
-
-                                Stepper(
-                                    value: Binding(
-                                        get: { summaryService.settings.summarizeBridgePort },
-                                        set: { summaryService.setSummarizeBridgePort($0) }
-                                    ),
-                                    in: 1...65535,
-                                    step: 1
-                                ) {
-                                    Text("Bridge port: \(summaryService.settings.summarizeBridgePort)")
-                                }
-
-                                TextField("Bridge secret/pass", text: Binding(
-                                    get: { summarizeBridgeSecretStorage },
-                                    set: {
-                                        summarizeBridgeSecretStorage = $0
-                                        summaryService.setSummarizeBridgeSecret($0)
-                                    }
-                                ))
-                                .textFieldStyle(LiquidGlassTextFieldStyle())
 
                                 #if os(macOS)
                                 TextField("Daemon token (Mac)", text: Binding(
@@ -5845,28 +5843,6 @@ struct SettingsView: View {
             This key is used for high-quality text-to-speech conversion with fast-start technology.
             """)
         }
-        .alert("Apple Cloud Shortcut Setup", isPresented: $showAppleShortcutHelp) {
-            Button("OK") { }
-        } message: {
-            Text("""
-            Apple Cloud uses the Shortcuts app with Apple Intelligence.
-
-            1) Create a Shortcut named:
-               \(summaryService.settings.appleCloudShortcutName.isEmpty ? "redapp" : summaryService.settings.appleCloudShortcutName)
-
-            2) For best reliability, use FILE-BASED I/O:
-               • Get File at Path → ShortcutInput.txt
-               • Get Text from Input
-               • [Your AI action]
-               • Save File → ShortcutOutput.txt
-
-            3) Or use clipboard (simpler but less reliable):
-               • [Your AI action] (input: Shortcut Input)
-               • Copy to Clipboard
-
-            Check logs for exact file paths on your device.
-            """)
-        }
         .alert("Authentication Error", isPresented: $showAuthError) {
             Button("OK") { }
         } message: {
@@ -5996,7 +5972,7 @@ struct SettingsView: View {
         case .appleLocal:
             return "Uses Apple Intelligence on-device (requires iOS 18.2+/macOS 15.2+ and compatible hardware)."
         case .appleCloud:
-            return "Uses Apple Intelligence Cloud via Shortcuts (requires a shortcut that copies output to clipboard)."
+            return "Uses Apple Intelligence through Private Cloud Compute (requires macOS/iOS 27+ and PCC access)."
         case .mlxLocal:
             return "Runs Gemma locally with LiteRT-LM acceleration using .litertlm model files."
         case .coreAIMLXLocal:
@@ -10274,7 +10250,7 @@ class RedditSubredditViewModel: ObservableObject {
 
         // MARK: - Limited Context Batch Processing
         /// For providers with limited context, process posts in provider-appropriate groups.
-        /// Apple Cloud uses shortcuts; Summarize/Gemini use the selected SummaryService provider.
+        /// Apple Cloud uses Private Cloud Compute; Summarize/Gemini use the selected SummaryService provider.
         /// MLX processes each post individually due to small context window.
     private func runAppleCloudBatchProcessing(subreddit: String) async throws {
         let selectedProvider = SummaryService.shared.settings.selectedSummaryProvider
@@ -10620,7 +10596,7 @@ class RedditSubredditViewModel: ObservableObject {
 
             print("✅ [\(providerLabel)] Batch Completed! \(allPostData.count) posts processed individually")
         } else if isAppleCloudFamily {
-            // Apple Cloud / Apple Local (auto-routed to Apple Cloud): process in small batches to reduce shortcut launches
+            // Apple Cloud / Apple Local (auto-routed to Apple Cloud): process in small batches for PCC context limits
             let batchSize = 3
             var processedPosts = 0
             let providerLabel = "AppleCloud"
@@ -10859,11 +10835,27 @@ class RedditSubredditViewModel: ObservableObject {
     @MainActor
     @discardableResult
     func saveCurrentBatchToResearchLibrary() -> UUID? {
-        guard !batchSummaries.isEmpty || !(batchFinalSummary?.isEmpty ?? true) else {
+        let summariesToSave: [(title: String, summary: String, permalink: String)] = batchExecutionMode == .web
+            ? batchExtractedPosts.map { (title: $0.title, summary: $0.comments, permalink: $0.permalink) }
+            : batchSummaries.map { (title: $0.postTitle, summary: $0.summary, permalink: $0.permalink) }
+        guard !summariesToSave.isEmpty || !(batchFinalSummary?.isEmpty ?? true) else {
             researchLibraryError = "There are no completed summaries to save yet."
             return nil
         }
-        if let savedResearchRunID {
+        let currentSourceDigest = BatchPodcastContextBuilder.sourceDigest(
+            sources: batchCapturedSources,
+            summaries: summariesToSave.map {
+                BatchPodcastPostSummaryInput(
+                    title: $0.title,
+                    summary: $0.summary,
+                    permalink: $0.permalink
+                )
+            },
+            overallSummary: batchFinalSummary
+        )
+        if let savedResearchRunID,
+           let savedRun = try? ResearchLibraryStore.shared.run(id: savedResearchRunID),
+           savedRun.sourceDigest == currentSourceDigest {
             if let overall = batchFinalSummary?.trimmingCharacters(in: .whitespacesAndNewlines),
                !overall.isEmpty {
                 do {
@@ -10895,7 +10887,7 @@ class RedditSubredditViewModel: ObservableObject {
 
         var coverage = batchCoverage
         coverage.postsRequested = max(coverage.postsRequested, max(batchTotalPosts, posts.count))
-        coverage.postsAnalyzed = max(coverage.postsAnalyzed, batchSummaries.count)
+        coverage.postsAnalyzed = max(coverage.postsAnalyzed, summariesToSave.count)
         if let batchError, !batchError.isEmpty, !coverage.failureMessages.contains(batchError) {
             coverage.failureMessages.append(batchError)
         }
@@ -10926,9 +10918,7 @@ class RedditSubredditViewModel: ObservableObject {
             timeRange: selectedPostType == .top ? selectedTopPostTimeRange.rawValue : "all",
             sources: batchCapturedSources,
             coverage: coverage,
-            perPostSummaries: batchSummaries.map {
-                (title: $0.postTitle, summary: $0.summary, permalink: $0.permalink)
-            },
+            perPostSummaries: summariesToSave,
             overallSummary: batchFinalSummary,
             generationReceipt: receipt
         )
@@ -12978,24 +12968,26 @@ struct CommentSummaryView: View {
                                 askQuestion()
                             }
 
-                        Button(action: askQuestion) {
-                            if isAnswering {
-                                ProgressView()
-                            } else {
-                                Text("Ask")
-                            }
-                        }
-                        .buttonStyle(LiquidGlassButtonStyle())
-                        .disabled(isAnswering || question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                        .padding(.trailing, 16)
+                        RedappCommentActionCapsule {
+                            HStack(spacing: 2) {
+                                Button(action: askQuestion) {
+                                    if isAnswering {
+                                        ProgressView()
+                                    } else {
+                                        Text("Ask")
+                                    }
+                                }
+                                .modifier(RedappGroupedActionButtonModifier(isCompact: false, isProminent: false))
+                                .disabled(isAnswering || question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
-                        if summaryService.settings.selectedSummaryProvider != .webAI {
-                            Button(action: openWebCommentQuestion) {
-                                Image(systemName: "globe")
+                                if summaryService.settings.selectedSummaryProvider != .webAI {
+                                    Button(action: openWebCommentQuestion) {
+                                        Image(systemName: "globe")
+                                    }
+                                    .modifier(RedappGroupedActionButtonModifier(isCompact: false, isProminent: false))
+                                    .disabled(question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                                }
                             }
-                            .buttonStyle(LiquidGlassButtonStyle())
-                            .disabled(question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                            .padding(.trailing, 16)
                         }
                     }
                     .padding(.horizontal)
@@ -14020,19 +14012,21 @@ struct PostRowView: View {
                         Spacer()
 
                         if let fullURL = post.fullURL {
-                            Button(action: {
-                                #if os(iOS)
-                                UIApplication.shared.open(fullURL)
-                                #elseif os(macOS)
-                                NSWorkspace.shared.open(fullURL)
-                                #endif
-                            }) {
-                                HStack(spacing: 4) {
-                                    Image(systemName: "safari")
-                                    Text("Open")
+                            RedappCommentActionCapsule {
+                                Button(action: {
+                                    #if os(iOS)
+                                    UIApplication.shared.open(fullURL)
+                                    #elseif os(macOS)
+                                    NSWorkspace.shared.open(fullURL)
+                                    #endif
+                                }) {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "safari")
+                                        Text("Open")
+                                    }
                                 }
+                                .modifier(RedappGroupedActionButtonModifier(isCompact: false, isProminent: false))
                             }
-                            .buttonStyle(LiquidGlassButtonStyle())
                         }
                     }
                     .font(.caption)
@@ -14657,80 +14651,80 @@ struct ResizableTextBox: View {
                 Text(title)
                     .font(.headline)
                 Spacer()
-                // Cloud TTS button
-                if let onCloudSpeakClicked = onCloudSpeakClicked {
-                    Button {
-                        onCloudSpeakClicked()
-                    } label: {
-                        Image(systemName: "speaker.wave.2")
-                    }
-                    .buttonStyle(PlainButtonStyle())
-                    #if os(macOS)
-                    .help("Read aloud (Cloud)")
-                    #endif
-                    .padding(.trailing, 4)
-                }
-                // Local TTS button
-                if let onLocalSpeakClicked = onLocalSpeakClicked {
-                    Button {
-                        onLocalSpeakClicked()
-                    } label: {
-                        if isAnswer {
-                            // For answer box, show stop icon if isSpeakingAnswerLocally is true
-                            if let isSpeaking = (Mirror(reflecting: self).descendant("_isSpeakingAnswerLocally") as? State<Bool>)?.wrappedValue, isSpeaking {
-                                Image(systemName: "stop.fill")
-                            } else {
-                                Image(systemName: "speaker.wave.2.circle")
+                RedappCommentActionCapsule {
+                    HStack(spacing: 2) {
+                        // Cloud TTS button
+                        if let onCloudSpeakClicked = onCloudSpeakClicked {
+                            Button {
+                                onCloudSpeakClicked()
+                            } label: {
+                                Image(systemName: "speaker.wave.2")
                             }
-                        } else {
-                            // For summary box, show stop icon if isSpeakingLocally is true
-                            if let isSpeaking = (Mirror(reflecting: self).descendant("_isSpeakingLocally") as? State<Bool>)?.wrappedValue, isSpeaking {
-                                Image(systemName: "stop.fill")
-                            } else {
-                                Image(systemName: "speaker.wave.2.circle")
-                            }
+                            .buttonStyle(RedappCommentChromeIconButtonStyle())
+                            #if os(macOS)
+                            .help("Read aloud (Cloud)")
+                            #endif
                         }
+                        // Local TTS button
+                        if let onLocalSpeakClicked = onLocalSpeakClicked {
+                            Button {
+                                onLocalSpeakClicked()
+                            } label: {
+                                if isAnswer {
+                                    // For answer box, show stop icon if isSpeakingAnswerLocally is true
+                                    if let isSpeaking = (Mirror(reflecting: self).descendant("_isSpeakingAnswerLocally") as? State<Bool>)?.wrappedValue, isSpeaking {
+                                        Image(systemName: "stop.fill")
+                                    } else {
+                                        Image(systemName: "speaker.wave.2.circle")
+                                    }
+                                } else {
+                                    // For summary box, show stop icon if isSpeakingLocally is true
+                                    if let isSpeaking = (Mirror(reflecting: self).descendant("_isSpeakingLocally") as? State<Bool>)?.wrappedValue, isSpeaking {
+                                        Image(systemName: "stop.fill")
+                                    } else {
+                                        Image(systemName: "speaker.wave.2.circle")
+                                    }
+                                }
+                            }
+                            .buttonStyle(RedappCommentChromeIconButtonStyle())
+                            #if os(macOS)
+                            .help(isAnswer ? "Read aloud (Local) / Stop" : "Read aloud (Local) / Stop")
+                            #endif
+                        }
+                        if let onKokoroSpeakClicked = onKokoroSpeakClicked {
+                            Button {
+                                onKokoroSpeakClicked()
+                            } label: {
+                                Image(systemName: "waveform")
+                            }
+                            .buttonStyle(RedappCommentChromeIconButtonStyle())
+                            #if os(macOS)
+                            .help("Read aloud (MLX TTS)")
+                            #endif
+                        }
+                        // Summarize button (only for answers)
+                        if isAnswer, let onSummarizeClicked = onSummarizeClicked {
+                            Button {
+                                onSummarizeClicked()
+                            } label: {
+                                Image(systemName: "doc.text.magnifyingglass")
+                            }
+                            .buttonStyle(RedappCommentChromeIconButtonStyle())
+                            #if os(macOS)
+                            .help("Summarize") // Add tooltip for macOS
+                            #endif
+                        }
+                        Button {
+                            copyToClipboard(content)
+                        } label: {
+                            Image(systemName: "doc.on.doc")
+                        }
+                        .buttonStyle(RedappCommentChromeIconButtonStyle())
+                        #if os(macOS)
+                        .help("Copy content") // Add tooltip for macOS
+                        #endif
                     }
-                    .buttonStyle(PlainButtonStyle())
-                    #if os(macOS)
-                    .help(isAnswer ? "Read aloud (Local) / Stop" : "Read aloud (Local) / Stop")
-                    #endif
-                    .padding(.trailing, 8)
                 }
-                if let onKokoroSpeakClicked = onKokoroSpeakClicked {
-                    Button {
-                        onKokoroSpeakClicked()
-                    } label: {
-                        Image(systemName: "waveform")
-                    }
-                    .buttonStyle(PlainButtonStyle())
-                    #if os(macOS)
-                    .help("Read aloud (MLX TTS)")
-                    #endif
-                    .padding(.trailing, 8)
-                }
-                // Summarize button (only for answers)
-                if isAnswer, let onSummarizeClicked = onSummarizeClicked {
-                    Button {
-                        onSummarizeClicked()
-                    } label: {
-                        Image(systemName: "doc.text.magnifyingglass")
-                    }
-                    .buttonStyle(PlainButtonStyle())
-                    #if os(macOS)
-                    .help("Summarize") // Add tooltip for macOS
-                    #endif
-                    .padding(.trailing, 4)
-                }
-                Button {
-                    copyToClipboard(content)
-                } label: {
-                    Image(systemName: "doc.on.doc")
-                }
-                .buttonStyle(PlainButtonStyle()) // Use PlainButtonStyle for better integration
-                #if os(macOS)
-                .help("Copy content") // Add tooltip for macOS
-                #endif
             }
 
             ScrollView {
@@ -14810,6 +14804,145 @@ struct ResizableTextBox: View {
 }
 
 // MARK: - Liquid Glass Styles
+private struct RedappCommentActionCapsule<Content: View>: View {
+    @Environment(\.colorScheme) private var colorScheme
+    let content: Content
+
+    init(@ViewBuilder content: () -> Content) {
+        self.content = content()
+    }
+
+    var body: some View {
+        #if os(macOS)
+        HStack(spacing: 2) {
+            content
+        }
+        .padding(4)
+        .modifier(RedappCommentGlassModifier())
+        .shadow(
+            color: Color.black.opacity(colorScheme == .dark ? 0.28 : 0.12),
+            radius: 10,
+            x: 0,
+            y: 5
+        )
+        .accessibilityElement(children: .contain)
+        #else
+        content
+        #endif
+    }
+}
+
+private struct RedappCommentGlassModifier: ViewModifier {
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if #available(macOS 26.0, *) {
+            content.glassEffect(.regular.interactive(), in: Capsule(style: .continuous))
+        } else {
+            content
+                .background(.ultraThinMaterial, in: Capsule(style: .continuous))
+                .overlay {
+                    Capsule(style: .continuous)
+                        .stroke(Color.white.opacity(0.24), lineWidth: 0.8)
+                }
+        }
+    }
+}
+
+private struct RedappRoundedGlassModifier: ViewModifier {
+    let cornerRadius: CGFloat
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        #if os(macOS)
+        if #available(macOS 26.0, *) {
+            content.glassEffect(
+                .regular,
+                in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+            )
+        } else {
+            content
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                        .stroke(Color.white.opacity(0.24), lineWidth: 0.8)
+                }
+        }
+        #else
+        content
+        #endif
+    }
+}
+
+private struct RedappCommentChromeIconButtonStyle: ButtonStyle {
+    @Environment(\.colorScheme) private var colorScheme
+
+    func makeBody(configuration: Configuration) -> some View {
+        #if os(macOS)
+        configuration.label
+            .font(.system(size: 14, weight: .medium))
+            .padding(.horizontal, 8)
+            .frame(minHeight: 32)
+            .contentShape(Capsule(style: .continuous))
+            .background {
+                Capsule(style: .continuous)
+                    .fill(
+                        configuration.isPressed
+                            ? Color.white.opacity(colorScheme == .dark ? 0.16 : 0.12)
+                            : .clear
+                    )
+            }
+            .scaleEffect(configuration.isPressed ? 0.95 : 1)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+        #else
+        configuration.label
+        #endif
+    }
+}
+
+/// Keeps the macOS action rows visually grouped in one Liquid Glass pill while
+/// preserving the existing compact glass button treatment on iOS.
+private struct RedappGroupedActionButtonModifier: ViewModifier {
+    let isCompact: Bool
+    let isProminent: Bool
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        #if os(macOS)
+        content.buttonStyle(RedappCommentChromeIconButtonStyle())
+        #else
+        if isCompact {
+            content.buttonStyle(AdaptiveLiquidGlassButtonStyle(cornerRadius: 20, isCompact: true))
+        } else {
+            content.buttonStyle(LiquidGlassButtonStyle(isProminent: isProminent))
+        }
+        #endif
+    }
+}
+
+/// Removes the per-button glass from compact macOS control groups. The iOS
+/// presentation keeps its existing standalone glass button treatment.
+private struct RedappGroupedIconButtonModifier: ViewModifier {
+    let isSelected: Bool
+    let isCompact: Bool
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        #if os(macOS)
+        content
+            .buttonStyle(.plain)
+            .frame(width: 28, height: 28)
+            .contentShape(Circle())
+        #else
+        content.buttonStyle(
+            BatchSummaryStandaloneGlassButtonStyle(
+                isSelected: isSelected,
+                isCompact: isCompact
+            )
+        )
+        #endif
+    }
+}
+
 struct LiquidGlassButtonStyle: ButtonStyle {
     var isProminent: Bool = false
     
@@ -16375,7 +16508,8 @@ struct CommentView: View {
     }
 
     private var commentActionRow: some View {
-        HStack(spacing: 12) {
+        RedappCommentActionCapsule {
+            HStack(spacing: 2) {
             Button {
                 submitVote(userVote == .upvote ? .none : .upvote)
             } label: {
@@ -16388,7 +16522,7 @@ struct CommentView: View {
             }
             .foregroundColor(userVote == .upvote ? accentColor : metadataColor)
             .disabled(isSubmittingVote)
-            .buttonStyle(.plain)
+            .buttonStyle(RedappCommentChromeIconButtonStyle())
             .accessibilityLabel(userVote == .upvote ? "Remove upvote" : "Upvote")
 
             Button {
@@ -16399,7 +16533,7 @@ struct CommentView: View {
             }
             .foregroundColor(userVote == .downvote ? .orange : metadataColor)
             .disabled(isSubmittingVote)
-            .buttonStyle(.plain)
+            .buttonStyle(RedappCommentChromeIconButtonStyle())
             .accessibilityLabel(userVote == .downvote ? "Remove downvote" : "Downvote")
 
             Button {
@@ -16415,7 +16549,7 @@ struct CommentView: View {
                 Label("Reply", systemImage: "bubble")
                     .labelStyle(.titleAndIcon)
             }
-            .buttonStyle(.plain)
+            .buttonStyle(RedappCommentChromeIconButtonStyle())
             .foregroundColor(metadataColor)
             .accessibilityLabel("Reply to comment")
 
@@ -16423,7 +16557,7 @@ struct CommentView: View {
                 Label("Share", systemImage: "square.and.arrow.up")
                     .labelStyle(.titleAndIcon)
             }
-            .buttonStyle(.plain)
+            .buttonStyle(RedappCommentChromeIconButtonStyle())
             .foregroundColor(metadataColor)
             .accessibilityLabel("Share comment")
 
@@ -16443,9 +16577,10 @@ struct CommentView: View {
                 Image(systemName: "ellipsis")
                     .font(.system(size: 16, weight: .semibold))
             }
-            .buttonStyle(.plain)
+            .buttonStyle(RedappCommentChromeIconButtonStyle())
             .foregroundColor(metadataColor)
             .accessibilityLabel("More comment actions")
+            }
         }
         .font(.system(size: 14, weight: .medium))
         .lineLimit(1)
@@ -18237,51 +18372,53 @@ struct SidebarControls: View {
     }
 
     private var sortMenu: some View {
-        Menu {
-            Button {
-                selectHomeFeed()
-            } label: {
-                Label("Home", systemImage: "house")
-            }
-
-            Divider()
-
-            Button {
-                selectPostType(.new)
-            } label: {
-                Text(PostType.new.displayName)
-            }
-
-            Button {
-                selectPostType(.hot)
-            } label: {
-                Text(PostType.hot.displayName)
-            }
-
-            Button {
-                selectPostType(.rising)
-            } label: {
-                Text(PostType.rising.displayName)
-            }
-
+        RedappCommentActionCapsule {
             Menu {
-                ForEach(TopPostTimeRange.allCases) { range in
-                    Button {
-                        selectTopTimeRange(range)
-                    } label: {
-                        Text(range.displayName)
+                Button {
+                    selectHomeFeed()
+                } label: {
+                    Label("Home", systemImage: "house")
+                }
+
+                Divider()
+
+                Button {
+                    selectPostType(.new)
+                } label: {
+                    Text(PostType.new.displayName)
+                }
+
+                Button {
+                    selectPostType(.hot)
+                } label: {
+                    Text(PostType.hot.displayName)
+                }
+
+                Button {
+                    selectPostType(.rising)
+                } label: {
+                    Text(PostType.rising.displayName)
+                }
+
+                Menu {
+                    ForEach(TopPostTimeRange.allCases) { range in
+                        Button {
+                            selectTopTimeRange(range)
+                        } label: {
+                            Text(range.displayName)
+                        }
                     }
+                } label: {
+                    Text(PostType.top.displayName)
                 }
             } label: {
-                Text(PostType.top.displayName)
+                Text(sortMenuTitle)
+                    .font(.system(size: 14, weight: .medium))
             }
-        } label: {
-            Text(sortMenuTitle)
-                .font(.system(size: 14, weight: .medium))
+            .modifier(RedappGroupedActionButtonModifier(isCompact: true, isProminent: false))
+            .fixedSize()
+            .accessibilityLabel("Sort by")
         }
-        .buttonStyle(AdaptiveLiquidGlassButtonStyle(cornerRadius: 20, isCompact: true))
-        .fixedSize()
-        .accessibilityLabel("Sort by")
     }
 
     private var sortMenuTitle: String {
@@ -18694,6 +18831,7 @@ struct BatchResultsView: View {
         @Environment(\.dismiss) var dismiss
     var onClose: (() -> Void)? = nil
     var onMinimize: (() -> Void)? = nil
+    var onOpenPodcast: (() -> Void)? = nil
     
     // Q&A state
     @State private var question: String = ""
@@ -18811,6 +18949,13 @@ struct BatchResultsView: View {
 
     private var isWebBatchMode: Bool {
         viewModel.batchExecutionMode == .web
+    }
+
+    private var hasBatchPodcastEvidence: Bool {
+        !viewModel.batchRawComments.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !viewModel.batchSummaries.isEmpty
+            || !viewModel.batchExtractedPosts.isEmpty
+            || !(viewModel.batchFinalSummary ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private var batchSourceLinks: [String: URL] {
@@ -21579,54 +21724,39 @@ struct BatchResultsView: View {
 #if os(macOS)
     private var macBatchPanelControls: some View {
         VStack {
-            HStack(spacing: 5) {
+            HStack {
                 Spacer()
+                RedappCommentActionCapsule {
+                    HStack(spacing: 2) {
+                        Button {
+                            viewModel.saveCurrentBatchToResearchLibrary()
+                        } label: {
+                            Image(systemName: viewModel.savedResearchRunID == nil ? "books.vertical" : "checkmark.circle.fill")
+                                .font(.system(size: 10, weight: .semibold))
+                        }
+                        .modifier(RedappGroupedIconButtonModifier(isSelected: false, isCompact: true))
+                        .disabled(viewModel.savedResearchRunID != nil || (viewModel.batchSummaries.isEmpty && viewModel.batchFinalSummary == nil))
+                        .help(viewModel.savedResearchRunID == nil ? "Save to Research Library" : "Saved to Research Library")
+                        .accessibilityLabel(viewModel.savedResearchRunID == nil ? "Save to Research Library" : "Saved to Research Library")
 
-                Button {
-                    viewModel.saveCurrentBatchToResearchLibrary()
-                } label: {
-                    Image(systemName: viewModel.savedResearchRunID == nil ? "books.vertical" : "checkmark.circle.fill")
-                        .font(.system(size: 10, weight: .semibold))
-                        .frame(width: 24, height: 24)
-                }
-                .buttonStyle(.plain)
-                .background(.regularMaterial, in: Circle())
-                .overlay {
-                    Circle()
-                        .strokeBorder(Color.white.opacity(isDarkMode ? 0.16 : 0.26), lineWidth: 0.75)
-                }
-                .disabled(viewModel.savedResearchRunID != nil || (viewModel.batchSummaries.isEmpty && viewModel.batchFinalSummary == nil))
-                .help(viewModel.savedResearchRunID == nil ? "Save to Research Library" : "Saved to Research Library")
-                .accessibilityLabel(viewModel.savedResearchRunID == nil ? "Save to Research Library" : "Saved to Research Library")
+                        if onMinimize != nil {
+                            Button(action: handleMinimize) {
+                                Image(systemName: "arrow.down.right.and.arrow.up.left")
+                                    .font(.system(size: 10, weight: .semibold))
+                            }
+                            .modifier(RedappGroupedIconButtonModifier(isSelected: false, isCompact: true))
+                            .help("Minimize")
+                            .accessibilityLabel("Minimize batch summary")
+                        }
 
-                if onMinimize != nil {
-                    Button(action: handleMinimize) {
-                        Image(systemName: "arrow.down.right.and.arrow.up.left")
-                            .font(.system(size: 10, weight: .semibold))
-                            .frame(width: 24, height: 24)
+                        Button(action: handleClose) {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 10, weight: .bold))
+                        }
+                        .modifier(RedappGroupedIconButtonModifier(isSelected: false, isCompact: true))
+                        .help(onClose != nil ? "Close" : "Done")
                     }
-                    .buttonStyle(.plain)
-                    .background(.regularMaterial, in: Circle())
-                    .overlay {
-                        Circle()
-                            .strokeBorder(Color.white.opacity(isDarkMode ? 0.16 : 0.26), lineWidth: 0.75)
-                    }
-                    .help("Minimize")
-                    .accessibilityLabel("Minimize batch summary")
                 }
-
-                Button(action: handleClose) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 10, weight: .bold))
-                        .frame(width: 24, height: 24)
-                }
-                .buttonStyle(.plain)
-                .background(.regularMaterial, in: Circle())
-                .overlay {
-                    Circle()
-                        .strokeBorder(Color.white.opacity(isDarkMode ? 0.16 : 0.26), lineWidth: 0.75)
-                }
-                .help(onClose != nil ? "Close" : "Done")
             }
 
             Spacer()
@@ -21647,30 +21777,34 @@ struct BatchResultsView: View {
                     submitBatchQuestion()
                 }
 
-            Button(action: {
-                summarizeBatchQuestionTopics(proxy: proxy)
-            }) {
-                if isBatchQuestionTopicActionInFlight {
-                    ProgressView()
-                        .scaleEffect(0.8)
-                } else {
-                    Image(systemName: hasSubredditOverviewForQuestions ? "text.badge.star" : "arrow.down.circle")
-                }
-            }
-            .buttonStyle(BatchSummaryStandaloneGlassButtonStyle())
-            .disabled(isBatchQuestionTopicActionDisabled)
-            .help(hasSubredditOverviewForQuestions ? "Summarize topics by subject" : "Scroll to individual post summaries")
+            RedappCommentActionCapsule {
+                HStack(spacing: 2) {
+                    Button(action: {
+                        summarizeBatchQuestionTopics(proxy: proxy)
+                    }) {
+                        if isBatchQuestionTopicActionInFlight {
+                            ProgressView()
+                                .scaleEffect(0.8)
+                        } else {
+                            Image(systemName: hasSubredditOverviewForQuestions ? "text.badge.star" : "arrow.down.circle")
+                        }
+                    }
+                    .modifier(RedappGroupedIconButtonModifier(isSelected: false, isCompact: isBatchResultsCompactLayout))
+                    .disabled(isBatchQuestionTopicActionDisabled)
+                    .help(hasSubredditOverviewForQuestions ? "Summarize topics by subject" : "Scroll to individual post summaries")
 
-            Button(action: {
-                withAnimation(.spring(response: 0.26, dampingFraction: 0.86)) {
-                    showBatchSummaryActionsMenu.toggle()
+                    Button(action: {
+                        withAnimation(.spring(response: 0.26, dampingFraction: 0.86)) {
+                            showBatchSummaryActionsMenu.toggle()
+                        }
+                    }) {
+                        Image(systemName: "line.3.horizontal")
+                    }
+                    .modifier(RedappGroupedIconButtonModifier(isSelected: showBatchSummaryActionsMenu, isCompact: isBatchResultsCompactLayout))
+                    .accessibilityLabel(showBatchSummaryActionsMenu ? "Hide batch summary actions" : "Show batch summary actions")
+                    .help(showBatchSummaryActionsMenu ? "Hide batch summary actions" : "Show batch summary actions")
                 }
-            }) {
-                Image(systemName: "line.3.horizontal")
             }
-            .buttonStyle(BatchSummaryStandaloneGlassButtonStyle(isSelected: showBatchSummaryActionsMenu))
-            .accessibilityLabel(showBatchSummaryActionsMenu ? "Hide batch summary actions" : "Show batch summary actions")
-            .help(showBatchSummaryActionsMenu ? "Hide batch summary actions" : "Show batch summary actions")
         }
     }
 
@@ -21742,6 +21876,9 @@ struct BatchResultsView: View {
         }
         .padding(16)
         .frame(maxWidth: 920, alignment: .leading)
+#if os(macOS)
+        .modifier(RedappRoundedGlassModifier(cornerRadius: 18))
+#else
         .background {
             if isDarkMode {
                 RoundedRectangle(cornerRadius: 18, style: .continuous)
@@ -21755,33 +21892,38 @@ struct BatchResultsView: View {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .strokeBorder(AppColors.redditCardBorder, lineWidth: 1)
         }
+#endif
         .shadow(color: .black.opacity(isDarkMode ? 0.35 : 0.16), radius: 18, y: 8)
     }
 
     private func batchBottomControlRow(proxy: ScrollViewProxy) -> some View {
         HStack(spacing: 12) {
             Spacer()
-            if hasBatchQuestionContext {
-                Button(action: {
-                    withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
-                        showFloatingAskMenu.toggle()
+            RedappCommentActionCapsule {
+                HStack(spacing: 2) {
+                    if hasBatchQuestionContext {
+                        Button(action: {
+                            withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+                                showFloatingAskMenu.toggle()
+                            }
+                        }) {
+                            Image(systemName: showFloatingAskMenu ? "questionmark.bubble.fill" : "questionmark.bubble")
+                        }
+                        .modifier(RedappGroupedIconButtonModifier(isSelected: showFloatingAskMenu, isCompact: isBatchResultsCompactLayout))
+                        .accessibilityLabel("Show ask menu")
+                        .help("Show ask menu")
                     }
-                }) {
-                    Image(systemName: showFloatingAskMenu ? "questionmark.bubble.fill" : "questionmark.bubble")
-                }
-                .buttonStyle(BatchSummaryStandaloneGlassButtonStyle(isSelected: showFloatingAskMenu))
-                .accessibilityLabel("Show ask menu")
-                .help("Show ask menu")
-            }
 
-            Button(action: {
-                withAnimation(.easeInOut(duration: 0.5)) {
-                    proxy.scrollTo("batchSummaryActionsTop", anchor: .top)
+                    Button(action: {
+                        withAnimation(.easeInOut(duration: 0.5)) {
+                            proxy.scrollTo("batchSummaryActionsTop", anchor: .top)
+                        }
+                    }) {
+                        Image(systemName: "arrow.up.circle")
+                    }
+                    .modifier(RedappGroupedIconButtonModifier(isSelected: false, isCompact: isBatchResultsCompactLayout))
                 }
-            }) {
-                Image(systemName: "arrow.up.circle")
             }
-            .buttonStyle(BatchSummaryStandaloneGlassButtonStyle())
         }
         .padding(.horizontal)
     }
@@ -21950,6 +22092,15 @@ struct BatchResultsView: View {
             .buttonStyle(BatchSummaryGlassIconButtonStyle(isCompact: isBatchResultsCompactLayout))
             .disabled(viewModel.batchSummaries.isEmpty && viewModel.batchFinalSummary == nil)
 
+            Button(action: { onOpenPodcast?() }) {
+                Image(systemName: "waveform.and.mic")
+                    .frame(width: 22, height: 22)
+            }
+            .buttonStyle(BatchSummaryGlassIconButtonStyle(isCompact: isBatchResultsCompactLayout))
+            .disabled(!hasBatchPodcastEvidence || onOpenPodcast == nil)
+            .help("Create a podcast from this saved batch")
+            .accessibilityLabel("Create podcast from saved batch")
+
             Button(action: {
                 generateWhiteboard()
             }) {
@@ -22106,6 +22257,15 @@ struct BatchResultsView: View {
         .buttonStyle(BatchSummaryGlassIconButtonStyle(isCompact: isBatchResultsCompactLayout))
         .disabled(isGeneratingWhiteboard || viewModel.batchExtractedPosts.isEmpty)
         .help("Whiteboard")
+
+        Button(action: { onOpenPodcast?() }) {
+            Image(systemName: "waveform.and.mic")
+                .frame(width: 22, height: 22)
+        }
+        .buttonStyle(BatchSummaryGlassIconButtonStyle(isCompact: isBatchResultsCompactLayout))
+        .disabled(!hasBatchPodcastEvidence || onOpenPodcast == nil)
+        .help("Create a podcast from this saved batch")
+        .accessibilityLabel("Create podcast from saved batch")
     }
 
     private var webBatchActionColumns: [GridItem] {
@@ -26092,6 +26252,7 @@ private struct BatchResultsOverlay: View {
     @Binding var isPresented: Bool
     @Binding var isMinimized: Bool
     let onClose: () -> Void
+    let onOpenPodcast: () -> Void
 
     @State private var dragOffset: CGFloat = 0
 
@@ -26121,7 +26282,8 @@ private struct BatchResultsOverlay: View {
                         },
                         onMinimize: {
                             minimize(animated: true)
-                        }
+                        },
+                        onOpenPodcast: onOpenPodcast
                     )
                     .frame(width: geometry.size.width, height: totalHeight)
                     .offset(y: currentOffset(totalHeight))
@@ -26219,6 +26381,7 @@ private struct BatchResultsOverlay: View {
     @Binding var isPresented: Bool
     @Binding var isMinimized: Bool
     let onClose: () -> Void
+    let onOpenPodcast: () -> Void
 
     @FocusState private var hasKeyboardFocus: Bool
 
@@ -26238,7 +26401,8 @@ private struct BatchResultsOverlay: View {
                     BatchResultsView(
                         viewModel: viewModel,
                         onClose: close,
-                        onMinimize: minimize
+                        onMinimize: minimize,
+                        onOpenPodcast: onOpenPodcast
                     )
                     .frame(
                         width: panelSize.width,
@@ -26430,6 +26594,11 @@ struct ContentView: View {
     @State private var isSidebarScrolling = false
     @State private var sidebarScrollRevealTask: Task<Void, Never>? = nil
     @State private var isBatchResultsMinimized = false
+    @State private var showBatchPodcast = false
+    @State private var isBatchPodcastMinimized = false
+    @State private var isBatchPodcastExplicitlyClosing = false
+    @State private var batchPodcastContext: BatchPodcastContext?
+    @State private var batchPodcastRunID: UUID?
     @State private var columnVisibility: NavigationSplitViewVisibility = .automatic
     @State private var currentLayoutIsCompact = false
     @AppStorage("experimentalSettingsGlassEnabled") private var experimentalAppGlassEnabled = true
@@ -26455,6 +26624,101 @@ struct ContentView: View {
 
     private var isDarkMode: Bool {
         colorScheme == .dark
+    }
+
+    private var batchPodcastSession: BatchPodcastSession {
+        BatchPodcastSessionStore.shared
+    }
+
+    private var currentBatchPodcastPostSummaries: [BatchPodcastPostSummaryInput] {
+        if viewModel.batchExecutionMode == .web {
+            return viewModel.batchExtractedPosts.map {
+                BatchPodcastPostSummaryInput(
+                    title: $0.title,
+                    summary: $0.comments,
+                    permalink: $0.permalink
+                )
+            }
+        }
+        return viewModel.batchSummaries.map {
+            BatchPodcastPostSummaryInput(
+                title: $0.postTitle,
+                summary: $0.summary,
+                permalink: $0.permalink
+            )
+        }
+    }
+
+    private var currentBatchPodcastSourceDigest: String {
+        BatchPodcastContextBuilder.sourceDigest(
+            sources: viewModel.batchCapturedSources,
+            summaries: currentBatchPodcastPostSummaries,
+            overallSummary: viewModel.batchFinalSummary
+        )
+    }
+
+    private func openBatchPodcast() {
+        do {
+            let rawComments = viewModel.batchRawComments
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .isEmpty
+                ? BatchPodcastContextBuilder.reconstructedRawComments(
+                    from: viewModel.batchCapturedSources
+                )
+                : viewModel.batchRawComments
+            let context = try BatchPodcastContextBuilder.build(
+                BatchPodcastBuildInput(
+                    contextName: viewModel.batchContextName,
+                    rawComments: rawComments,
+                    capturedSources: viewModel.batchCapturedSources,
+                    postSummaries: currentBatchPodcastPostSummaries,
+                    overallSummary: viewModel.batchFinalSummary,
+                    coverage: viewModel.batchCoverage,
+                    allowSummariesOnly: true
+                )
+            )
+
+            if batchPodcastSession.context?.sourceDigest != context.sourceDigest
+                || batchPodcastContext?.sourceDigest != context.sourceDigest {
+                batchPodcastRunID = viewModel.saveCurrentBatchToResearchLibrary()
+                batchPodcastContext = context
+                batchPodcastSession.begin(context: context, runID: batchPodcastRunID)
+            }
+
+            isBatchPodcastExplicitlyClosing = false
+            isBatchPodcastMinimized = false
+            showBatchPodcast = true
+        } catch {
+            viewModel.researchLibraryError = error.localizedDescription
+        }
+    }
+
+    private func minimizeBatchPodcast() {
+        isBatchPodcastExplicitlyClosing = false
+        isBatchPodcastMinimized = true
+        showBatchPodcast = false
+    }
+
+    private func restoreBatchPodcast() {
+        guard batchPodcastContext != nil else { return }
+        isBatchPodcastExplicitlyClosing = false
+        isBatchPodcastMinimized = false
+        showBatchPodcast = true
+    }
+
+    private func closeBatchPodcast() {
+        isBatchPodcastExplicitlyClosing = true
+        batchPodcastSession.invalidate()
+        batchPodcastContext = nil
+        batchPodcastRunID = nil
+        isBatchPodcastMinimized = false
+        showBatchPodcast = false
+    }
+
+    private func invalidateBatchPodcastIfNeeded(for sourceDigest: String) {
+        guard let existingDigest = batchPodcastContext?.sourceDigest,
+              existingDigest != sourceDigest else { return }
+        closeBatchPodcast()
     }
 
     @ViewBuilder
@@ -26633,6 +26897,42 @@ struct ContentView: View {
                     }
                 }
 
+                if isBatchPodcastMinimized, batchPodcastContext != nil {
+                    VStack {
+                        Spacer()
+                        HStack {
+                            Spacer()
+                            Button(action: restoreBatchPodcast) {
+                                Label("Podcast", systemImage: "waveform.and.mic")
+                                    .font(.subheadline.weight(.semibold))
+                                    .padding(.horizontal, 16)
+                                    .padding(.vertical, 11)
+                            }
+                            .buttonStyle(.plain)
+                            .background(.regularMaterial, in: Capsule())
+                            .overlay {
+                                Capsule().strokeBorder(AppColors.redditCardBorder, lineWidth: 1)
+                            }
+                            .shadow(color: .black.opacity(0.2), radius: 12, y: 6)
+                            .accessibilityLabel("Restore batch podcast")
+                            .accessibilityHint("Returns to podcast generation or playback")
+
+                            Button(action: closeBatchPodcast) {
+                                Image(systemName: "xmark")
+                                    .font(.caption.weight(.bold))
+                                    .frame(width: 32, height: 32)
+                            }
+                            .buttonStyle(.plain)
+                            .background(.regularMaterial, in: Circle())
+                            .accessibilityLabel("Close batch podcast")
+                        }
+                    }
+                    .padding(.trailing, 24)
+                    .padding(.bottom, 82)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .zIndex(31)
+                }
+
                 if appState.showFallbackNotification {
                     VStack {
                         Spacer()
@@ -26668,7 +26968,8 @@ struct ContentView: View {
                             set: { viewModel.showBatchResults = $0 }
                         ),
                         isMinimized: $isBatchResultsMinimized,
-                        onClose: closeBatchResults
+                        onClose: closeBatchResults,
+                        onOpenPodcast: openBatchPodcast
                     )
                     .frame(width: geometry.size.width, height: geometry.size.height)
                 }
@@ -26681,7 +26982,8 @@ struct ContentView: View {
                             set: { viewModel.showBatchResults = $0 }
                         ),
                         isMinimized: $isBatchResultsMinimized,
-                        onClose: closeBatchResults
+                        onClose: closeBatchResults,
+                        onOpenPodcast: openBatchPodcast
                     )
                     .frame(width: geometry.size.width, height: geometry.size.height + geometry.safeAreaInsets.top + geometry.safeAreaInsets.bottom)
                     .ignoresSafeArea()
@@ -26764,6 +27066,25 @@ struct ContentView: View {
                 .preferredColorScheme(.dark)
 #endif
             }
+            .sheet(isPresented: $showBatchPodcast, onDismiss: {
+                if isBatchPodcastExplicitlyClosing {
+                    isBatchPodcastMinimized = false
+                } else if batchPodcastContext != nil {
+                    isBatchPodcastMinimized = true
+                }
+                isBatchPodcastExplicitlyClosing = false
+            }) {
+                if let batchPodcastContext {
+                    BatchPodcastView(
+                        context: batchPodcastContext,
+                        runID: batchPodcastRunID,
+                        session: batchPodcastSession,
+                        onMinimize: minimizeBatchPodcast,
+                        onClose: closeBatchPodcast
+                    )
+                    .frame(minWidth: 760, idealWidth: 900, minHeight: 600, idealHeight: 760)
+                }
+            }
             .confirmationDialog(
                 "Local batch is too large",
                 isPresented: Binding(
@@ -26790,6 +27111,9 @@ struct ContentView: View {
                         isBatchResultsMinimized = false
                     }
                 }
+            }
+            .onChange(of: currentBatchPodcastSourceDigest) { _, newDigest in
+                invalidateBatchPodcastIfNeeded(for: newDigest)
             }
             .onAppear {
                 updateColumnVisibility(animated: false)
@@ -27535,19 +27859,21 @@ struct RedditCommentsView: View {
                                     // Reply button for the post
                                     HStack {
                                         Spacer()
-                                        Button(action: {
-                                            if RedditAuthManager.shared.isAuthenticated {
-                                                isReplyingToPost = true
-                                            } else {
-                                                // Show login prompt
-                                                Task {
-                                                    await showLoginPrompt()
+                                        RedappCommentActionCapsule {
+                                            Button(action: {
+                                                if RedditAuthManager.shared.isAuthenticated {
+                                                    isReplyingToPost = true
+                                                } else {
+                                                    // Show login prompt
+                                                    Task {
+                                                        await showLoginPrompt()
+                                                    }
                                                 }
+                                            }) {
+                                                Label("Reply to Post", systemImage: "bubble.left")
                                             }
-                                        }) {
-                                            Label("Reply to Post", systemImage: "bubble.left")
+                                            .modifier(RedappGroupedActionButtonModifier(isCompact: false, isProminent: false))
                                         }
-                                        .buttonStyle(LiquidGlassButtonStyle())
                                         .padding(.horizontal)
                                     }
                                     
@@ -27577,7 +27903,10 @@ struct RedditCommentsView: View {
                                         .foregroundColor(.secondary)
                                     
                                     ScrollView(.horizontal, showsIndicators: false) {
-                                        HStack(spacing: 8) {
+                                        HStack(spacing: 0) {
+                                            Spacer(minLength: 16)
+                                            RedappCommentActionCapsule {
+                                                HStack(spacing: 2) {
 
                                         // Summary Button with dropdown menu
                                         Menu {
@@ -27618,7 +27947,7 @@ struct RedditCommentsView: View {
                                             Text("Comments")
                                                 .font(.system(size: 14, weight: .medium))
                                         }
-                                        .buttonStyle(AdaptiveLiquidGlassButtonStyle(cornerRadius: 20, isCompact: true))
+                                        .modifier(RedappGroupedActionButtonModifier(isCompact: true, isProminent: false))
                                         .fixedSize()
                                         .disabled(isSummarizing)
 
@@ -27628,7 +27957,7 @@ struct RedditCommentsView: View {
                                     }) {
                                         Image(systemName: "chart.pie.fill")
                                     }
-                                    .buttonStyle(LiquidGlassButtonStyle(isProminent: true))
+                                    .modifier(RedappGroupedActionButtonModifier(isCompact: false, isProminent: true))
                                     .accessibilityLabel("Deep Analysis")
                                     .sheet(item: $activeAnalyticsLaunchMode) { launchMode in
                                         CommentAnalyticsView(
@@ -27652,7 +27981,7 @@ struct RedditCommentsView: View {
                                         } label: {
                                             Image(systemName: "globe")
                                         }
-                                        .buttonStyle(LiquidGlassButtonStyle(isProminent: true))
+                                        .modifier(RedappGroupedActionButtonModifier(isCompact: false, isProminent: true))
                                         .accessibilityLabel("Web Deep Analysis")
                                     }
 
@@ -27695,7 +28024,7 @@ struct RedditCommentsView: View {
                                         Text("Post")
                                             .font(.system(size: 14, weight: .medium))
                                     }
-                                    .buttonStyle(AdaptiveLiquidGlassButtonStyle(cornerRadius: 20, isCompact: true))
+                                    .modifier(RedappGroupedActionButtonModifier(isCompact: true, isProminent: false))
                                     .fixedSize()
                                     .disabled(isSummarizingPost || (postTitle.isEmpty && postContent.isEmpty))
 
@@ -27708,7 +28037,7 @@ struct RedditCommentsView: View {
                                                 .font(.system(size: 14, weight: .medium))
                                                 .foregroundColor(.red)
                                         }
-                                        .buttonStyle(AdaptiveLiquidGlassButtonStyle(cornerRadius: 20, isCompact: true))
+                                        .modifier(RedappGroupedActionButtonModifier(isCompact: true, isProminent: false))
                                         .fixedSize()
                                     } else {
                                         Menu {
@@ -27731,7 +28060,7 @@ struct RedditCommentsView: View {
                                             Label("Read", systemImage: "speaker.wave.2")
                                                 .font(.system(size: 14, weight: .medium))
                                         }
-                                        .buttonStyle(AdaptiveLiquidGlassButtonStyle(cornerRadius: 20, isCompact: true))
+                                        .modifier(RedappGroupedActionButtonModifier(isCompact: true, isProminent: false))
                                         .fixedSize()
                                         .disabled(allComments.isEmpty)
                                     }
@@ -27744,11 +28073,14 @@ struct RedditCommentsView: View {
                                         Image(systemName: "arrow.down.circle.fill")
                                             .font(.system(size: 18, weight: .semibold))
                                     }
-                                    .buttonStyle(AdaptiveLiquidGlassButtonStyle(cornerRadius: 20, isCompact: true))
+                                    .modifier(RedappGroupedActionButtonModifier(isCompact: true, isProminent: false))
                                     .accessibilityLabel("Jump to Ask a Question")
 
+                                                }
+                                            }
+                                            Spacer(minLength: 16)
                                         }
-                                        .padding(.horizontal)
+                                        .containerRelativeFrame(.horizontal)
                                     }
                                 }
                             } else {
@@ -27775,10 +28107,12 @@ struct RedditCommentsView: View {
                                     CommentView(comment: comment, postPermalink: postPermalink)
                                 }
                                 if visibleCount < allComments.count {
-                                    Button("Load More Comments") {
-                                        visibleCount += 10
+                                    RedappCommentActionCapsule {
+                                        Button("Load More Comments") {
+                                            visibleCount += 10
+                                        }
+                                        .modifier(RedappGroupedActionButtonModifier(isCompact: false, isProminent: false))
                                     }
-                                    .buttonStyle(LiquidGlassButtonStyle())
                                     .padding()
                                 }
                             }
@@ -28233,11 +28567,12 @@ struct RedditCommentsView: View {
                                 }
                                 
                                 if showBottomActions {
+                                    RedappCommentActionCapsule {
                                     MacWrappingActionLayout(horizontalSpacing: 10, verticalSpacing: 10) {
                                         Button(action: copyCommentsToClipboard) {
                                             Text("Copy Comments")
                                         }
-                                        .buttonStyle(LiquidGlassButtonStyle())
+                                        .modifier(RedappGroupedActionButtonModifier(isCompact: true, isProminent: false))
                                 
                                 // Summarize Post button with dropdown menu
                                 Menu {
@@ -28248,7 +28583,7 @@ struct RedditCommentsView: View {
                                         Label("Short Summary", systemImage: "text.badge.minus")
                                         Text("2 paragraphs max")
                                     }
-                                    
+
                                     Button {
                                         selectedSummaryType = .long
                                         summarizePost(isShort: false)
@@ -28263,7 +28598,7 @@ struct RedditCommentsView: View {
                                         Text("Summarize Post")
                                     }
                                 }
-                                .buttonStyle(LiquidGlassButtonStyle())
+                                .modifier(RedappGroupedActionButtonModifier(isCompact: true, isProminent: false))
                                 .disabled(isSummarizingPost || (postTitle.isEmpty && postContent.isEmpty))
 
                                 // Read All Comments TTS button
@@ -28275,7 +28610,7 @@ struct RedditCommentsView: View {
                                             .font(.system(size: 14, weight: .medium))
                                             .foregroundColor(.red)
                                     }
-                                    .buttonStyle(LiquidGlassButtonStyle())
+                                    .modifier(RedappGroupedActionButtonModifier(isCompact: true, isProminent: false))
                                 } else {
                                     Menu {
                                         Button {
@@ -28297,7 +28632,7 @@ struct RedditCommentsView: View {
                                         Label("Read", systemImage: "speaker.wave.2")
                                             .font(.system(size: 14, weight: .medium))
                                     }
-                                    .buttonStyle(LiquidGlassButtonStyle())
+                                    .modifier(RedappGroupedActionButtonModifier(isCompact: true, isProminent: false))
                                     .disabled(allComments.isEmpty)
                                 }
 
@@ -28309,7 +28644,7 @@ struct RedditCommentsView: View {
                                     Image(systemName: "arrow.up.circle.fill")
                                         .font(.system(size: 18, weight: .semibold))
                                 }
-                                .buttonStyle(LiquidGlassButtonStyle())
+                                .modifier(RedappGroupedActionButtonModifier(isCompact: true, isProminent: false))
                                 .accessibilityLabel("Scroll to Post")
 
                                 // Summarize Comments button with dropdown menu
@@ -28321,7 +28656,7 @@ struct RedditCommentsView: View {
                                         Label("Short Summary", systemImage: "text.badge.minus")
                                         Text("2 paragraphs max")
                                     }
-                                    
+
                                     Button {
                                         selectedSummaryType = .long
                                         summarizeComments(isShort: false)
@@ -28336,7 +28671,7 @@ struct RedditCommentsView: View {
                                         Text("Summarize Comments")
                                     }
                                 }
-                                .buttonStyle(LiquidGlassButtonStyle())
+                                .modifier(RedappGroupedActionButtonModifier(isCompact: true, isProminent: false))
                                 .disabled(isSummarizing)
                                 
                                 // Close button
@@ -28349,10 +28684,11 @@ struct RedditCommentsView: View {
                                         .font(.system(size: 20))
                                         .foregroundColor(.gray)
                                 }
-                                .buttonStyle(PlainButtonStyle())
+                                .modifier(RedappGroupedActionButtonModifier(isCompact: false, isProminent: false))
                             }
                             .frame(maxWidth: .infinity, alignment: .center)
                             .transition(.move(edge: .bottom).combined(with: .opacity))
+                            }
                             }
                             }
                             .padding(.horizontal)
@@ -28413,24 +28749,26 @@ struct RedditCommentsView: View {
                                             askQuestion()
                                         }
 
-                                    Button(action: askQuestion) {
-                                        if isAnswering {
-                                            ProgressView()
-                                        } else {
-                                            Text("Ask")
-                                        }
-                                    }
-                                    .buttonStyle(LiquidGlassButtonStyle())
-                                    .disabled(isAnswering || question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                                    .padding(.trailing, 16)
+                                    RedappCommentActionCapsule {
+                                        HStack(spacing: 2) {
+                                            Button(action: askQuestion) {
+                                                if isAnswering {
+                                                    ProgressView()
+                                                } else {
+                                                    Text("Ask")
+                                                }
+                                            }
+                                            .modifier(RedappGroupedActionButtonModifier(isCompact: false, isProminent: false))
+                                            .disabled(isAnswering || question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
-                                    if summaryService.settings.selectedSummaryProvider != .webAI {
-                                        Button(action: openWebCommentQuestion) {
-                                            Image(systemName: "globe")
+                                            if summaryService.settings.selectedSummaryProvider != .webAI {
+                                                Button(action: openWebCommentQuestion) {
+                                                    Image(systemName: "globe")
+                                                }
+                                                .modifier(RedappGroupedActionButtonModifier(isCompact: false, isProminent: false))
+                                                .disabled(question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                                            }
                                         }
-                                        .buttonStyle(LiquidGlassButtonStyle())
-                                        .disabled(question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                                        .padding(.trailing, 16)
                                     }
                                 }
                                 .padding(.bottom)
@@ -28986,9 +29324,42 @@ struct RedditCommentsView: View {
 
         private func speakSummaryWithKokoro() {
             #if os(macOS)
-            speechSynthesisError = "Kokoro action is not available on macOS."
-            isSpeakingLocally = false
-            return
+            if isSpeakingLocally {
+                localTTSTask?.cancel(); localTTSTask = nil
+                KokoroTTSService.shared.cancelPlayback()
+                audioPlayer?.stop()
+                localSpeechSynth?.stopSpeaking()
+                isSpeakingLocally = false
+                return
+            }
+            guard let summaryToSpeak = summary, !summaryToSpeak.isEmpty else {
+                speechSynthesisError = "No summary available to read."
+                return
+            }
+            guard KokoroTTSService.shared.isAvailable else {
+                speechSynthesisError = "MLX TTS is not available in this build."
+                return
+            }
+            let plainTextSummary = MarkdownTextView.extractPlainText(from: summaryToSpeak)
+            audioPlayer?.stop()
+            localSpeechSynth?.stopSpeaking()
+            isSpeakingLocally = true
+            speechSynthesisError = nil
+            startKokoroPlayback(
+                text: plainTextSummary,
+                voice: SummaryService.shared.settings.kokoroVoice,
+                speed: SummaryService.shared.settings.kokoroSpeed,
+                setAudioPlayer: { [self] player in audioPlayer = player },
+                soundDelegate: soundDelegate,
+                taskStore: &localTTSTask,
+                onCompleted: {
+                    self.isSpeakingLocally = false
+                    self.localTTSTask = nil
+                }
+            ) { message in
+                self.speechSynthesisError = message
+                self.isSpeakingLocally = false
+            }
             #elseif os(iOS)
             if isSpeakingLocally {
                 localTTSTask?.cancel(); localTTSTask = nil
@@ -29220,8 +29591,24 @@ struct RedditCommentsView: View {
             let plainText = MarkdownTextView.extractPlainText(from: text)
 
             #if os(macOS)
-            isReadingAllCommentsLocally = false
-            return
+            guard KokoroTTSService.shared.isAvailable else {
+                isReadingAllCommentsLocally = false
+                return
+            }
+            startKokoroPlayback(
+                text: plainText,
+                voice: SummaryService.shared.settings.kokoroVoice,
+                speed: SummaryService.shared.settings.kokoroSpeed,
+                setAudioPlayer: { [self] player in audioPlayer = player },
+                soundDelegate: soundDelegate,
+                taskStore: &localTTSTask,
+                onCompleted: {
+                    self.isReadingAllCommentsLocally = false
+                    self.localTTSTask = nil
+                }
+            ) { _ in
+                self.isReadingAllCommentsLocally = false
+            }
             #elseif os(iOS)
             configureBackgroundAudioSession()
             guard KokoroTTSService.shared.isAvailable else {
@@ -29798,9 +30185,42 @@ struct RedditCommentsView: View {
 
         private func speakPostSummaryWithKokoro() {
             #if os(macOS)
-            postSpeechSynthesisError = "Kokoro action is not available on macOS."
-            isSpeakingPostLocally = false
-            return
+            if isSpeakingPostLocally {
+                localTTSTask?.cancel(); localTTSTask = nil
+                KokoroTTSService.shared.cancelPlayback()
+                postAudioPlayer?.stop()
+                postLocalSpeechSynth?.stopSpeaking()
+                isSpeakingPostLocally = false
+                return
+            }
+            guard let postSummaryToSpeak = postSummary, !postSummaryToSpeak.isEmpty else {
+                postSpeechSynthesisError = "No post summary available to read."
+                return
+            }
+            guard KokoroTTSService.shared.isAvailable else {
+                postSpeechSynthesisError = "MLX TTS is not available in this build."
+                return
+            }
+            let plainText = MarkdownTextView.extractPlainText(from: postSummaryToSpeak)
+            postAudioPlayer?.stop()
+            postLocalSpeechSynth?.stopSpeaking()
+            isSpeakingPostLocally = true
+            postSpeechSynthesisError = nil
+            startKokoroPlayback(
+                text: plainText,
+                voice: SummaryService.shared.settings.kokoroVoice,
+                speed: SummaryService.shared.settings.kokoroSpeed,
+                setAudioPlayer: { [self] player in postAudioPlayer = player },
+                soundDelegate: soundDelegate,
+                taskStore: &localTTSTask,
+                onCompleted: {
+                    self.isSpeakingPostLocally = false
+                    self.localTTSTask = nil
+                }
+            ) { message in
+                self.postSpeechSynthesisError = message
+                self.isSpeakingPostLocally = false
+            }
             #elseif os(iOS)
             if isSpeakingPostLocally {
                 localTTSTask?.cancel(); localTTSTask = nil
@@ -30814,6 +31234,80 @@ class SoundDelegate: NSObject, ObservableObject, AVAudioPlayerDelegate, AVSpeech
 #endif
 
 // MARK: - Audio Utility Functions
+#if os(macOS)
+private func startKokoroPlayback(
+    text: String,
+    voice: String,
+    speed: Double,
+    setAudioPlayer: @escaping (NSSound?) -> Void,
+    soundDelegate: SoundDelegate,
+    taskStore: inout Task<Void, Never>?,
+    onCompleted: @escaping () -> Void,
+    onError: @escaping (String) -> Void
+) {
+    _ = soundDelegate
+    taskStore?.cancel()
+    KokoroTTSService.shared.cancelPlayback()
+    taskStore = Task { @MainActor in
+        defer {
+            if !SummaryService.shared.settings.kokoroPrecacheEnabled {
+                KokoroTTSService.shared.unloadIfAllowed()
+            }
+            setAudioPlayer(nil)
+            onCompleted()
+        }
+
+        do {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { throw KokoroTTSServiceError.emptyText }
+            let chunks = KokoroTTSService.shared.speechChunks(from: trimmed)
+            guard !chunks.isEmpty else { throw KokoroTTSServiceError.emptyText }
+            let playbackToken = KokoroTTSService.shared.newPlaybackToken()
+
+            try await playResearchSpeechChunks(
+                chunks,
+                voice: voice,
+                speed: Float(speed),
+                playbackToken: playbackToken,
+                onPreparing: { _, _ in }
+            ) { data, _, _, token in
+                try Task.checkCancellation()
+                guard KokoroTTSService.shared.isPlaybackTokenCurrent(token) else {
+                    throw CancellationError()
+                }
+                guard let player = NSSound(data: data) else {
+                    throw NSError(
+                        domain: "KokoroPlayback",
+                        code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "Failed to initialize MLX audio playback."]
+                    )
+                }
+                setAudioPlayer(player)
+                guard player.play() else {
+                    throw NSError(
+                        domain: "KokoroPlayback",
+                        code: 2,
+                        userInfo: [NSLocalizedDescriptionKey: "Failed to start MLX audio playback."]
+                    )
+                }
+                while player.isPlaying {
+                    try Task.checkCancellation()
+                    guard KokoroTTSService.shared.isPlaybackTokenCurrent(token) else {
+                        player.stop()
+                        throw CancellationError()
+                    }
+                    try await Task.sleep(for: .milliseconds(100))
+                }
+            }
+        } catch is CancellationError {
+            // Stopping speech is a normal user action.
+        } catch {
+            onError("MLX TTS failed: \(error.localizedDescription)")
+        }
+    }
+}
+#endif
+
 #if os(iOS)
 private func startKokoroPlayback(
     text: String,

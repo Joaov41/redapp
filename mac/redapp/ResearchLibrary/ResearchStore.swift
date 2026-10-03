@@ -337,11 +337,16 @@ final class ResearchLibraryStore: ObservableObject {
             context.insert(item)
         }
 
-        let sourceDigest = ResearchDigest.sha256Hex(
-            request.sources
-                .sorted { $0.sourceOrder < $1.sourceOrder }
-                .map(\.contentDigest)
-                .joined(separator: "|")
+        let sourceDigest = BatchPodcastContextBuilder.sourceDigest(
+            sources: request.sources,
+            summaries: request.perPostSummaries.map {
+                BatchPodcastPostSummaryInput(
+                    title: $0.title,
+                    summary: $0.summary,
+                    permalink: $0.permalink
+                )
+            },
+            overallSummary: request.overallSummary
         )
         let hasIncompleteCoverage = !request.coverage.failureMessages.isEmpty
             || request.coverage.postsAnalyzed < request.coverage.postsRequested

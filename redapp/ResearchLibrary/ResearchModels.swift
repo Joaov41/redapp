@@ -14,6 +14,7 @@ enum ResearchArtifactKind: String, Codable, CaseIterable, Sendable {
     case tableReport
     case infographic
     case whiteboard
+    case podcastScript
     case questionAnswer
     case conversationAnswer
     case changeReport
@@ -23,16 +24,17 @@ enum ResearchArtifactKind: String, Codable, CaseIterable, Sendable {
         switch self {
         case .postSummary: return "Post Summary"
         case .commentSummary: return "Comment Summary"
-        case .batchSummary: return "Batch Summary"
-        case .overallReport: return "Overall Report"
-        case .categorizedReport: return "Categorized Report"
+        case .batchSummary: return "Summary"
+        case .overallReport: return "Report"
+        case .categorizedReport: return "Report by Category"
         case .tableReport: return "Table Report"
         case .infographic: return "Infographic"
         case .whiteboard: return "Whiteboard"
-        case .questionAnswer: return "Q&A"
-        case .conversationAnswer: return "Conversation Answer"
+        case .podcastScript: return "Podcast Script"
+        case .questionAnswer: return "Answer"
+        case .conversationAnswer: return "Answer"
         case .changeReport: return "What Changed"
-        case .communityComparison: return "Community Comparison"
+        case .communityComparison: return "Comparison"
         }
     }
 }
@@ -151,7 +153,7 @@ enum ResearchRunState: String, Codable, Sendable {
         switch self {
         case .capturing: return "Saving"
         case .ready: return "Complete"
-        case .partial: return "Incomplete"
+        case .partial: return "Some content missing"
         case .failed: return "Failed"
         }
     }
@@ -159,13 +161,13 @@ enum ResearchRunState: String, Codable, Sendable {
     var explanation: String {
         switch self {
         case .capturing:
-            return "This saved revision is still being prepared."
+            return "This snapshot is still being saved."
         case .ready:
             return "All requested material that was fetched was included."
         case .partial:
-            return "Reddit returned fewer posts or comments than requested, or the available content exceeded the analysis limit. This revision includes everything that was available for analysis."
+            return "Some posts or comments couldn’t be loaded when this snapshot was saved, for example because of a timeout, rate limit or deleted post. Everything else was included."
         case .failed:
-            return "The revision could not be completed."
+            return "This snapshot couldn’t be saved completely."
         }
     }
 }
@@ -176,7 +178,28 @@ enum ResearchEvidenceConfidence: String, Codable, CaseIterable, Sendable {
     case medium
     case high
 
-    var displayName: String { rawValue.capitalized }
+    var displayName: String {
+        switch self {
+        case .high: return "Strong support"
+        case .medium: return "Some support"
+        case .low: return "Thin support"
+        case .unverified: return "Not checked"
+        }
+    }
+
+    /// Why a finding got this rating, in plain words.
+    var explanation: String {
+        switch self {
+        case .high:
+            return "Several quotes from different posts back this up."
+        case .medium:
+            return "More than one quote, from at least two posts, backs this up."
+        case .low:
+            return "Only a few quotes back this up, they come from one post, sources disagree, or some content couldn’t be loaded. It isn’t necessarily wrong."
+        case .unverified:
+            return "No quote could be linked to this point."
+        }
+    }
 }
 
 enum ResearchOfflineAssetState: String, Codable, Sendable {
@@ -893,6 +916,10 @@ final class ResearchCommunityComparisonRecord {
     }
 }
 
+/// Version 1 keeps its own frozen copies of the models, as SwiftData requires.
+/// If it pointed at the live classes, any later change to them would also
+/// change version 1, and stores saved by version 1 could no longer be migrated.
+/// When a model changes in future, freeze version 2 the same way first.
 enum ResearchSchemaV1: VersionedSchema {
     static var versionIdentifier = Schema.Version(1, 0, 0)
 
@@ -909,6 +936,275 @@ enum ResearchSchemaV1: VersionedSchema {
             ResearchOfflineAssetRecord.self,
             ResearchDraftRecord.self
         ]
+    }
+
+    @Model
+    final class ResearchItemRecord {
+        @Attribute(.unique) var id: UUID
+        var title: String
+        var scope: String
+        var subreddit: String
+        var createdAt: Date
+        var updatedAt: Date
+        var lastOpenedAt: Date?
+        var pinnedAt: Date?
+        var tagsJSON: String
+        var normalizedSearchText: String
+
+        init(id: UUID, title: String, scope: String, subreddit: String) {
+            self.id = id
+            self.title = title
+            self.scope = scope
+            self.subreddit = subreddit
+            self.createdAt = Date()
+            self.updatedAt = Date()
+            self.tagsJSON = "[]"
+            self.normalizedSearchText = ""
+        }
+    }
+
+    @Model
+    final class ResearchRunRecord {
+        @Attribute(.unique) var id: UUID
+        var itemID: UUID
+        var revision: Int
+        var stateRawValue: String
+        var capturedAt: Date
+        var completedAt: Date?
+        var feedMode: String
+        var subreddit: String
+        var sortMode: String
+        var timeRange: String
+        var sourceDigest: String
+        var coverageJSON: String
+        var appBuild: String
+        var failureMessage: String?
+
+        init(id: UUID, itemID: UUID) {
+            self.id = id
+            self.itemID = itemID
+            self.revision = 1
+            self.stateRawValue = ResearchRunState.ready.rawValue
+            self.capturedAt = Date()
+            self.feedMode = ""
+            self.subreddit = ""
+            self.sortMode = ""
+            self.timeRange = ""
+            self.sourceDigest = ""
+            self.coverageJSON = ""
+            self.appBuild = ""
+        }
+    }
+
+    @Model
+    final class ResearchSourceRecord {
+        @Attribute(.unique) var id: UUID
+        var runID: UUID
+        var sourceID: String
+        var kindRawValue: String
+        var postSourceID: String
+        var parentSourceID: String?
+        var subreddit: String
+        var title: String?
+        var permalink: String
+        var author: String?
+        var score: Int?
+        var sourceCreatedAt: Date?
+        var depth: Int?
+        var rawMarkdown: String
+        var mediaURLsJSON: String
+        var sourceOrder: Int
+        var contentDigest: String
+
+        init(id: UUID, runID: UUID) {
+            self.id = id
+            self.runID = runID
+            self.sourceID = ""
+            self.kindRawValue = ResearchSourceKind.post.rawValue
+            self.postSourceID = ""
+            self.subreddit = ""
+            self.permalink = ""
+            self.rawMarkdown = ""
+            self.mediaURLsJSON = "[]"
+            self.sourceOrder = 0
+            self.contentDigest = ""
+        }
+    }
+
+    @Model
+    final class ResearchArtifactRecord {
+        @Attribute(.unique) var id: UUID
+        var runID: UUID
+        var supersedesArtifactID: UUID?
+        var kindRawValue: String
+        var title: String
+        var body: String
+        var format: String
+        var createdAt: Date
+        var generationReceiptJSON: String?
+        var coverageJSON: String
+        var conflictsJSON: String
+        var missingDataJSON: String
+        var legacyUncited: Bool
+
+        init(id: UUID, runID: UUID) {
+            self.id = id
+            self.runID = runID
+            self.kindRawValue = ResearchArtifactKind.batchSummary.rawValue
+            self.title = ""
+            self.body = ""
+            self.format = "markdown"
+            self.createdAt = Date()
+            self.coverageJSON = ""
+            self.conflictsJSON = "[]"
+            self.missingDataJSON = "[]"
+            self.legacyUncited = false
+        }
+    }
+
+    @Model
+    final class ResearchClaimRecord {
+        @Attribute(.unique) var id: UUID
+        var artifactID: UUID
+        var claimOrder: Int
+        var text: String
+        var claimType: String
+        var confidenceRawValue: String
+        var conflictingSourceIDsJSON: String
+        var missingDataNote: String?
+
+        init(id: UUID, artifactID: UUID) {
+            self.id = id
+            self.artifactID = artifactID
+            self.claimOrder = 0
+            self.text = ""
+            self.claimType = "finding"
+            self.confidenceRawValue = ResearchEvidenceConfidence.unverified.rawValue
+            self.conflictingSourceIDsJSON = "[]"
+        }
+    }
+
+    @Model
+    final class ResearchCitationRecord {
+        @Attribute(.unique) var id: UUID
+        var claimID: UUID
+        var sourceID: String
+        var supportingQuote: String?
+        var sourceDigest: String
+        var validated: Bool
+        var validationMessage: String?
+
+        init(id: UUID, claimID: UUID) {
+            self.id = id
+            self.claimID = claimID
+            self.sourceID = ""
+            self.sourceDigest = ""
+            self.validated = false
+        }
+    }
+
+    @Model
+    final class ResearchConversationRecord {
+        @Attribute(.unique) var id: UUID
+        var runID: UUID
+        var sourceDigest: String
+        var title: String
+        var createdAt: Date
+        var updatedAt: Date
+
+        init(id: UUID, runID: UUID) {
+            self.id = id
+            self.runID = runID
+            self.sourceDigest = ""
+            self.title = ""
+            self.createdAt = Date()
+            self.updatedAt = Date()
+        }
+    }
+
+    @Model
+    final class ResearchConversationTurnRecord {
+        @Attribute(.unique) var id: UUID
+        var conversationID: UUID
+        var sequence: Int
+        var roleRawValue: String
+        var text: String
+        var artifactID: UUID?
+        var generationReceiptJSON: String?
+        var createdAt: Date
+
+        init(id: UUID, conversationID: UUID) {
+            self.id = id
+            self.conversationID = conversationID
+            self.sequence = 0
+            self.roleRawValue = ResearchConversationRole.user.rawValue
+            self.text = ""
+            self.createdAt = Date()
+        }
+    }
+
+    @Model
+    final class ResearchOfflineAssetRecord {
+        @Attribute(.unique) var id: UUID
+        var runID: UUID
+        var artifactID: UUID?
+        var kindRawValue: String
+        var remoteURL: String?
+        var relativePath: String
+        var mimeType: String
+        var checksum: String
+        var byteCount: Int64
+        var stateRawValue: String
+        var sourceTextDigest: String?
+        var ttsEngine: String?
+        var ttsVoice: String?
+        var ttsSpeed: Double?
+        var duration: Double?
+        var createdAt: Date
+        var failureMessage: String?
+
+        init(id: UUID, runID: UUID) {
+            self.id = id
+            self.runID = runID
+            self.kindRawValue = ResearchOfflineAssetKind.attachment.rawValue
+            self.relativePath = ""
+            self.mimeType = ""
+            self.checksum = ""
+            self.byteCount = 0
+            self.stateRawValue = ResearchOfflineAssetState.queued.rawValue
+            self.createdAt = Date()
+        }
+    }
+
+    @Model
+    final class ResearchDraftRecord {
+        @Attribute(.unique) var id: UUID
+        var kindRawValue: String
+        var destinationKey: String
+        var subreddit: String
+        var parentSourceID: String?
+        var permalink: String?
+        var title: String
+        var body: String
+        var linkURL: String
+        var flairID: String?
+        var flairText: String?
+        var attachmentPathsJSON: String
+        var createdAt: Date
+        var updatedAt: Date
+
+        init(id: UUID, destinationKey: String) {
+            self.id = id
+            self.kindRawValue = ResearchDraftKind.post.rawValue
+            self.destinationKey = destinationKey
+            self.subreddit = ""
+            self.title = ""
+            self.body = ""
+            self.linkURL = ""
+            self.attachmentPathsJSON = "[]"
+            self.createdAt = Date()
+            self.updatedAt = Date()
+        }
     }
 }
 

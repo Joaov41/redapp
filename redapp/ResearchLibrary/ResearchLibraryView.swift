@@ -23,25 +23,22 @@ private struct ResearchLibraryExperimentalGlassSurfaceModifier: ViewModifier {
 
     @ViewBuilder
     func body(content: Content) -> some View {
-        if experimentalAppGlassEnabled {
-            content
-                .scrollContentBackground(.hidden)
-                .background(Color.black)
-        } else {
-            content
-        }
+        // Every library list sits on the app's reading canvas.
+        content
+            .scrollContentBackground(.hidden)
+            .background(RedappDesign.canvas)
     }
 }
 
 enum ResearchLibraryRoute: Hashable {
     case item(id: UUID)
     case run(id: UUID)
+    case artifact(runID: UUID, artifactID: UUID)
     case comparison(leftRunID: UUID, rightRunID: UUID)
-    case crossFilterPicker(baseRunID: UUID)
-    case communityPicker(baseRunID: UUID)
     case communitySetup(firstRunID: UUID, secondRunID: UUID)
     case communityComparison(id: UUID)
     case conversation(runID: UUID, conversationID: UUID?)
+    case ask(runID: UUID, question: String)
     case sources(runID: UUID)
     case source(runID: UUID, sourceID: String)
 }
@@ -68,19 +65,25 @@ struct ResearchLibraryView: View {
     @Binding private var navigationPath: NavigationPath
     @State private var searchText = ""
     @State private var selectedTags = Set<String>()
-    @State private var presentedExport: ResearchExportDocument?
     @State private var communityComparisons: [ResearchCommunityComparisonRecord] = []
     @State private var communityComparisonPendingDeletion: ResearchCommunityComparisonRecord?
+    @State private var itemPendingDeletion: ResearchItemRecord?
     @State private var errorMessage: String?
+
+    /// When embedded in the app shell the library has no sheet chrome
+    /// (minimize/close) and the host supplies the NavigationStack.
+    let isEmbedded: Bool
 
     init(
         navigationPath: Binding<NavigationPath>,
         initialComparison: ResearchComparisonGenerationState? = nil,
+        isEmbedded: Bool = false,
         onMinimize: @escaping () -> Void = {},
         onClose: @escaping () -> Void = {}
     ) {
         _navigationPath = navigationPath
         self.initialComparison = initialComparison
+        self.isEmbedded = isEmbedded
         self.onMinimize = onMinimize
         self.onClose = onClose
     }
@@ -107,7 +110,35 @@ struct ResearchLibraryView: View {
 #endif
 
     var body: some View {
-        NavigationStack(path: $navigationPath) {
+        Group {
+            if isEmbedded {
+                libraryList
+            } else {
+                NavigationStack(path: $navigationPath) {
+                    libraryList
+                }
+            }
+        }
+        .environment(\.researchLibraryMinimizeAction, minimize)
+        .environment(\.researchLibraryNavigate, { route in
+            navigationPath.append(route)
+        })
+        .task(id: initialComparison?.id) {
+            guard let initialComparison, navigationPath.isEmpty else { return }
+            if let comparisonID = initialComparison.communityComparisonID {
+                navigationPath.append(ResearchLibraryRoute.communityComparison(id: comparisonID))
+            } else {
+                navigationPath.append(
+                    ResearchLibraryRoute.comparison(
+                        leftRunID: initialComparison.leftRunID,
+                        rightRunID: initialComparison.rightRunID
+                    )
+                )
+            }
+        }
+    }
+
+    private var libraryList: some View {
             List {
 #if os(macOS)
                 Section {
@@ -123,6 +154,17 @@ struct ResearchLibraryView: View {
                 }
                 .listRowBackground(Color.clear)
 #endif
+                if let storageFailure = store.storageFailure {
+                    Section {
+                        RedappInlineMessage(
+                            title: "Research Library isn’t saving",
+                            message: storageFailure,
+                            kind: .error
+                        )
+                    }
+                    .listRowBackground(Color.clear)
+                    .listRowInsets(EdgeInsets())
+                }
                 if !comparisonJobs.activeJobs.isEmpty {
                     Section("Comparison in progress") {
                         ForEach(comparisonJobs.activeJobs) { job in
@@ -198,8 +240,7 @@ struct ResearchLibraryView: View {
                                     } label: {
                                         Label(tag, systemImage: selectedTags.contains(tag) ? "checkmark.circle.fill" : "tag")
                                     }
-                                    .buttonStyle(.bordered)
-                                    .tint(selectedTags.contains(tag) ? .accentColor : .secondary)
+                                    .buttonStyle(RedappChipButtonStyle(isFilled: selectedTags.contains(tag)))
                                 }
                             }
                         }
@@ -213,14 +254,17 @@ struct ResearchLibraryView: View {
                             systemImage: "books.vertical",
                             description: Text(
                                 searchText.isEmpty
-                                    ? "Save a completed batch to keep its reports, sources, metadata, and follow-up questions."
+                                    ? "Summarize a subreddit, then tap Save. Its report, posts and comments will be kept here so you can read, compare and ask about them later."
                                     : "Try a different search or tag filter."
                             )
                         )
                     } else {
                         ForEach(store.items) { item in
                             NavigationLink(value: ResearchLibraryRoute.item(id: item.id)) {
-                                ResearchLibraryRow(item: item)
+                                ResearchLibraryRow(
+                                    item: item,
+                                    snapshotCount: (try? store.runs(itemID: item.id).count) ?? 1
+                                )
                             }
                             .contextMenu {
                                 Button {
@@ -229,15 +273,24 @@ struct ResearchLibraryView: View {
                                     Label(item.pinnedAt == nil ? "Pin" : "Unpin", systemImage: "pin")
                                 }
                                 Button(role: .destructive) {
-                                    perform { try store.deleteItem(id: item.id) }
+                                    itemPendingDeletion = item
                                 } label: {
                                     Label("Delete", systemImage: "trash")
                                 }
                             }
+                            .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                                // Not `.destructive`: the row stays until the deletion is confirmed.
+                                Button {
+                                    itemPendingDeletion = item
+                                } label: {
+                                    Label("Delete", systemImage: "trash")
+                                }
+                                .tint(RedappDesign.negative)
+                            }
                         }
                     }
                 } header: {
-                    Text("Saved batches")
+                    Text("Saved feeds")
                 }
             }
             .researchLibraryExperimentalGlassSurface()
@@ -248,33 +301,7 @@ struct ResearchLibraryView: View {
                 placement: .navigationBarDrawer(displayMode: .always),
                 prompt: "Search reports, posts, comments, authors"
             )
-            .navigationDestination(for: ResearchLibraryRoute.self) { route in
-                switch route {
-                case .item(let id):
-                    ResearchItemDetailView(itemID: id)
-                case .run(let id):
-                    ResearchRunDetailView(runID: id)
-                case .comparison(let leftRunID, let rightRunID):
-                    ResearchComparisonView(leftRunID: leftRunID, rightRunID: rightRunID)
-                case .crossFilterPicker(let baseRunID):
-                    ResearchCrossFilterComparisonPickerView(baseRunID: baseRunID)
-                case .communityPicker(let baseRunID):
-                    ResearchCommunityComparisonPickerView(baseRunID: baseRunID)
-                case .communitySetup(let firstRunID, let secondRunID):
-                    ResearchCommunityComparisonSetupView(
-                        firstRunID: firstRunID,
-                        secondRunID: secondRunID
-                    )
-                case .communityComparison(let id):
-                    ResearchCommunityComparisonView(comparisonID: id)
-                case .conversation(let runID, let conversationID):
-                    ResearchConversationView(runID: runID, conversationID: conversationID)
-                case .sources(let runID):
-                    ResearchSourcesListView(runID: runID)
-                case .source(let runID, let sourceID):
-                    ResearchSavedSourceRouteView(runID: runID, sourceID: sourceID)
-                }
-            }
+            .modifier(ResearchLibraryDestinations(isEnabled: !isEmbedded))
             .task(id: ResearchSearchRequest(query: searchText, tags: selectedTags)) {
                 try? await Task.sleep(for: .milliseconds(220))
                 guard !Task.isCancelled else { return }
@@ -293,6 +320,9 @@ struct ResearchLibraryView: View {
             } message: {
                 Text(errorMessage ?? store.lastError ?? "Unknown error")
             }
+            .researchItemDeletionConfirmation(item: $itemPendingDeletion) { _ in
+                communityComparisons = (try? store.communityComparisons()) ?? []
+            }
             .alert("Delete community comparison?", isPresented: Binding(
                 get: { communityComparisonPendingDeletion != nil },
                 set: { if !$0 { communityComparisonPendingDeletion = nil } }
@@ -304,42 +334,30 @@ struct ResearchLibraryView: View {
                     deletePendingCommunityComparison()
                 }
             } message: {
-                Text("This removes the comparison and its generated answers. The two saved subreddit batches will remain in the Research Library.")
+                Text("This removes the comparison and its generated answers. Both saved feeds stay in the Research Library.")
             }
-        }
-        .toolbar {
-            ToolbarItem(placement: .cancellationAction) {
-                Button(action: minimize) {
-                    Label("Minimize", systemImage: "chevron.down")
+            // Toolbar items must be attached inside the NavigationStack to render.
+            .toolbar {
+                if !isEmbedded {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button(action: minimize) {
+                        Label("Minimize", systemImage: "chevron.down")
+                    }
+                    .accessibilityHint("Keeps the Research Library available while you browse")
                 }
-                .accessibilityHint("Keeps the Research Library available while you browse")
-            }
-            ToolbarItem(placement: .confirmationAction) {
-                if comparisonJobs.hasActiveJobs {
-                    ProgressView()
-                        .controlSize(.small)
-                        .accessibilityLabel("Comparison in progress")
+                ToolbarItem(placement: .confirmationAction) {
+                    HStack(spacing: 10) {
+                        if comparisonJobs.hasActiveJobs {
+                            ProgressView()
+                                .controlSize(.small)
+                                .accessibilityLabel("Comparison in progress")
+                        }
+                        Button("Close", action: close)
+                            .fontWeight(.semibold)
+                    }
                 }
-                Button("Close", action: close)
+                }
             }
-        }
-        .environment(\.researchLibraryMinimizeAction, minimize)
-        .environment(\.researchLibraryNavigate, { route in
-            navigationPath.append(route)
-        })
-        .task(id: initialComparison?.id) {
-            guard let initialComparison, navigationPath.isEmpty else { return }
-            if let comparisonID = initialComparison.communityComparisonID {
-                navigationPath.append(ResearchLibraryRoute.communityComparison(id: comparisonID))
-            } else {
-                navigationPath.append(
-                    ResearchLibraryRoute.comparison(
-                        leftRunID: initialComparison.leftRunID,
-                        rightRunID: initialComparison.rightRunID
-                    )
-                )
-            }
-        }
     }
 
     private func minimize() {
@@ -384,6 +402,48 @@ struct ResearchLibraryView: View {
     }
 }
 
+/// Every Research Library route. Applied once to whichever NavigationStack
+/// hosts the library (the legacy sheet or the app shell's workspace).
+struct ResearchLibraryDestinations: ViewModifier {
+    var isEnabled = true
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if isEnabled {
+            content.navigationDestination(for: ResearchLibraryRoute.self) { route in
+                switch route {
+                // A saved feed and a single snapshot open the same report screen.
+                case .item(let id):
+                    ResearchItemBriefingLoader(itemID: id)
+                case .run(let id):
+                    ResearchBriefingView(runID: id)
+                case .artifact(let runID, let artifactID):
+                    ResearchSavedArtifactView(runID: runID, artifactID: artifactID)
+                case .comparison(let leftRunID, let rightRunID):
+                    ResearchComparisonView(leftRunID: leftRunID, rightRunID: rightRunID)
+                case .communitySetup(let firstRunID, let secondRunID):
+                    ResearchCommunityComparisonSetupView(
+                        firstRunID: firstRunID,
+                        secondRunID: secondRunID
+                    )
+                case .communityComparison(let id):
+                    ResearchCommunityComparisonView(comparisonID: id)
+                case .conversation(let runID, let conversationID):
+                    ResearchConversationView(runID: runID, conversationID: conversationID)
+                case .ask(let runID, let question):
+                    ResearchConversationView(runID: runID, initialQuestion: question)
+                case .sources(let runID):
+                    ResearchSourcesListView(runID: runID)
+                case .source(let runID, let sourceID):
+                    ResearchSavedSourceRouteView(runID: runID, sourceID: sourceID)
+                }
+            }
+        } else {
+            content
+        }
+    }
+}
+
 private struct ResearchSearchRequest: Equatable {
     let query: String
     let tags: Set<String>
@@ -392,6 +452,7 @@ private struct ResearchSearchRequest: Equatable {
 @MainActor
 private struct ResearchLibraryRow: View {
     let item: ResearchItemRecord
+    let snapshotCount: Int
 
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
@@ -418,7 +479,11 @@ private struct ResearchLibraryRow: View {
                     .foregroundStyle(.tint)
                     .lineLimit(2)
             }
-            Text("Updated \(item.updatedAt.formatted(date: .abbreviated, time: .shortened))")
+            Text(
+                snapshotCount > 1
+                    ? "Saved \(snapshotCount) times · updated \(item.updatedAt.formatted(date: .abbreviated, time: .shortened))"
+                    : "Updated \(item.updatedAt.formatted(date: .abbreviated, time: .shortened))"
+            )
                 .font(.caption)
                 .foregroundStyle(.tertiary)
         }
@@ -427,434 +492,52 @@ private struct ResearchLibraryRow: View {
     }
 }
 
+/// One saved answer or report (a Q&A answer, a "what changed" report, a
+/// podcast script…), opened from the report's Ask tab.
 @MainActor
-struct ResearchItemDetailView: View {
-    let itemID: UUID
-    @ObservedObject private var store = ResearchLibraryStore.shared
-    @State private var item: ResearchItemRecord?
-    @State private var runs: [ResearchRunRecord] = []
-    @State private var crossFilterRuns: [ResearchRunRecord] = []
-    @State private var showTagEditor = false
-    @State private var tagText = ""
-    @State private var errorMessage: String?
-
-    var body: some View {
-        List {
-            if let item {
-                Section("Collection") {
-                    LabeledContent("Scope", value: item.subreddit == "home" ? "Home feed" : "r/\(item.subreddit)")
-                    LabeledContent("Saved feed", value: ResearchCaptureLabel.displayName(scope: item.scope))
-                    LabeledContent("Created", value: item.createdAt.formatted(date: .abbreviated, time: .shortened))
-                    if !item.tags.isEmpty {
-                        LabeledContent("Tags", value: item.tags.joined(separator: ", "))
-                    }
-                }
-
-                if let latestRun = runs.first {
-                    Section("Compare") {
-                        if runs.count >= 2 {
-                            NavigationLink(value: ResearchLibraryRoute.comparison(
-                                leftRunID: runs[1].id,
-                                rightRunID: runs[0].id
-                            )) {
-                                Label("Compare latest two revisions", systemImage: "rectangle.split.2x1")
-                            }
-                        }
-
-                        if !crossFilterRuns.isEmpty {
-                            NavigationLink(value: ResearchLibraryRoute.crossFilterPicker(baseRunID: latestRun.id)) {
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Label("Compare New, Hot, or Top", systemImage: "slider.horizontal.3")
-                                    Text("Choose another saved r/\(item.subreddit) feed")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-
-                        NavigationLink(value: ResearchLibraryRoute.communityPicker(baseRunID: latestRun.id)) {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Label("Compare with another subreddit", systemImage: "person.2.wave.2")
-                                Text("Choose a saved community and a subject")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                    }
-                }
-
-                Section("History") {
-                    ForEach(runs) { run in
-                        NavigationLink(value: ResearchLibraryRoute.run(id: run.id)) {
-                            VStack(alignment: .leading, spacing: 5) {
-                                HStack {
-                                    Text("Revision \(run.revision)")
-                                        .font(.headline)
-                                    Spacer()
-                                    ResearchRunStateBadge(state: run.state)
-                                }
-                                Text(run.capturedAt.formatted(date: .abbreviated, time: .shortened))
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                Text("\(run.coverage.postsAnalyzed) posts · \(run.coverage.commentsAnalyzed) comments analyzed")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                if run.state == .partial {
-                                    Text(run.state.explanation)
-                                        .font(.caption)
-                                        .foregroundStyle(.orange)
-                                        .fixedSize(horizontal: false, vertical: true)
-                                }
-                            }
-                            .padding(.vertical, 3)
-                        }
-                    }
-                }
-            } else {
-                ProgressView()
-            }
-        }
-        .researchLibraryExperimentalGlassSurface()
-        .navigationTitle(item?.title ?? "Saved Research")
-        .toolbar {
-            if let item {
-                ToolbarItemGroup(placement: .primaryAction) {
-                    Button {
-                        perform { try store.setPinned(item.pinnedAt == nil, itemID: item.id) }
-                        reload()
-                    } label: {
-                        Image(systemName: item.pinnedAt == nil ? "pin" : "pin.slash")
-                    }
-                    .accessibilityLabel(item.pinnedAt == nil ? "Pin" : "Unpin")
-
-                    Button {
-                        tagText = item.tags.joined(separator: ", ")
-                        showTagEditor = true
-                    } label: {
-                        Image(systemName: "tag")
-                    }
-                    .accessibilityLabel("Edit tags")
-                }
-            }
-        }
-        .sheet(isPresented: $showTagEditor) {
-            NavigationStack {
-                Form {
-                    TextField("research, important, later", text: $tagText)
-                        .textInputAutocapitalization(.never)
-                    Text("Separate tags with commas.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                .researchLibraryExperimentalGlassSurface()
-                .navigationTitle("Tags")
-                .toolbar {
-                    ToolbarItem(placement: .cancellationAction) {
-                        Button("Cancel") { showTagEditor = false }
-                    }
-                    ToolbarItem(placement: .confirmationAction) {
-                        Button("Save") {
-                            let tags = tagText.split(separator: ",").map(String.init)
-                            perform { try store.setTags(tags, itemID: itemID) }
-                            showTagEditor = false
-                            reload()
-                        }
-                    }
-                }
-            }
-        }
-        .task { reload() }
-        .alert("Research Library", isPresented: Binding(
-            get: { errorMessage != nil },
-            set: { if !$0 { errorMessage = nil } }
-        )) {
-            Button("OK", role: .cancel) { errorMessage = nil }
-        } message: {
-            Text(errorMessage ?? "Unknown error")
-        }
-    }
-
-    private func reload() {
-        do {
-            item = try store.item(id: itemID)
-            runs = try store.runs(itemID: itemID)
-            if let latestRun = runs.first {
-                crossFilterRuns = try store.comparisonRuns(
-                    for: latestRun.id,
-                    differentFiltersOnly: true
-                )
-            } else {
-                crossFilterRuns = []
-            }
-            try store.markOpened(itemID: itemID)
-        } catch {
-            errorMessage = error.localizedDescription
-        }
-    }
-
-    private func perform(_ operation: () throws -> Void) {
-        do { try operation() } catch { errorMessage = error.localizedDescription }
-    }
-}
-
-@MainActor
-private struct ResearchCrossFilterComparisonPickerView: View {
-    let baseRunID: UUID
-    @ObservedObject private var store = ResearchLibraryStore.shared
-    @State private var baseRun: ResearchRunRecord?
-    @State private var candidates: [ResearchRunRecord] = []
-    @State private var errorMessage: String?
-
-    var body: some View {
-        List {
-            if let baseRun {
-                Section("Starting snapshot") {
-                    snapshotRow(baseRun)
-                }
-
-                Section {
-                    if candidates.isEmpty {
-                        ContentUnavailableView(
-                            "No Other Feed Types Saved",
-                            systemImage: "rectangle.stack.badge.plus",
-                            description: Text("Save a New, Hot, or Top batch from the same subreddit first.")
-                        )
-                    } else {
-                        ForEach(candidates) { candidate in
-                            let orderedIDs = orderedRunIDs(baseRun, candidate)
-                            NavigationLink(value: ResearchLibraryRoute.comparison(
-                                leftRunID: orderedIDs.earlier,
-                                rightRunID: orderedIDs.later
-                            )) {
-                                snapshotRow(candidate)
-                            }
-                        }
-                    }
-                } header: {
-                    Text("Choose another saved feed")
-                } footer: {
-                    Text("Different feed types can surface different posts. The comparison will label this clearly.")
-                }
-            } else {
-                ProgressView()
-            }
-        }
-        .researchLibraryExperimentalGlassSurface()
-        .navigationTitle("Compare Feed Types")
-        .task { load() }
-        .alert("Comparison unavailable", isPresented: Binding(
-            get: { errorMessage != nil },
-            set: { if !$0 { errorMessage = nil } }
-        )) {
-            Button("OK", role: .cancel) { errorMessage = nil }
-        } message: {
-            Text(errorMessage ?? "Unknown error")
-        }
-    }
-
-    private func snapshotRow(_ run: ResearchRunRecord) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text(ResearchCaptureLabel.displayName(sortMode: run.sortMode, timeRange: run.timeRange))
-                .font(.headline)
-            Text(run.capturedAt.formatted(date: .abbreviated, time: .shortened))
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Text("\(run.coverage.postsAnalyzed) posts · \(run.coverage.commentsAnalyzed) comments analyzed")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-        .padding(.vertical, 3)
-        .contentShape(Rectangle())
-    }
-
-    private func orderedRunIDs(
-        _ first: ResearchRunRecord,
-        _ second: ResearchRunRecord
-    ) -> (earlier: UUID, later: UUID) {
-        if first.capturedAt <= second.capturedAt {
-            return (first.id, second.id)
-        }
-        return (second.id, first.id)
-    }
-
-    private func load() {
-        do {
-            guard let loadedBase = try store.run(id: baseRunID) else {
-                throw ResearchStoreError.runNotFound
-            }
-            baseRun = loadedBase
-            candidates = try store.comparisonRuns(
-                for: baseRunID,
-                differentFiltersOnly: true
-            )
-            errorMessage = nil
-        } catch {
-            errorMessage = error.localizedDescription
-        }
-    }
-}
-
-@MainActor
-struct ResearchRunDetailView: View {
+private struct ResearchSavedArtifactView: View {
     let runID: UUID
+    let artifactID: UUID
     @ObservedObject private var store = ResearchLibraryStore.shared
     @State private var detail: ResearchRunDetail?
-    @State private var claimsByArtifact: [UUID: [ResearchClaimRecord]] = [:]
+    @State private var artifact: ResearchArtifactRecord?
+    @State private var claims: [ResearchClaimRecord] = []
     @State private var citationsByClaim: [UUID: [ResearchCitationRecord]] = [:]
     @State private var selectedSource: ResearchSourceRecord?
-    @State private var exportDocument: ResearchExportDocument?
     @State private var errorMessage: String?
-    @State private var isGeneratingCompleteOverview = false
-    @State private var isGeneratingGroundedReport = false
-    @State private var isUpdatingOfflinePack = false
 
     var body: some View {
         List {
-            if let detail {
-                overallSummarySection(detail)
-                sourceLinkedReportSection(detail)
-                coverageSection(detail.run.coverage)
-                postSummariesSection(detail)
-                remainingArtifactsSection(detail)
-                followUpQuestionsSection(detail)
-
-                Section("Sources") {
-                    NavigationLink(value: ResearchLibraryRoute.sources(runID: runID)) {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Label(
-                                "\(detail.sources.count) saved source\(detail.sources.count == 1 ? "" : "s")",
-                                systemImage: "tray.full"
-                            )
-                            .font(.headline)
-                            Text("Open the complete posts and comments list")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+            if let detail, let artifact {
+                ResearchArtifactView(
+                    runID: runID,
+                    artifact: artifact,
+                    claims: claims,
+                    citationsByClaim: citationsByClaim,
+                    speechAsset: detail.offlineAssets.first {
+                        $0.kind == .speech && $0.artifactID == artifact.id && $0.state == .ready
+                    },
+                    sourceForID: { sourceID in
+                        if let reference = ResearchComparisonSourceReference.parse(sourceID),
+                           let source = try? store.source(runID: reference.runID, sourceID: reference.sourceID) {
+                            return source
                         }
-                    }
-                }
-
-                Section("Offline") {
-                    if detail.offlineAssets.isEmpty {
-                        Text("Not downloaded")
-                            .foregroundStyle(.secondary)
-                    } else {
-                        LabeledContent(
-                            "Downloaded files",
-                            value: "\(detail.offlineAssets.filter { $0.state == .ready }.count)"
-                        )
-                        LabeledContent(
-                            "Storage",
-                            value: ByteCountFormatter.string(
-                                fromByteCount: detail.offlineAssets.reduce(0) { $0 + $1.byteCount },
-                                countStyle: .file
-                            )
-                        )
-                        if detail.offlineAssets.contains(where: { $0.state != .ready }) {
-                            Label("Some media could not be downloaded.", systemImage: "exclamationmark.triangle")
-                                .foregroundStyle(.orange)
-                            ForEach(detail.offlineAssets.filter { $0.state == .failed }) { asset in
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(asset.remoteURL ?? "Unavailable media")
-                                        .font(.caption)
-                                        .lineLimit(2)
-                                    if let failureMessage = asset.failureMessage {
-                                        Text(failureMessage)
-                                            .font(.caption2)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                        return detail.sources.first { $0.sourceID == sourceID }
+                    },
+                    openSource: { selectedSource = $0 },
+                    onOfflineChange: reload,
+                    presentation: .expanded,
+                    showsSourceLinkNotice: true
+                )
             } else {
                 ProgressView()
             }
         }
         .researchLibraryExperimentalGlassSurface()
-        .navigationTitle(detail.map { "Revision \($0.run.revision)" } ?? "Research Run")
-        .toolbar {
-            ToolbarItemGroup(placement: .primaryAction) {
-                Menu {
-                    Button("Markdown") { prepareExport(format: .markdown) }
-                    Button("JSON archive") { prepareExport(format: .json) }
-                } label: {
-                    Image(systemName: "square.and.arrow.up")
-                }
-                .accessibilityLabel("Re-export")
-
-                Menu {
-                    if detail?.revisionArtifacts.completeOverview == nil,
-                       detail?.revisionArtifacts.postSummaries.isEmpty == false {
-                        Button {
-                            generateCompleteOverview()
-                        } label: {
-                            Label(
-                                "Create full overview from all saved posts",
-                                systemImage: "doc.text.magnifyingglass"
-                            )
-                        }
-                        .disabled(isGeneratingCompleteOverview)
-                    }
-                    Button {
-                        generateGroundedReport()
-                    } label: {
-                        Label(
-                            detail?.revisionArtifacts.sourceLinkedReport == nil
-                                ? "Create key points with source links"
-                                : "Update key points from complete overview",
-                            systemImage: "checkmark.seal"
-                        )
-                    }
-                    .disabled(isGeneratingGroundedReport || detail?.sources.isEmpty != false)
-                } label: {
-                    if isGeneratingCompleteOverview || isGeneratingGroundedReport {
-                        ProgressView()
-                    } else {
-                        Image(systemName: "ellipsis.circle")
-                    }
-                }
-                .disabled(
-                    isGeneratingCompleteOverview
-                        || isGeneratingGroundedReport
-                )
-                .accessibilityLabel("More report options")
-
-                Menu {
-                    Button {
-                        makeOffline()
-                    } label: {
-                        Label(detail?.offlineAssets.isEmpty == false ? "Refresh offline pack" : "Make available offline", systemImage: "arrow.down.circle")
-                    }
-                    if detail?.offlineAssets.isEmpty == false {
-                        Button(role: .destructive) {
-                            deleteOfflinePack()
-                        } label: {
-                            Label("Remove offline download", systemImage: "trash")
-                        }
-                    }
-                } label: {
-                    if isUpdatingOfflinePack {
-                        ProgressView()
-                    } else {
-                        Image(systemName: detail?.offlineAssets.isEmpty == false ? "checkmark.icloud" : "icloud.and.arrow.down")
-                    }
-                }
-                .disabled(isUpdatingOfflinePack)
-                .accessibilityLabel("Offline options")
-            }
-        }
+        .navigationTitle(artifact?.kind.displayName ?? "Saved Report")
+        .navigationBarTitleDisplayMode(.inline)
         .sheet(item: $selectedSource) { source in
-            NavigationStack {
-                ResearchSourceDetailView(source: source)
-            }
-        }
-        .sheet(item: $exportDocument) { document in
-            #if os(iOS)
-            ShareSheet(activityItems: [document.url])
-            #else
-            Text(document.url.path)
-            #endif
+            NavigationStack { ResearchSourceDetailView(source: source) }
         }
         .task { reload() }
         .alert("Research Library", isPresented: Binding(
@@ -864,188 +547,6 @@ struct ResearchRunDetailView: View {
             Button("OK", role: .cancel) { errorMessage = nil }
         } message: {
             Text(errorMessage ?? "Unknown error")
-        }
-    }
-
-    @ViewBuilder
-    private func overallSummarySection(_ detail: ResearchRunDetail) -> some View {
-        Section {
-            Label(
-                "\(detail.revisionArtifacts.postSummaries.count) saved post summaries",
-                systemImage: "doc.on.doc"
-            )
-            .font(.subheadline.weight(.semibold))
-            if let summary = detail.revisionArtifacts.completeOverview {
-                artifactView(
-                    summary,
-                    in: detail,
-                    presentation: .expanded,
-                    showsSourceLinkNotice: false
-                )
-            } else {
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("A full overview was not created when this revision was saved.")
-                        .foregroundStyle(.secondary)
-                    if !detail.revisionArtifacts.postSummaries.isEmpty {
-                        Button {
-                            generateCompleteOverview()
-                        } label: {
-                            if isGeneratingCompleteOverview {
-                                Label("Creating full overview…", systemImage: "hourglass")
-                            } else {
-                                Label(
-                                    "Create overview from all \(detail.revisionArtifacts.postSummaries.count) posts",
-                                    systemImage: "doc.text.magnifyingglass"
-                                )
-                            }
-                        }
-                        .disabled(isGeneratingCompleteOverview)
-                    }
-                }
-            }
-        } header: {
-            Text("Complete overview")
-        } footer: {
-            if detail.revisionArtifacts.completeOverview != nil {
-                Text("This overview was created from all saved post summaries. Source-linked key points are shown separately below.")
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func sourceLinkedReportSection(_ detail: ResearchRunDetail) -> some View {
-        if let report = detail.revisionArtifacts.sourceLinkedReport {
-            let representedPosts = representedPostCount(for: report, in: detail)
-            let savedPosts = max(
-                detail.revisionArtifacts.postSummaries.count,
-                Set(detail.sources.map(\.postSourceID)).count
-            )
-            Section {
-                Label(
-                    "\(representedPosts) of \(savedPosts) saved posts provide direct examples",
-                    systemImage: "link"
-                )
-                .font(.subheadline.weight(.semibold))
-                artifactView(report, in: detail, presentation: .expanded)
-            } header: {
-                Text("Key points with source links")
-            } footer: {
-                Text("The themes come from the complete overview of all saved post summaries. This count shows how many original posts provide direct supporting or conflicting links.")
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func postSummariesSection(_ detail: ResearchRunDetail) -> some View {
-        if !detail.revisionArtifacts.postSummaries.isEmpty {
-            Section("Individual post summaries (\(detail.revisionArtifacts.postSummaries.count))") {
-                ForEach(detail.revisionArtifacts.postSummaries) { artifact in
-                    artifactView(
-                        artifact,
-                        in: detail,
-                        presentation: .disclosure,
-                        showsSourceLinkNotice: false
-                    )
-                }
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func remainingArtifactsSection(_ detail: ResearchRunDetail) -> some View {
-        if !detail.revisionArtifacts.remainingArtifacts.isEmpty {
-            Section("Other reports and answers") {
-                ForEach(detail.revisionArtifacts.remainingArtifacts) { artifact in
-                    artifactView(artifact, in: detail, presentation: .disclosure)
-                }
-            }
-        }
-    }
-
-    private func followUpQuestionsSection(_ detail: ResearchRunDetail) -> some View {
-        Section("Follow-up questions") {
-            NavigationLink(value: ResearchLibraryRoute.conversation(runID: runID, conversationID: nil)) {
-                Label("Ask about this saved batch", systemImage: "plus.bubble")
-            }
-            ForEach(detail.conversations) { conversation in
-                NavigationLink(value: ResearchLibraryRoute.conversation(
-                    runID: runID,
-                    conversationID: conversation.id
-                )) {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(conversation.title)
-                        Text("Updated \(conversation.updatedAt.formatted(date: .abbreviated, time: .shortened))")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-            }
-        }
-    }
-
-    private func artifactView(
-        _ artifact: ResearchArtifactRecord,
-        in detail: ResearchRunDetail,
-        presentation: ResearchArtifactPresentation,
-        showsSourceLinkNotice: Bool = true
-    ) -> some View {
-        ResearchArtifactView(
-            runID: runID,
-            artifact: artifact,
-            claims: claimsByArtifact[artifact.id] ?? [],
-            citationsByClaim: citationsByClaim,
-            speechAsset: detail.offlineAssets.first {
-                $0.kind == .speech && $0.artifactID == artifact.id && $0.state == .ready
-            },
-            sourceForID: { sourceID in
-                if let reference = ResearchComparisonSourceReference.parse(sourceID),
-                   let source = try? store.source(
-                       runID: reference.runID,
-                       sourceID: reference.sourceID
-                   ) {
-                    return source
-                }
-                return detail.sources.first { $0.sourceID == sourceID }
-            },
-            openSource: { selectedSource = $0 },
-            onOfflineChange: reload,
-            presentation: presentation,
-            showsSourceLinkNotice: showsSourceLinkNotice
-        )
-    }
-
-    private func representedPostCount(
-        for artifact: ResearchArtifactRecord,
-        in detail: ResearchRunDetail
-    ) -> Int {
-        let sourcesByID = Dictionary(uniqueKeysWithValues: detail.sources.map { ($0.sourceID, $0) })
-        let postIDs = (claimsByArtifact[artifact.id] ?? []).flatMap { claim in
-            let supportingPostIDs = (citationsByClaim[claim.id] ?? [])
-                .filter(\.validated)
-                .compactMap { sourcesByID[$0.sourceID]?.postSourceID }
-            let conflictingPostIDs = claim.conflictingSourceIDs.compactMap {
-                sourcesByID[$0]?.postSourceID
-            }
-            return supportingPostIDs + conflictingPostIDs
-        }
-        return Set(postIDs).count
-    }
-
-    @ViewBuilder
-    private func coverageSection(_ coverage: ResearchCoverageInput) -> some View {
-        Section("Coverage") {
-            LabeledContent("Posts analyzed", value: "\(coverage.postsAnalyzed) of \(coverage.postsRequested)")
-            LabeledContent("Comments analyzed", value: "\(coverage.commentsAnalyzed)")
-            LabeledContent("Comments fetched", value: "\(coverage.commentsFetched)")
-            LabeledContent("Comments reported", value: "\(coverage.commentsReported)")
-            if coverage.commentsOmitted > 0 {
-                LabeledContent("Comments omitted", value: "\(coverage.commentsOmitted)")
-                    .foregroundStyle(.orange)
-            }
-            ForEach(coverage.failureMessages, id: \.self) { message in
-                Label(message, systemImage: "exclamationmark.triangle")
-                    .foregroundStyle(.orange)
-            }
         }
     }
 
@@ -1053,206 +554,14 @@ struct ResearchRunDetailView: View {
         do {
             let loaded = try store.detail(runID: runID)
             detail = loaded
-            var loadedClaims: [UUID: [ResearchClaimRecord]] = [:]
-            var loadedCitations: [UUID: [ResearchCitationRecord]] = [:]
-            for artifact in loaded.artifacts {
-                let claims = try store.claims(artifactID: artifact.id)
-                loadedClaims[artifact.id] = claims
-                for claim in claims {
-                    loadedCitations[claim.id] = try store.citations(claimID: claim.id)
-                }
+            artifact = loaded.artifacts.first { $0.id == artifactID }
+            if artifact == nil { errorMessage = "This saved report is no longer available." }
+            claims = try store.claims(artifactID: artifactID)
+            citationsByClaim = try claims.reduce(into: [:]) { result, claim in
+                result[claim.id] = try store.citations(claimID: claim.id)
             }
-            claimsByArtifact = loadedClaims
-            citationsByClaim = loadedCitations
         } catch {
             errorMessage = error.localizedDescription
-        }
-    }
-
-    private func prepareExport(format: ResearchExportFormat) {
-        do {
-            let directory = FileManager.default.temporaryDirectory
-                .appendingPathComponent("redapp-research-exports", isDirectory: true)
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            let url = directory.appendingPathComponent("research-\(runID.uuidString).\(format.fileExtension)")
-            switch format {
-            case .json:
-                try store.exportJSON(runID: runID).write(to: url, options: .atomic)
-            case .markdown:
-                try store.exportMarkdown(runID: runID).write(to: url, atomically: true, encoding: .utf8)
-            }
-            exportDocument = ResearchExportDocument(url: url)
-        } catch {
-            errorMessage = error.localizedDescription
-        }
-    }
-
-    private func generateCompleteOverview() {
-        guard let detail else { return }
-        isGeneratingCompleteOverview = true
-        errorMessage = nil
-        Task {
-            defer { isGeneratingCompleteOverview = false }
-            do {
-                _ = try await ensureCompleteOverview(for: detail)
-                reload()
-            } catch is CancellationError {
-                // Closing the revision while generation is running is not an error.
-            } catch {
-                errorMessage = error.localizedDescription
-            }
-        }
-    }
-
-    private func ensureCompleteOverview(
-        for initialDetail: ResearchRunDetail
-    ) async throws -> ResearchArtifactRecord {
-        let latestDetail = try store.detail(runID: runID)
-        if let existing = latestDetail.revisionArtifacts.completeOverview {
-            return existing
-        }
-
-        let postSummaries = latestDetail.revisionArtifacts.postSummaries
-        guard !postSummaries.isEmpty else { throw GroundedResearchError.noPostSummaries }
-        let service = SummaryService.shared
-        let selectedProvider = service.settings.selectedSummaryProvider
-        let basePrompt = completeOverviewPrompt(from: postSummaries, detail: latestDetail)
-        let prompt = selectedProvider == .applePCCGateway
-            ? basePrompt + "\n\nReturn only a readable overview in plain natural-language Markdown. Do not return JSON, a property list, or a code block."
-            : basePrompt
-        let startedAt = Date()
-        let generated: String
-        if selectedProvider == .webAI {
-            generated = try await AppState.shared.performWebAIRequestAsync(
-                title: "Complete Revision Overview",
-                prompt: prompt
-            )
-        } else {
-            generated = try await service.summarize(text: prompt)
-        }
-
-        let rawBody = generated.trimmingCharacters(in: .whitespacesAndNewlines)
-        let body = selectedProvider == .applePCCGateway
-            ? QuestionAnswerTextFormatter.displayText(from: rawBody)
-            : rawBody
-        guard !body.isEmpty else { throw GroundedResearchError.invalidResponse }
-
-        // A second action may have finished while the model was working.
-        if let existing = try store.detail(runID: runID).revisionArtifacts.completeOverview {
-            return existing
-        }
-        return try store.addArtifact(
-            runID: runID,
-            kind: .overallReport,
-            title: "Overall Summary",
-            body: body,
-            generationReceipt: ResearchGenerationReceiptFactory.make(
-                settings: service.settings,
-                startedAt: startedAt,
-                completedAt: Date(),
-                promptVersion: 2,
-                responseSchemaVersion: 0
-            ),
-            coverage: initialDetail.run.coverage,
-            legacyUncited: true
-        )
-    }
-
-    private func completeOverviewPrompt(
-        from postSummaries: [ResearchArtifactRecord],
-        detail: ResearchRunDetail
-    ) -> String {
-        let inputBudget = 50_000
-        let perSummaryLimit = max(120, min(1_200, inputBudget / max(postSummaries.count, 1)))
-        let entries = postSummaries.enumerated().map { index, artifact in
-            """
-            Post \(index + 1): \(artifact.title)
-            Saved summary: \(String(artifact.body.prefix(perSummaryLimit)))
-            """
-        }.joined(separator: "\n\n---\n\n")
-
-        return """
-        Create a complete, plain-language overview of this saved Reddit batch.
-
-        The input contains \(postSummaries.count) saved post summaries. Consider every numbered summary before writing. Combine related posts into themes, explain the overall tone, identify repeated concerns and disagreements, and mention important minority topics so that the result is not based on only a few posts. Do not claim that every user agrees. Do not invent details.
-
-        Use clear Markdown headings and short paragraphs. End with a short coverage sentence stating that all \(postSummaries.count) saved post summaries were included in the request. Do not output a table or a post-by-post list.
-
-        Saved batch coverage: \(detail.run.coverage.postsAnalyzed) posts analyzed and \(detail.run.coverage.commentsAnalyzed) comments analyzed.
-
-        \(entries)
-        """
-    }
-
-    private func generateGroundedReport() {
-        guard let detail else { return }
-        isGeneratingGroundedReport = true
-        errorMessage = nil
-        let inputs = detail.sources.map(ResearchSourceInput.init(record:))
-        Task {
-            defer {
-                isGeneratingCompleteOverview = false
-                isGeneratingGroundedReport = false
-            }
-            do {
-                let overview: ResearchArtifactRecord
-                if let savedOverview = detail.revisionArtifacts.completeOverview {
-                    overview = savedOverview
-                } else {
-                    isGeneratingCompleteOverview = true
-                    overview = try await ensureCompleteOverview(for: detail)
-                    isGeneratingCompleteOverview = false
-                    reload()
-                }
-                let result = try await GroundedResearchService.shared.generateReport(
-                    instruction: "Using the complete overview only to decide what matters, produce 8 to 12 representative key points. Cover the major recurring themes, meaningful disagreement, and important minority topics. Prefer support from different posts. When a recurring point is supported by multiple posts, cite at least two different posts. Every point and quotation must still be supported by the saved Reddit sources. Do not claim that these linked examples are exhaustive.",
-                    sources: inputs,
-                    coverage: detail.run.coverage,
-                    guidingOverview: overview.body,
-                    balanceAcrossPosts: true,
-                    promptVersion: 3
-                )
-                try store.addArtifact(
-                    runID: runID,
-                    kind: .overallReport,
-                    title: result.response.title,
-                    body: result.response.markdown,
-                    generationReceipt: result.receipt,
-                    coverage: detail.run.coverage,
-                    conflicts: result.response.conflicts,
-                    missingData: result.response.missingData,
-                    claims: result.response.claims
-                )
-                reload()
-            } catch {
-                errorMessage = error.localizedDescription
-            }
-        }
-    }
-
-    private func makeOffline() {
-        isUpdatingOfflinePack = true
-        Task {
-            do {
-                _ = try await ResearchOfflinePackManager.shared.makeOffline(runID: runID)
-                reload()
-            } catch {
-                errorMessage = error.localizedDescription
-            }
-            isUpdatingOfflinePack = false
-        }
-    }
-
-    private func deleteOfflinePack() {
-        isUpdatingOfflinePack = true
-        Task {
-            do {
-                try await ResearchOfflinePackManager.shared.deletePack(runID: runID)
-                reload()
-            } catch {
-                errorMessage = error.localizedDescription
-            }
-            isUpdatingOfflinePack = false
         }
     }
 }
@@ -1436,9 +745,6 @@ private struct ResearchArtifactView: View {
         } message: {
             Text(speechError ?? "Unknown error")
         }
-        .onDisappear {
-            stopSpeechOperation()
-        }
     }
 
     @ViewBuilder
@@ -1446,7 +752,7 @@ private struct ResearchArtifactView: View {
         VStack(alignment: .leading, spacing: 10) {
             if artifact.legacyUncited && showsSourceLinkNotice {
                 Label(
-                    "This summary was created before source links were saved. Its points cannot open the original posts or comments.",
+                    "This was written without quotes, so its points can’t open the original posts or comments.",
                     systemImage: "info.circle"
                 )
                     .font(.caption)
@@ -1467,11 +773,10 @@ private struct ResearchArtifactView: View {
                                 ResearchConfidenceBadge(confidence: claim.confidence)
                                 ForEach((citationsByClaim[claim.id] ?? []).filter(\.validated)) { citation in
                                     if let source = sourceForID(citation.sourceID) {
-                                        Button(ResearchComparisonSourceReference.displayName(for: citation.sourceID)) {
+                                        Button(ResearchSourceLabel.text(for: source, quote: citation.supportingQuote)) {
                                             openSource(source)
                                         }
-                                            .buttonStyle(.bordered)
-                                            .controlSize(.small)
+                                            .buttonStyle(RedappChipButtonStyle())
                                     }
                                 }
                             }
@@ -1484,12 +789,10 @@ private struct ResearchArtifactView: View {
                                         .foregroundStyle(.orange)
                                     ForEach(claim.conflictingSourceIDs, id: \.self) { sourceID in
                                         if let source = sourceForID(sourceID) {
-                                            Button(ResearchComparisonSourceReference.displayName(for: sourceID)) {
+                                            Button(ResearchSourceLabel.text(for: source)) {
                                                 openSource(source)
                                             }
-                                                .buttonStyle(.bordered)
-                                                .controlSize(.small)
-                                                .tint(.orange)
+                                                .buttonStyle(RedappChipButtonStyle(isFilled: false))
                                         }
                                     }
                                 }
@@ -1507,8 +810,8 @@ private struct ResearchArtifactView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.vertical, 5)
                 }
-                DisclosureGroup("What does confidence mean?") {
-                    Text("Confidence shows how much support the app found for a point. Low does not mean the point is wrong. It means there were few supporting posts or comments, some sources disagreed, or not enough comments were available.")
+                DisclosureGroup("What do the support labels mean?") {
+                    Text("They show how many quotes from different posts back up a point. Thin support doesn’t mean a point is wrong: there may be few quotes, they may come from one post, sources may disagree, or some content couldn’t be loaded.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(nil)
@@ -1568,8 +871,7 @@ private struct ResearchArtifactView: View {
                                 Button(evidenceLabel(for: source)) {
                                     openSource(source)
                                 }
-                                .buttonStyle(.bordered)
-                                .controlSize(.small)
+                                .buttonStyle(RedappChipButtonStyle())
                                 .help("Open \(sourceID)")
                             }
                         }
@@ -1610,13 +912,21 @@ private struct ResearchArtifactView: View {
                 VStack(alignment: .trailing, spacing: 4) {
                     HStack(spacing: 14) {
                         Button {
-                            toggleSpeechPlayback()
+                            startSpeechPlayback()
                         } label: {
-                            Image(systemName: speechActivity.isPlayback ? "stop.circle.fill" : "play.circle.fill")
+                            Image(systemName: "play.circle.fill")
                         }
                         .buttonStyle(.borderless)
-                        .disabled(speechActivity.isBusy && !speechActivity.isPlayback)
-                        .accessibilityLabel(speechActivity.isPlayback ? "Stop report speech" : "Play report with MLX speech")
+                        .disabled(speechActivity.isBusy)
+                        .accessibilityLabel("Read report aloud")
+
+                        Button {
+                            stopSpeechOperation()
+                        } label: {
+                            Image(systemName: "stop.circle.fill")
+                        }
+                        .buttonStyle(.borderless)
+                        .accessibilityLabel("Stop report speech")
 
                         Button {
                             saveSpeechOffline()
@@ -1626,7 +936,7 @@ private struct ResearchArtifactView: View {
                         .buttonStyle(.borderless)
                         .disabled(speechActivity.isBusy || speechSaved || speechAsset != nil)
                         .accessibilityLabel(
-                            speechSaved || speechAsset != nil ? "Speech saved offline" : "Save speech offline"
+                            speechSaved || speechAsset != nil ? "Spoken version saved offline" : "Save spoken version for offline"
                         )
                     }
 
@@ -1643,14 +953,6 @@ private struct ResearchArtifactView: View {
                     }
                 }
             }
-        }
-    }
-
-    private func toggleSpeechPlayback() {
-        if speechActivity.isPlayback {
-            stopSpeechOperation()
-        } else {
-            startSpeechPlayback()
         }
     }
 
@@ -1685,22 +987,19 @@ private struct ResearchArtifactView: View {
                         playbackToken: playbackToken
                     )
                 } else {
-                    for (index, chunk) in chunks.enumerated() {
-                        try Task.checkCancellation()
-                        guard KokoroTTSService.shared.isPlaybackTokenCurrent(playbackToken) else {
-                            throw CancellationError()
-                        }
-                        speechActivity = .preparing(current: index + 1, total: chunks.count)
-                        let data = try await KokoroTTSService.shared.synthesize(
-                            text: chunk,
-                            voice: settings.kokoroVoice,
-                            speed: Float(settings.kokoroSpeed)
-                        )
+                    try await playResearchSpeechChunks(
+                        chunks,
+                        voice: settings.kokoroVoice,
+                        speed: Float(settings.kokoroSpeed),
+                        playbackToken: playbackToken
+                    ) { current, total in
+                        speechActivity = .preparing(current: current, total: total)
+                    } playData: { data, current, total, token in
                         try await playSpeechData(
                             data,
-                            current: index + 1,
-                            total: chunks.count,
-                            playbackToken: playbackToken
+                            current: current,
+                            total: total,
+                            playbackToken: token
                         )
                     }
                 }
@@ -2020,6 +1319,7 @@ struct ResearchComparisonView: View {
     @State private var areEarlierOnlySourcesExpanded = false
     @State private var areEditedSourcesExpanded = false
     @State private var areScoreChangesExpanded = false
+    @State private var showsDetails = false
     @State private var errorMessage: String?
 
     private var generationKey: String {
@@ -2047,8 +1347,23 @@ struct ResearchComparisonView: View {
             if let left, let right, let difference {
                 comparisonContextSection(left: left, right: right)
                 subredditProgressSection(difference)
-                revisionOverallSummarySection(left)
-                revisionOverallSummarySection(right)
+                if difference.hasChanges {
+                    Section {
+                        Button {
+                            withAnimation { showsDetails.toggle() }
+                        } label: {
+                            Label(
+                                showsDetails ? "Hide the exact differences" : "Show the exact differences",
+                                systemImage: showsDetails ? "chevron.up" : "chevron.down"
+                            )
+                        }
+                    } footer: {
+                        if !showsDetails {
+                            Text(detailsSummary(difference))
+                        }
+                    }
+                }
+                if showsDetails {
                 exactChangesSection(difference)
 
                 if !difference.added.isEmpty {
@@ -2060,7 +1375,7 @@ struct ResearchComparisonView: View {
                                     snapshotLabel: snapshotName(right),
                                     runID: difference.newRunID,
                                     systemImage: "doc.text",
-                                    tint: .blue
+                                    tint: RedappDesign.accent
                                 )
                             }
                         } label: {
@@ -2071,10 +1386,6 @@ struct ResearchComparisonView: View {
                                 Text("\(difference.added.count)")
                                     .foregroundStyle(.secondary)
                             }
-                        }
-                    } footer: {
-                        if !areAddedSourcesExpanded {
-                            Text("Collapsed to keep large comparisons easy to scan.")
                         }
                     }
                 }
@@ -2088,7 +1399,7 @@ struct ResearchComparisonView: View {
                                     snapshotLabel: snapshotName(left),
                                     runID: difference.oldRunID,
                                     systemImage: "doc.text",
-                                    tint: .blue
+                                    tint: RedappDesign.accent
                                 )
                             }
                         } label: {
@@ -2099,10 +1410,6 @@ struct ResearchComparisonView: View {
                                 Text("\(difference.removed.count)")
                                     .foregroundStyle(.secondary)
                             }
-                        }
-                    } footer: {
-                        if !areEarlierOnlySourcesExpanded {
-                            Text("Collapsed to keep large comparisons easy to scan.")
                         }
                     }
                 }
@@ -2141,10 +1448,6 @@ struct ResearchComparisonView: View {
                                     .foregroundStyle(.secondary)
                             }
                         }
-                    } footer: {
-                        if !areEditedSourcesExpanded {
-                            Text("Collapsed to keep large comparisons easy to scan.")
-                        }
                     }
                 }
 
@@ -2159,8 +1462,8 @@ struct ResearchComparisonView: View {
                                         VStack(alignment: .leading, spacing: 3) {
                                             Text(delta.displayTitle)
                                                 .foregroundStyle(.primary)
-                                            Text(delta.sourceID)
-                                                .font(.caption.monospaced())
+                                            Text(sourceKindDescription(delta.kind, author: delta.newSource.author))
+                                                .font(.caption)
                                                 .foregroundStyle(.secondary)
                                         }
                                         Spacer()
@@ -2183,33 +1486,25 @@ struct ResearchComparisonView: View {
                             }
                         }
                     } footer: {
-                        Text("Scores show engagement, not whether a claim is true. Expand to inspect individual changes.")
+                        Text("Scores show how much attention a post or comment got, not whether it is right.")
                     }
                 }
 
                 if !difference.coverageChanges.isEmpty {
-                    Section("Coverage changes") {
+                    Section("Collection changes") {
                         ForEach(difference.coverageChanges) { delta in
                             comparisonRow(delta.title, left: delta.oldValue, right: delta.newValue)
                         }
                     }
                 }
 
-                Section("Coverage") {
-                    comparisonRow("Posts analyzed", left: left.run.coverage.postsAnalyzed, right: right.run.coverage.postsAnalyzed)
-                    comparisonRow("Comments analyzed", left: left.run.coverage.commentsAnalyzed, right: right.run.coverage.commentsAnalyzed)
-                    comparisonRow("Comments omitted", left: left.run.coverage.commentsOmitted, right: right.run.coverage.commentsOmitted)
-                    comparisonRow("Reports and answers", left: left.artifacts.count, right: right.artifacts.count)
-                    comparisonRow("Saved sources", left: left.sources.count, right: right.sources.count)
                 }
-                revisionRemainingOutputsSection(left)
-                revisionRemainingOutputsSection(right)
             } else {
                 ProgressView()
             }
         }
         .researchLibraryExperimentalGlassSurface()
-        .navigationTitle(comparesDifferentFilters ? "Compare Feeds" : "Compare Revisions")
+        .navigationTitle(comparesDifferentFilters ? "Compare Feeds" : "How It Changed")
         .toolbar {
             if isGeneratingReport {
                 ToolbarItem(placement: .primaryAction) {
@@ -2269,51 +1564,15 @@ struct ResearchComparisonView: View {
         }
     }
 
-    @ViewBuilder
-    private func revisionOverallSummarySection(_ detail: ResearchRunDetail) -> some View {
-        Section("\(snapshotName(detail)) — Overall summary") {
-            if let summary = detail.revisionArtifacts.overallSummary {
-                VStack(alignment: .leading, spacing: 8) {
-                    MarkdownTextView(content: summary.body, fontScale: 0.8)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                    Text("Saved \(summary.createdAt.formatted(date: .abbreviated, time: .shortened))")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                .padding(.vertical, 3)
-            } else {
-                Text("No overall summary was saved for this revision.")
-                    .foregroundStyle(.secondary)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func revisionRemainingOutputsSection(_ detail: ResearchRunDetail) -> some View {
-        let overallID = detail.revisionArtifacts.overallSummary?.id
-        let remaining = detail.artifacts.filter { $0.id != overallID }
-        if !remaining.isEmpty {
-            Section("\(snapshotName(detail)) — Individual summaries and reports") {
-                ForEach(remaining) { artifact in
-                    DisclosureGroup {
-                        Text(artifact.body)
-                            .lineLimit(nil)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .textSelection(.enabled)
-                    } label: {
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(artifact.title)
-                                .font(.headline)
-                            Text(artifact.kind.displayName)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                }
-            }
-        }
+    /// One line saying what the hidden details contain.
+    private func detailsSummary(_ difference: ResearchRevisionDiff) -> String {
+        var parts: [String] = []
+        if !difference.added.isEmpty { parts.append("\(difference.added.count) only in the later one") }
+        if !difference.removed.isEmpty { parts.append("\(difference.removed.count) only in the earlier one") }
+        if !difference.edited.isEmpty { parts.append("\(difference.edited.count) edited") }
+        if !difference.scoreChanges.isEmpty { parts.append("\(difference.scoreChanges.count) with new scores") }
+        guard !parts.isEmpty else { return "Only the amount of collected content changed." }
+        return "Posts and comments: " + parts.joined(separator: ", ") + "."
     }
 
     @ViewBuilder
@@ -2322,11 +1581,11 @@ struct ResearchComparisonView: View {
         right: ResearchRunDetail
     ) -> some View {
         Section {
-            comparisonSnapshotRow(title: "Earlier snapshot", detail: left)
-            comparisonSnapshotRow(title: "Later snapshot", detail: right)
+            comparisonSnapshotRow(title: comparesDifferentFilters ? "First feed" : "Earlier", detail: left)
+            comparisonSnapshotRow(title: comparesDifferentFilters ? "Second feed" : "Later", detail: right)
             if comparesDifferentFilters {
                 Label(
-                    "These snapshots use different Reddit feed types. Differences show what each feed surfaced and do not automatically mean the subreddit changed over time.",
+                    "Hot, New and Top show different posts, so a difference here can come from the feed rather than from the community changing.",
                     systemImage: "info.circle"
                 )
                 .font(.caption)
@@ -2335,7 +1594,7 @@ struct ResearchComparisonView: View {
                 .fixedSize(horizontal: false, vertical: true)
             }
         } header: {
-            Text("Compared snapshots")
+            Text(comparesDifferentFilters ? "Compared feeds" : "Compared snapshots")
         }
     }
 
@@ -2354,7 +1613,7 @@ struct ResearchComparisonView: View {
             Text(detail.run.capturedAt.formatted(date: .abbreviated, time: .shortened))
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            Text("\(detail.run.coverage.postsAnalyzed) posts · \(detail.run.coverage.commentsAnalyzed) comments analyzed")
+            Text("\(detail.run.coverage.postsAnalyzed) posts · \(detail.run.coverage.commentsAnalyzed) comments read")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -2442,7 +1701,7 @@ struct ResearchComparisonView: View {
 
     @ViewBuilder
     private func exactChangesSection(_ difference: ResearchRevisionDiff) -> some View {
-        Section("Exact changes") {
+        Section("Exact differences") {
             if !difference.hasChanges {
                 Label("No saved source or coverage changes detected.", systemImage: "equal.circle")
                     .foregroundStyle(.secondary)
@@ -2495,7 +1754,9 @@ struct ResearchComparisonView: View {
     }
 
     private func snapshotName(_ detail: ResearchRunDetail) -> String {
-        comparesDifferentFilters ? captureName(detail.run) : "Revision \(detail.run.revision)"
+        comparesDifferentFilters
+            ? captureName(detail.run)
+            : "Saved \(detail.run.capturedAt.formatted(date: .abbreviated, time: .omitted))"
     }
 
     private func comparisonReportTitle(
@@ -2817,8 +2078,8 @@ struct ResearchComparisonView: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(delta.displayTitle)
                         .foregroundStyle(.primary)
-                    Text("\(snapshotLabel) · \(delta.sourceID)")
-                        .font(.caption.monospaced())
+                    Text("\(snapshotLabel) · \(sourceKindDescription(delta.kind, author: delta.newSource?.author ?? delta.oldSource?.author))")
+                        .font(.caption)
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -2831,8 +2092,7 @@ struct ResearchComparisonView: View {
 
     private func sourceButton(title: String, runID: UUID, sourceID: String) -> some View {
         Button(title) { openSource(runID: runID, sourceID: sourceID) }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
+            .buttonStyle(RedappChipButtonStyle())
     }
 
     private func openComparisonSource(_ encodedID: String) {
@@ -2845,15 +2105,26 @@ struct ResearchComparisonView: View {
 
     private func comparisonSourceLabel(_ encodedID: String) -> String {
         guard let reference = ResearchComparisonSourceReference.parse(encodedID) else {
-            return encodedID
+            if let source = try? store.source(runID: rightRunID, sourceID: encodedID) {
+                return ResearchSourceLabel.text(for: source)
+            }
+            return "Saved source"
         }
+        let sourceText = (try? store.source(runID: reference.runID, sourceID: reference.sourceID))
+            .map { ResearchSourceLabel.text(for: $0) } ?? "Saved source"
         if let left, reference.runID == left.run.id {
-            return "\(snapshotName(left)) · \(reference.sourceID)"
+            return "\(snapshotName(left)) · \(sourceText)"
         }
         if let right, reference.runID == right.run.id {
-            return "\(snapshotName(right)) · \(reference.sourceID)"
+            return "\(snapshotName(right)) · \(sourceText)"
         }
-        return reference.displayName
+        return sourceText
+    }
+
+    private func sourceKindDescription(_ kind: ResearchSourceKind, author: String?) -> String {
+        let noun = kind == .post ? "post" : "comment"
+        guard let author, !author.isEmpty else { return noun }
+        return "\(noun) by u/\(author)"
     }
 
     private func openSource(runID: UUID, sourceID: String) {
@@ -2942,8 +2213,7 @@ private struct ResearchComparisonReportView: View {
                                     Button(sourceLabel(citation.sourceID)) {
                                         openSource(citation.sourceID)
                                     }
-                                    .buttonStyle(.bordered)
-                                    .controlSize(.small)
+                                    .buttonStyle(RedappChipButtonStyle())
                                 }
                             }
                         }
@@ -2985,54 +2255,78 @@ private struct ResearchComparisonReportView: View {
     }
 }
 
-private struct ResearchRunStateBadge: View {
-    let state: ResearchRunState
-
-    var body: some View {
-        Text(state.displayName)
-            .font(.caption2.weight(.semibold))
-            .padding(.horizontal, 7)
-            .padding(.vertical, 3)
-            .background(state == .ready ? Color.green.opacity(0.15) : Color.orange.opacity(0.15))
-            .clipShape(Capsule())
-            .accessibilityHint(state.explanation)
-    }
-}
-
+/// "Strong support" / "Some support" / "Thin support". Tapping it explains
+/// what the rating means for this point.
 struct ResearchConfidenceBadge: View {
     let confidence: ResearchEvidenceConfidence
+    @State private var showsExplanation = false
 
     var body: some View {
-        Label(confidence.displayName, systemImage: "checkmark.shield")
-            .font(.caption2.weight(.semibold))
-            .fixedSize(horizontal: true, vertical: false)
-            .padding(.horizontal, 7)
-            .padding(.vertical, 4)
-            .background(color.opacity(0.15))
-            .foregroundStyle(color)
-            .clipShape(Capsule())
+        Button {
+            showsExplanation = true
+        } label: {
+            Label(confidence.displayName, systemImage: "checkmark.shield")
+                .font(.caption2.weight(.semibold))
+                .fixedSize(horizontal: true, vertical: false)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 4)
+                .background(color.opacity(0.15))
+                .foregroundStyle(color)
+                .clipShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityHint(confidence.explanation)
+        .popover(isPresented: $showsExplanation) {
+            Text(confidence.explanation)
+                .font(.subheadline)
+                .foregroundStyle(RedappDesign.ink)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: 280, alignment: .leading)
+                .padding(16)
+                .presentationCompactAdaptation(.popover)
+        }
     }
 
     private var color: Color {
         switch confidence {
-        case .high: return .green
-        case .medium: return .blue
+        case .high: return RedappDesign.positive
+        case .medium: return RedappDesign.inkSecondary
         case .low: return .orange
-        case .unverified: return .red
+        case .unverified: return RedappDesign.negative
         }
     }
 }
 
-private enum ResearchExportFormat {
-    case markdown
-    case json
+/// Readable chip text for a saved source, used instead of internal IDs such as
+/// "t1_k3x9ab": "u/name · “first few words…”" or "Post · “title…”".
+enum ResearchSourceLabel {
+    static func text(for source: ResearchSourceRecord, quote: String? = nil) -> String {
+        let trimmedQuote = quote?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let excerptSource: String
+        if !trimmedQuote.isEmpty {
+            excerptSource = trimmedQuote
+        } else if source.kind == .post, let title = source.title, !title.isEmpty {
+            excerptSource = title
+        } else {
+            excerptSource = MarkdownTextView.extractPlainText(from: source.rawMarkdown)
+        }
+        let lead: String
+        if source.kind == .post {
+            lead = "Post"
+        } else if let author = source.author, !author.isEmpty {
+            lead = "u/\(author)"
+        } else {
+            lead = "Comment"
+        }
+        let excerpt = shortened(excerptSource)
+        return excerpt.isEmpty ? lead : "\(lead) · “\(excerpt)”"
+    }
 
-    var fileExtension: String { self == .json ? "json" : "md" }
-}
-
-private struct ResearchExportDocument: Identifiable {
-    let id = UUID()
-    let url: URL
+    static func shortened(_ text: String, words: Int = 6) -> String {
+        let parts = text.split(whereSeparator: \.isWhitespace)
+        let head = parts.prefix(words).joined(separator: " ")
+        return parts.count > words ? head + "…" : head
+    }
 }
 
 extension ResearchSourceInput {
@@ -3053,5 +2347,37 @@ extension ResearchSourceInput {
             mediaURLs: record.mediaURLs,
             sourceOrder: record.sourceOrder
         )
+    }
+}
+
+
+/// Says what actually made a snapshot partial (which posts failed and why),
+/// instead of a generic warning.
+struct ResearchPartialReason: View {
+    let coverage: ResearchCoverageInput
+
+    private var summary: String {
+        let failures = coverage.failureMessages
+        guard !failures.isEmpty else {
+            return "Some posts or comments couldn’t be loaded when this was saved."
+        }
+        let count = failures.count
+        let lead = count == 1 ? "1 post couldn't be loaded" : "\(count) posts couldn't be loaded"
+        let first = failures[0]
+        return count == 1 ? "\(lead): \(first)" : "\(lead), e.g. \(first)"
+    }
+
+    var body: some View {
+        Label {
+            Text(summary)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+        } icon: {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+        }
+        .font(.caption)
+        .foregroundStyle(RedappDesign.inkSecondary)
+        .accessibilityElement(children: .combine)
     }
 }

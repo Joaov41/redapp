@@ -55,43 +55,44 @@ struct InfographicView: View {
                             .edgesIgnoringSafeArea(.bottom)
                         if isLoading {
                             ProgressView(loadingText)
-                                .padding(12)
-                                .background(.ultraThinMaterial)
-                                .cornerRadius(12)
+                                .tint(RedappDesign.accent)
+                                .padding(.horizontal, 18)
+                                .padding(.vertical, 12)
+                                .background(Capsule().fill(RedappDesign.card))
+                                .overlay(Capsule().strokeBorder(RedappDesign.hairlineStrong, lineWidth: 1))
                         }
                     }
                         .edgesIgnoringSafeArea(.bottom)
                 } else {
-                    VStack(spacing: 12) {
-                        Image(systemName: "exclamationmark.triangle")
-                            .font(.largeTitle)
-                            .foregroundColor(.secondary)
-                        Text(emptyText)
-                            .foregroundColor(.secondary)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    ContentUnavailableView(emptyText, systemImage: "exclamationmark.triangle")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
+            .background(RedappDesign.canvas.ignoresSafeArea())
             .navigationTitle(title)
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
             #endif
             .toolbar {
+                // Same arrangement as the other result screens: minimize on the
+                // leading edge, Close as the confirming action on the trailing edge.
                 ToolbarItem(placement: .cancellationAction) {
-                    HStack(spacing: 12) {
-                        Button("Close") {
+                    if onMinimize != nil {
+                        Button(action: {
+                            onMinimize?()
                             dismiss()
-                        }
-                        if onMinimize != nil {
-                            Button(action: {
-                                onMinimize?()
-                                dismiss()
-                            }) {
-                                Label("Minimize", systemImage: "minus.circle")
-                            }
+                        }) {
+                            Label("Minimize", systemImage: "chevron.down")
                         }
                     }
                 }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Close") {
+                        dismiss()
+                    }
+                    .fontWeight(.semibold)
+                }
+                ToolbarSpacer(.fixed, placement: .primaryAction)
                 ToolbarItem(placement: .primaryAction) {
                     Button(action: snapshotAndCopyImage) {
                         Label("Copy Image", systemImage: "square.on.square")
@@ -110,8 +111,8 @@ struct InfographicView: View {
                     Text(message)
                         .font(.caption)
                         .padding(8)
-                        .background(.ultraThinMaterial)
-                        .cornerRadius(8)
+                        .background(Capsule().fill(RedappDesign.card))
+                        .overlay(Capsule().strokeBorder(RedappDesign.hairlineStrong, lineWidth: 1))
                         .padding(.bottom, 20)
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                         .onAppear {
@@ -341,6 +342,7 @@ struct AskAIResponseSheet: View {
             VStack(alignment: .leading, spacing: 16) {
                 if isLoading {
                     ProgressView("Asking AI…")
+                        .tint(RedappDesign.accent)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
 
@@ -351,14 +353,13 @@ struct AskAIResponseSheet: View {
                             .textSelection(.enabled)
                     }
                 } else if let errorMessage {
-                    Text(errorMessage)
-                        .foregroundColor(.red)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                    RedappInlineMessage(title: "Couldn’t get an answer", message: errorMessage)
                 }
 
                 Spacer()
             }
-            .padding()
+            .padding(24)
+            .background(RedappDesign.canvas.ignoresSafeArea())
             .navigationTitle("Ask AI")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -369,8 +370,10 @@ struct AskAIResponseSheet: View {
                 }
                 ToolbarItem(placement: .primaryAction) {
                     if response != nil {
-                        Button("Copy") {
+                        Button {
                             onCopy()
+                        } label: {
+                            Label("Copy", systemImage: "doc.on.doc")
                         }
                     }
                 }

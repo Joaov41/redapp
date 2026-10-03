@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import SwiftData
 import XCTest
 @testable import redapp
 
@@ -114,7 +115,7 @@ final class redappTests: XCTestCase {
             ResearchCaptureLabel.displayName(scope: "subreddit|OpenAI|new|all"),
             "New"
         )
-        XCTAssertEqual(ResearchRunState.partial.displayName, "Incomplete")
+        XCTAssertEqual(ResearchRunState.partial.displayName, "Some content missing")
         XCTAssertTrue(ResearchRunState.partial.explanation.contains("posts or comments"))
     }
 
@@ -744,7 +745,27 @@ final class redappTests: XCTestCase {
         )
 
         let cleaned = ResearchCommunityComparisonService.removingCitationSelectionLimitations(response)
-        XCTAssertEqual(cleaned.missingData, ["Reddit returned only 48 of 50 requested posts."])
+        XCTAssertEqual(
+            cleaned.missingData,
+            [
+                "Reddit returned only 48 of 50 requested posts.",
+                ResearchCommunityComparisonService.selectionLimitationNote
+            ],
+            "Confusing selection notes are replaced by one plain note, not hidden"
+        )
+
+        let ownCoverageNote = "Quotes were picked from 12 of 50 saved posts, so not every saved post is quoted here."
+        let validationNote = ResearchEvidenceValidator.omittedClaimsNote(count: 2)
+        let kept = ResearchCommunityComparisonService.removingCitationSelectionLimitations(
+            ValidatedGroundedResponse(
+                title: "Comparison",
+                overview: nil,
+                claims: [],
+                conflicts: [],
+                missingData: [ownCoverageNote, validationNote]
+            )
+        )
+        XCTAssertEqual(kept.missingData, [ownCoverageNote, validationNote])
     }
 
     func testMLXReportSpeechChunkingKeepsEveryChunkWithinModelLimit() {
@@ -1095,7 +1116,11 @@ final class redappTests: XCTestCase {
         XCTAssertEqual(result.claims.count, 1)
         XCTAssertEqual(result.claims[0].confidence, .high)
         XCTAssertEqual(result.claims[0].citations.count, 3)
-        XCTAssertTrue(result.missingData.contains { $0.contains("Unverified model claim omitted") })
+        XCTAssertTrue(result.missingData.contains(ResearchEvidenceValidator.omittedClaimsNote(count: 1)))
+        XCTAssertFalse(
+            result.missingData.contains { $0.contains("This unsupported claim must be omitted.") },
+            "A rejected claim must not be shown again as a note"
+        )
 
         let unanswered = try ResearchEvidenceValidator.validate(
             GroundedResearchPayload(
@@ -1281,5 +1306,224 @@ final class redappTests: XCTestCase {
 
         try store.deleteDraft(kind: .reply, destinationKey: "reply:t1_comment")
         XCTAssertNil(try store.draft(kind: .reply, destinationKey: "reply:t1_comment"))
+    }
+
+    func testQuoteValidationRejectsGenericShortQuotes() throws {
+        let sources = [
+            source(id: "t1_one", postID: "t3_a", text: "I agree. Battery life improved after the update."),
+            source(id: "t1_two", postID: "t3_b", text: "Same here")
+        ]
+        let payload = GroundedResearchPayload(
+            title: nil,
+            overview: nil,
+            claims: [
+                .init(
+                    text: "Battery life improved.",
+                    claimType: nil,
+                    citations: [
+                        .init(sourceID: "t1_one", quote: "I agree."),
+                        .init(sourceID: "t1_two", quote: "Same here")
+                    ],
+                    conflictingSourceIDs: nil,
+                    missingData: nil
+                ),
+                .init(
+                    text: "The update helped battery life.",
+                    claimType: nil,
+                    citations: [.init(sourceID: "t1_one", quote: "Battery life improved after")],
+                    conflictingSourceIDs: nil,
+                    missingData: nil
+                )
+            ],
+            conflicts: nil,
+            missingData: nil
+        )
+
+        let result = try ResearchEvidenceValidator.validate(payload, sources: sources, coverage: .empty)
+        XCTAssertEqual(result.claims.map(\.text), ["The update helped battery life."])
+        XCTAssertTrue(result.missingData.contains(ResearchEvidenceValidator.omittedClaimsNote(count: 1)))
+    }
+
+    func testSupportCheckDropsQuotesThatDoNotSupportTheirFinding() throws {
+        let sources = [
+            source(id: "t1_one", postID: "t3_a", text: "Battery life improved after the update."),
+            source(id: "t1_two", postID: "t3_b", text: "I agree with everything said in this thread."),
+            source(id: "t1_three", postID: "t3_c", text: "My battery lasts much longer now.")
+        ]
+        let response = ValidatedGroundedResponse(
+            title: "Battery",
+            overview: nil,
+            claims: [
+                ResearchClaimInput(
+                    order: 0,
+                    text: "Battery life improved.",
+                    citations: [
+                        ResearchCitationInput(sourceID: "t1_one", supportingQuote: "Battery life improved"),
+                        ResearchCitationInput(sourceID: "t1_two", supportingQuote: "I agree with everything said")
+                    ],
+                    confidence: .medium
+                ),
+                ResearchClaimInput(
+                    order: 1,
+                    text: "People dislike the new design.",
+                    citations: [ResearchCitationInput(sourceID: "t1_three", supportingQuote: "battery lasts much longer")],
+                    confidence: .low
+                )
+            ],
+            conflicts: [],
+            missingData: []
+        )
+
+        let raw = """
+        ```json
+        {"verdicts":[{"id":"C1-Q1","supports":true},{"id":"c1-q2","supports":"no"},{"id":"C2-Q1","supports":false}]}
+        ```
+        """
+        let verdicts = try XCTUnwrap(GroundedResearchService.decodeSupportVerdicts(raw))
+        XCTAssertEqual(verdicts["C1-Q2"], false)
+
+        let checked = GroundedResearchService.applyingSupportVerdicts(
+            verdicts,
+            to: response,
+            sources: sources,
+            coverage: .empty
+        )
+        XCTAssertEqual(checked.claims.count, 1)
+        XCTAssertEqual(checked.claims[0].citations.map(\.sourceID), ["t1_one"])
+        XCTAssertEqual(checked.claims[0].confidence, .low, "Confidence is recomputed from the remaining quotes")
+        XCTAssertTrue(checked.missingData.contains(ResearchEvidenceValidator.unsupportedClaimsNote(count: 1)))
+        XCTAssertTrue(ResearchEvidenceValidator.isValidationNote(ResearchEvidenceValidator.unsupportedClaimsNote(count: 1)))
+
+        let unchecked = GroundedResearchService.applyingSupportVerdicts(
+            [:],
+            to: response,
+            sources: sources,
+            coverage: .empty
+        )
+        XCTAssertEqual(unchecked.claims.count, 2, "Pairs without a verdict are kept")
+        XCTAssertTrue(GroundedResearchService.supportCheckPrompt(for: response.claims).contains("C2-Q1"))
+    }
+
+    func testThinCommunityComparisonIsFlaggedInsteadOfDiscarded() throws {
+        let runID = UUID()
+        func claim(_ side: ResearchCommunitySourceReference.Side) -> ResearchClaimInput {
+            ResearchClaimInput(
+                order: 0,
+                text: "A point.",
+                claimType: "first_community",
+                citations: [
+                    ResearchCitationInput(
+                        sourceID: ResearchCommunitySourceReference(
+                            side: side,
+                            runID: runID,
+                            subreddit: "swift",
+                            sourceID: "t1_x"
+                        ).encodedID,
+                        supportingQuote: "a supporting quote here"
+                    )
+                ],
+                confidence: .low
+            )
+        }
+
+        let thin = try XCTUnwrap(
+            ResearchCommunityComparisonService.limitedEvidenceNote(
+                claims: [claim(.first)],
+                broadThemeRequest: false
+            )
+        )
+        XCTAssertTrue(ResearchCommunityComparisonService.isLimitedEvidenceNote(thin))
+        XCTAssertNil(
+            ResearchCommunityComparisonService.limitedEvidenceNote(
+                claims: [claim(.first), claim(.second)],
+                broadThemeRequest: false
+            )
+        )
+        XCTAssertNotNil(
+            ResearchCommunityComparisonService.limitedEvidenceNote(
+                claims: [claim(.first), claim(.second)],
+                broadThemeRequest: true
+            ),
+            "A broad comparison with two findings and no complete themes is thin"
+        )
+    }
+
+    func testSourceLabelsAreReadableInsteadOfInternalIDs() {
+        let comment = ResearchSourceRecord(
+            runID: UUID(),
+            input: source(id: "t1_k3x9ab", text: "Battery life improved a lot after the latest update to iOS.")
+        )
+        let label = ResearchSourceLabel.text(for: comment)
+        XCTAssertFalse(label.contains("t1_"))
+        XCTAssertEqual(label, "u/tester · “Battery life improved a lot after…”")
+        XCTAssertEqual(
+            ResearchSourceLabel.text(for: comment, quote: "improved a lot"),
+            "u/tester · “improved a lot”"
+        )
+    }
+
+    @MainActor
+    func testDeletingTheOnlyTurnRemovesTheConversation() throws {
+        let store = ResearchLibraryStore(inMemory: true)
+        let run = try store.saveBatch(
+            ResearchBatchSaveRequest(
+                title: "Swift Research",
+                scope: "subreddit|swift|new|all",
+                subreddit: "swift",
+                feedMode: "subreddit",
+                sortMode: "new",
+                timeRange: "all",
+                sources: [source()],
+                coverage: .empty,
+                perPostSummaries: [],
+                overallSummary: nil,
+                generationReceipt: nil
+            )
+        )
+        let conversation = try store.createConversation(runID: run.id, title: "Question")
+        let turn = try store.appendTurn(conversationID: conversation.id, role: .user, text: "Question?")
+
+        try store.deleteTurn(id: turn.id)
+        XCTAssertNil(try store.conversation(id: conversation.id))
+        XCTAssertTrue(try store.conversations(runID: run.id).isEmpty)
+        XCTAssertNil(store.storageFailure)
+    }
+
+    func testVersionOneStoreMigratesToTheCurrentSchema() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ResearchMigration-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("Research.store")
+        let itemID = UUID()
+
+        do {
+            let schema = Schema(versionedSchema: ResearchSchemaV1.self)
+            let container = try ModelContainer(
+                for: schema,
+                configurations: [ModelConfiguration(schema: schema, url: url, cloudKitDatabase: .none)]
+            )
+            let context = ModelContext(container)
+            context.insert(
+                ResearchSchemaV1.ResearchItemRecord(
+                    id: itemID,
+                    title: "Old research",
+                    scope: "subreddit|swift|new|all",
+                    subreddit: "swift"
+                )
+            )
+            try context.save()
+        }
+
+        let schema = Schema(versionedSchema: ResearchSchemaV2.self)
+        let container = try ModelContainer(
+            for: schema,
+            migrationPlan: ResearchMigrationPlan.self,
+            configurations: [ModelConfiguration(schema: schema, url: url, cloudKitDatabase: .none)]
+        )
+        let items = try ModelContext(container).fetch(FetchDescriptor<ResearchItemRecord>())
+        XCTAssertEqual(items.map(\.id), [itemID])
+        XCTAssertEqual(items.first?.title, "Old research")
+        XCTAssertTrue(try ModelContext(container).fetch(FetchDescriptor<ResearchCommunityComparisonRecord>()).isEmpty)
     }
 }

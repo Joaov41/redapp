@@ -24,11 +24,12 @@ struct SimpleTableSummaryView: View {
                                         }
                                     }
                                 )
+                                .padding(.horizontal, 24)
+                                .padding(.top, 8)
                                 .id("topSection")
                                 
                                 TableContentView(tableData: tableData)
                             }
-                            .padding(.horizontal)
                             
                             // Scroll to top button at bottom
                             HStack {
@@ -38,9 +39,9 @@ struct SimpleTableSummaryView: View {
                                         proxy.scrollTo("topSection", anchor: .top)
                                     }
                                 }) {
-                                    Image(systemName: "arrow.up.circle")
+                                    Label("Back to top", systemImage: "arrow.up")
                                 }
-                                .buttonStyle(LiquidGlassButtonStyle(isProminent: true))
+                                .buttonStyle(RedappSecondaryButtonStyle())
                                 Spacer()
                             }
                             .padding(.horizontal)
