@@ -185,23 +185,6 @@
     .cover { align-content: center; }
     .cover h1 { max-width: 1040px; }
     .cover .tagline { max-width: 720px; color: var(--paper); font-size: clamp(22px, 2vw, 34px); }
-    .app-mark {
-      position: absolute;
-      right: 8vw;
-      top: 50%;
-      width: min(25vw, 390px);
-      aspect-ratio: 1;
-      transform: translateY(-50%) rotate(5deg);
-      border: 1px solid rgba(255,75,25,.35);
-      border-radius: 28%;
-      background: rgba(255,75,25,.06);
-      box-shadow: 0 0 0 18px rgba(255,75,25,.025), 0 40px 100px rgba(0,0,0,.45);
-    }
-    .app-mark img { width: 100%; height: 100%; object-fit: cover; border-radius: 28%; filter: saturate(.9) contrast(1.08); }
-    .orbit { position: absolute; inset: -22%; border: 1px dashed rgba(214,255,70,.22); border-radius: 50%; animation: spin 24s linear infinite; }
-    .orbit::after { content: ""; position: absolute; width: 13px; height: 13px; top: 16%; left: 14%; border-radius: 50%; background: var(--lime); box-shadow: 0 0 22px var(--lime); }
-    .capture .orbit { animation: none; }
-    @keyframes spin { to { transform: rotate(360deg); } }
 
     /* Feed map */
     .feed-map { position: relative; min-height: 570px; }
@@ -220,25 +203,43 @@
     .feed-label:nth-of-type(3) { top: 43%; left: 8%; }
     .feed-label:nth-of-type(4) { top: 70%; left: 1%; }
 
-    /* Real iPad app captures */
+    /* Real iPad app captures (landscape, iPad bezel) */
     .actual-shot {
+      --bezel: clamp(8px, .85vw, 14px);
       position: relative;
       justify-self: center;
-      width: min(100%, 510px);
-      height: min(76vh, 690px);
+      width: min(100%, 720px);
       margin: 0;
-      overflow: hidden;
-      border: 1px solid rgba(243,238,226,.25);
-      border-radius: 30px;
-      background: #000;
-      box-shadow: -28px 38px 90px rgba(0,0,0,.52), 0 0 0 8px rgba(243,238,226,.025);
+      padding: var(--bezel);
+      border-radius: clamp(22px, 2.3vw, 38px);
+      background: #080908;
+      box-shadow: 0 0 0 1.5px #44463f, 0 0 0 3px #151611, -28px 38px 90px rgba(0,0,0,.52);
     }
-    .actual-shot img { width: 100%; height: 100%; display: block; object-fit: contain; background: #000; }
+    .actual-shot::before {
+      content: "";
+      position: absolute;
+      left: 50%;
+      top: calc(var(--bezel) / 2 - 2px);
+      z-index: 2;
+      width: 4px;
+      height: 4px;
+      border-radius: 50%;
+      background: #23251f;
+      transform: translateX(-50%);
+    }
+    .actual-shot img {
+      display: block;
+      width: 100%;
+      aspect-ratio: 2360 / 1640;
+      object-fit: cover;
+      border-radius: clamp(14px, 1.5vw, 26px);
+      background: #000;
+    }
     .actual-shot figcaption,
     .shot-stack .capture-label {
       position: absolute;
-      left: 18px;
-      bottom: 16px;
+      left: 4px;
+      bottom: -44px;
       z-index: 3;
       padding: 8px 11px;
       border: 1px solid rgba(214,255,70,.32);
@@ -251,22 +252,27 @@
       text-transform: uppercase;
       backdrop-filter: blur(14px);
     }
-    .actual-shot.home-shot { width: min(100%, 650px); height: min(72vh, 650px); border-radius: 24px; }
-    .actual-shot.home-shot img { object-fit: cover; object-position: left top; }
-    .actual-shot.library-shot { width: min(100%, 500px); }
-    .shot-stack { position: relative; justify-self: center; width: min(100%, 610px); height: min(78vh, 700px); }
+    .actual-shot.hero-shot {
+      position: absolute;
+      right: 4vw;
+      top: 50%;
+      width: min(36vw, 700px);
+      transform: translateY(-50%) rotate(2deg);
+    }
+    .shot-stack { position: relative; justify-self: center; width: min(100%, 680px); aspect-ratio: 1 / .82; }
     .shot-stack img {
       position: absolute;
       display: block;
-      object-fit: contain;
+      aspect-ratio: 2360 / 1640;
+      object-fit: cover;
       background: #000;
-      border: 1px solid rgba(243,238,226,.25);
-      border-radius: 26px;
-      box-shadow: -22px 30px 75px rgba(0,0,0,.5);
+      border: clamp(6px, .65vw, 10px) solid #080908;
+      border-radius: clamp(16px, 1.8vw, 28px);
+      box-shadow: 0 0 0 1.5px #44463f, -22px 30px 75px rgba(0,0,0,.5);
     }
-    .shot-stack .shot-main { left: 0; top: 0; width: 73%; height: 100%; }
-    .shot-stack .shot-detail { right: 0; bottom: 3%; width: 50%; height: 58%; }
-    .shot-stack .capture-label { left: auto; right: 15px; bottom: 13px; }
+    .shot-stack .shot-main { left: 0; top: 0; width: 82%; }
+    .shot-stack .shot-detail { right: 0; bottom: 0; width: 62%; }
+    .shot-stack .capture-label { left: 4px; right: auto; top: -44px; bottom: auto; }
 
     /* Analysis rings */
     .rings { position: relative; height: 580px; }
@@ -389,7 +395,9 @@
       .slide { padding: 66px; }
       .content-two { grid-template-columns: 1fr; gap: 32px; align-content: center; }
       .content-two > :last-child { max-height: 40vh; }
-      .app-mark { opacity: .25; right: -4vw; }
+      .actual-shot.hero-shot { opacity: .16; right: -8vw; width: 70vw; }
+      .actual-shot { width: min(100%, 56vh); }
+      .shot-stack { width: min(100%, 50vh); }
       .pipeline { grid-template-columns: repeat(2,1fr); }
       .stage { min-height: 170px; }
       .providers { grid-template-columns: repeat(2,1fr); }
@@ -410,10 +418,9 @@
       <p class="kicker">Reddit intelligence, reimagined</p>
       <h1>Turn noise into<br><span class="accent">knowledge.</span></h1>
       <p class="tagline">redapp transforms community conversations into structured, verifiable research.</p>
-      <div class="app-mark" aria-hidden="true">
-        <div class="orbit"></div>
-        <img src="../redapp/Assets.xcassets/AppIcon2.appiconset/image-1024.png" alt="">
-      </div>
+      <figure class="actual-shot hero-shot">
+        <img src="../output/ipad-app-screenshots/2026-10-05/1.png" alt="redapp running on iPad: the r/iOS feed beside an open post">
+      </figure>
       <span class="slide-no">01 / 12</span>
     </section>
 
@@ -428,8 +435,8 @@
             <span class="chip">Home feed</span><span class="chip">Subreddit search</span><span class="chip">Favorites</span><span class="chip">Hot</span><span class="chip">New</span><span class="chip">Rising</span><span class="chip">Top</span>
           </div>
         </div>
-        <figure class="actual-shot home-shot">
-          <img src="../output/ipad-app-screenshots/01-home.png" alt="Actual redapp home screen running on an iPad Pro simulator">
+        <figure class="actual-shot">
+          <img src="../output/ipad-app-screenshots/2026-10-05/2.png" alt="redapp on iPad: subreddit feed beside the comment thread">
           <figcaption>Actual app · iPad Pro 13‑inch</figcaption>
         </figure>
       </div>
@@ -522,8 +529,8 @@
           <p class="lead">Save the report, the sources, and the path that led to every conclusion.</p>
           <div class="chip-row"><span class="chip">Search</span><span class="chip">Tags</span><span class="chip">Pin</span><span class="chip">Revision history</span><span class="chip">Compare</span><span class="chip">Offline packs</span><span class="chip">Markdown</span><span class="chip">JSON</span></div>
         </div>
-        <figure class="actual-shot library-shot">
-          <img src="../output/ipad-app-screenshots/08-research-library.png" alt="Actual Research Library screen in redapp on iPad">
+        <figure class="actual-shot">
+          <img src="../output/ipad-app-screenshots/2026-10-05/10.png" alt="Research Library community briefing for r/iOS in redapp on iPad">
           <figcaption>Actual app · Research Library</figcaption>
         </figure>
       </div>
@@ -539,10 +546,10 @@
           <p class="lead">Turn summaries, answers, analyses, and comment threads into private, natural speech.</p>
           <div class="chip-row"><span class="chip">Multiple voices</span><span class="chip">Chunked playback</span><span class="chip">Optional pre-cache</span><span class="chip">Offline after download</span><span class="chip">Cloud fallback</span></div>
         </div>
-        <div class="shot-stack" aria-label="Actual redapp MLX text-to-speech settings and voice picker on iPad">
-          <img class="shot-main" src="../output/ipad-app-screenshots/06-mlx-tts-settings.png" alt="MLX TTS settings with voice, speed, and pre-cache controls">
-          <img class="shot-detail" src="../output/ipad-app-screenshots/07-mlx-voice-menu.png" alt="MLX TTS voice menu showing eight voices">
-          <span class="capture-label">Actual app · MLX TTS</span>
+        <div class="shot-stack" aria-label="redapp thread summary and answer with Listen controls on iPad">
+          <img class="shot-main" src="../output/ipad-app-screenshots/2026-10-05/4.png" alt="Thread summary with a Listen button in redapp on iPad">
+          <img class="shot-detail" src="../output/ipad-app-screenshots/2026-10-05/5.png" alt="AI answer with Listen controls in redapp on iPad">
+          <span class="capture-label">Actual app · Listen</span>
         </div>
       </div>
       <div class="privacy-seal">Generated<br>on device</div>
@@ -567,8 +574,8 @@
           </div>
         </div>
         <figure class="actual-shot">
-          <img src="../output/ipad-app-screenshots/02-settings-summary.png" alt="Actual redapp provider and persistent web session settings on iPad">
-          <figcaption>Actual app · Provider settings</figcaption>
+          <img src="../output/ipad-app-screenshots/2026-10-05/6.png" alt="redapp summarize menu with Run on ChatGPT web session option on iPad">
+          <figcaption>Actual app · Web session models</figcaption>
         </figure>
       </div>
       <span class="slide-no">09 / 12</span>
@@ -606,8 +613,8 @@
           </div>
         </div>
         <figure class="actual-shot">
-          <img src="../output/ipad-app-screenshots/03-settings-services.png" alt="Actual redapp account, media service, voice, and local TTS settings on iPad">
-          <figcaption>Actual app · iPad settings</figcaption>
+          <img src="../output/ipad-app-screenshots/2026-10-05/8.png" alt="redapp full-screen batch summary results on iPad">
+          <figcaption>Actual app · Batch summary</figcaption>
         </figure>
       </div>
       <span class="slide-no">11 / 12</span>
