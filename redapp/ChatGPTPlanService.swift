@@ -1084,13 +1084,15 @@ extension ChatGPTPlanService: ASWebAuthenticationPresentationContextProviding {
 }
 
 /// Batches streamed text so a fast stream updates the UI about 12 times a second.
+/// While a scroll view is being dragged or is decelerating, text is held and delivered
+/// once the scroll settles, so scrolling during a stream costs no re-layout.
 @MainActor
 final class ChatGPTStreamCoalescer {
     private let deliver: (String) -> Void
     private let interval: TimeInterval
     private var pending = ""
     private var lastDelivery = Date.distantPast
-    private var scheduledFlush: Task<Void, Never>?
+    private var scheduledFlush: Timer?
 
     init(interval: TimeInterval = 0.08, deliver: @escaping (String) -> Void) {
         self.interval = interval
@@ -1100,21 +1102,34 @@ final class ChatGPTStreamCoalescer {
     func append(_ chunk: String) {
         pending += chunk
         let elapsed = Date().timeIntervalSince(lastDelivery)
-        if elapsed >= interval {
+        if elapsed >= interval && !Self.isScrolling {
             flush()
         } else if scheduledFlush == nil {
             // Deliver the tail even if the stream pauses before the next chunk.
-            let delay = UInt64((interval - elapsed) * 1_000_000_000)
-            scheduledFlush = Task { [weak self] in
-                try? await Task.sleep(nanoseconds: delay)
-                guard !Task.isCancelled else { return }
-                self?.flush()
-            }
+            scheduleFlush(after: max(0, interval - elapsed))
         }
     }
 
+    /// The timer runs only in the default run loop mode, so it waits out a scroll view
+    /// that is tracking; it also re-arms while SwiftUI reports a scroll in progress.
+    private func scheduleFlush(after delay: TimeInterval) {
+        let timer = Timer(timeInterval: delay, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.scheduledFlush = nil
+                if Self.isScrolling {
+                    self.scheduleFlush(after: self.interval)
+                } else {
+                    self.flush()
+                }
+            }
+        }
+        RunLoop.main.add(timer, forMode: .default)
+        scheduledFlush = timer
+    }
+
     func flush() {
-        scheduledFlush?.cancel()
+        scheduledFlush?.invalidate()
         scheduledFlush = nil
         guard !pending.isEmpty else { return }
         let text = pending
@@ -1122,6 +1137,22 @@ final class ChatGPTStreamCoalescer {
         lastDelivery = Date()
         deliver(text)
     }
+
+    /// UIKit runs the main run loop in tracking mode while a scroll view is dragged or
+    /// decelerating; screens marked `pausesStreamingWhileScrolling()` also report their phase.
+    private static var isScrolling: Bool {
+        #if os(iOS)
+        return RunLoop.main.currentMode == .tracking || StreamingScrollActivity.isScrolling
+        #else
+        return StreamingScrollActivity.isScrolling
+        #endif
+    }
+}
+
+/// Whether a reading screen is scrolling, so streamed text can wait for it to settle.
+@MainActor
+enum StreamingScrollActivity {
+    static var isScrolling = false
 }
 
 // MARK: - Loopback callback listener

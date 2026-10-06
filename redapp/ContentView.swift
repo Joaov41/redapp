@@ -1953,7 +1953,12 @@ class SummaryService: ObservableObject {
             #endif
         }
     }
-    @Published var mlxThroughputState: MLXThroughputState? = nil
+    /// Stored in `MLXThroughputReadout` so its frequent updates redraw only the readout
+    /// line (`MLXThroughputText`), not every screen that observes this service.
+    var mlxThroughputState: MLXThroughputState? {
+        get { MLXThroughputReadout.shared.state }
+        set { MLXThroughputReadout.shared.state = newValue }
+    }
     private var ttsCache: [String: Data] = [:]
     private let maxCacheSize = 50
     private let appleCloudMutex = AsyncMutex()
@@ -1967,7 +1972,6 @@ class SummaryService: ObservableObject {
         private let lock = NSLock()
         private let startTime: Date
         private var tokenCount = 0
-        private var lastPublishedTokenCount = 0
         private var lastPublishedAt: Date
 
         init(startTime: Date) {
@@ -1977,16 +1981,16 @@ class SummaryService: ObservableObject {
 
         func recordToken(
             now: Date,
-            tokenThreshold: Int = 8,
             timeThreshold: TimeInterval = 0.25
         ) -> (tokens: Int, elapsed: TimeInterval)? {
-            recordUnits(1, now: now, tokenThreshold: tokenThreshold, timeThreshold: timeThreshold)
+            recordUnits(1, now: now, timeThreshold: timeThreshold)
         }
 
+        /// Publishes at most every `timeThreshold`: the readout is observed by many views,
+        /// so a token-count trigger redrew them on almost every streamed chunk.
         func recordUnits(
             _ units: Int,
             now: Date,
-            tokenThreshold: Int = 8,
             timeThreshold: TimeInterval = 0.25
         ) -> (tokens: Int, elapsed: TimeInterval)? {
             lock.lock()
@@ -1994,11 +1998,7 @@ class SummaryService: ObservableObject {
 
             tokenCount += max(0, units)
             let elapsed = now.timeIntervalSince(startTime)
-            let crossedTokenThreshold = (tokenCount - lastPublishedTokenCount) >= tokenThreshold
-            let crossedTimeThreshold = now.timeIntervalSince(lastPublishedAt) >= timeThreshold
-
-            guard crossedTokenThreshold || crossedTimeThreshold else { return nil }
-            lastPublishedTokenCount = tokenCount
+            guard now.timeIntervalSince(lastPublishedAt) >= timeThreshold else { return nil }
             lastPublishedAt = now
             return (tokenCount, elapsed)
         }
@@ -2914,7 +2914,35 @@ class SummaryService: ObservableObject {
         }
         #endif
 
-        switch settings.selectedSummaryProvider {
+        // Providers stream per token or in fast 56-character steps; every delivery re-parses
+        // and re-lays out the whole reply. Batch them to about 10 screen updates a second
+        // so scrolling stays smooth while text streams.
+        guard let onPartial else {
+            return try await summarize(text: text, provider: settings.selectedSummaryProvider, onPartial: nil)
+        }
+        let coalescer = await MainActor.run {
+            ChatGPTStreamCoalescer(interval: 0.1) { onPartial($0) }
+        }
+        do {
+            let result = try await summarize(
+                text: text,
+                provider: settings.selectedSummaryProvider,
+                onPartial: { coalescer.append($0) }
+            )
+            await MainActor.run { coalescer.flush() }
+            return result
+        } catch {
+            await MainActor.run { coalescer.flush() }
+            throw error
+        }
+    }
+
+    private func summarize(
+        text: String,
+        provider: SummaryProvider,
+        onPartial: (@MainActor @Sendable (String) -> Void)?
+    ) async throws -> String {
+        switch provider {
         case .gemini:
             return try await summarizeWithGemini(text: text)
         case .appleLocal:
@@ -2952,6 +2980,16 @@ class SummaryService: ObservableObject {
     /// Direct Apple Cloud call, bypassing provider selection.
     /// Use this when batch logic needs Apple Cloud even if Apple Local is selected.
     func summarizeWithAppleCloudDirect(prompt: String) async throws -> String {
+        #if os(iOS)
+        // Same background protection as summarize(text:), which this bypasses.
+        let backgroundHandle = GeminiBackgroundTaskManager.shared.beginLongRunningTask(
+            identifier: .geminiProcessing,
+            title: "Generating Summary"
+        )
+        defer {
+            backgroundHandle.finish(success: true)
+        }
+        #endif
         return try await summarizeWithAppleCloud(prompt: prompt)
     }
 
@@ -4141,6 +4179,17 @@ class SummaryService: ObservableObject {
     
     // MARK: - Infographic Generation (Gemini Flash -> HTML/SVG)
     func generateImage(prompt: String) async throws -> Data {
+        #if os(iOS)
+        // The Gemini branch calls the API directly, so keep it running in the background
+        // the same way summarize(text:) does.
+        let backgroundHandle = GeminiBackgroundTaskManager.shared.beginLongRunningTask(
+            identifier: .geminiProcessing,
+            title: "Generating Visual"
+        )
+        defer {
+            backgroundHandle.finish(success: true)
+        }
+        #endif
         if settings.selectedSummaryProvider != .gemini {
             // Apple providers and MLX: generate HTML/SVG via text-generation pathway
             // MLX redirects to Apple Local for structured JSON output (MLX struggles with JSON)
@@ -8726,6 +8775,11 @@ class RedditSubredditViewModel: ObservableObject {
     }
     
     @Published var posts = [SubredditPostData]()
+    /// The feed minus pinned (sticky) posts: those show in the feed but stay out
+    /// of batch summaries, overviews and comment exports.
+    var summarizablePosts: [SubredditPostData] {
+        posts.filter { $0.stickied != true }
+    }
     @Published var isLoading = false
     @Published var error: String?
     @Published var postLimit: String = "50"
@@ -8764,6 +8818,8 @@ class RedditSubredditViewModel: ObservableObject {
             publishWidgetSnapshot()
         }
     }
+    /// The overview as it streams; `batchFinalSummary` gets the finished text.
+    let batchFinalSummaryStream = StreamingTextBuffer()
     @Published var batchFinalSummaryWasPCC = false
     @Published var batchFinalSummaryCondensed: String? {
         didSet {
@@ -8970,7 +9026,7 @@ class RedditSubredditViewModel: ObservableObject {
     }
 
     private func processedPosts(from fetchedPosts: [SubredditPostData]) -> [SubredditPostData] {
-        fetchedPosts.filter { $0.stickied != true }.map { post in
+        fetchedPosts.map { post in
             var processedPost = post
 
             let imageURLs = parseImageURLs(from: post.selftext)
@@ -9129,7 +9185,7 @@ class RedditSubredditViewModel: ObservableObject {
         isBatchProcessing = true
         batchProgress = 0.0
         batchCurrentPost = 0
-        batchTotalPosts = posts.count
+        batchTotalPosts = summarizablePosts.count
         batchSummaries = []
         batchFinalSummary = nil
         batchFinalSummaryCondensed = nil
@@ -9141,8 +9197,8 @@ class RedditSubredditViewModel: ObservableObject {
         batchCapturedSources = []
         batchCoverage = ResearchCoverageInput(
             postsRequested: max(
-                posts.count,
-                Int(postLimit.trimmingCharacters(in: .whitespacesAndNewlines)) ?? posts.count
+                summarizablePosts.count,
+                Int(postLimit.trimmingCharacters(in: .whitespacesAndNewlines)) ?? summarizablePosts.count
             ),
             postsFetched: 0,
             postsAnalyzed: 0,
@@ -9159,12 +9215,12 @@ class RedditSubredditViewModel: ObservableObject {
 
         #if os(iOS)
         if #available(iOS 16.1, *) {
-            BatchSummaryLiveActivityController.shared.start(subreddit: subreddit, totalPosts: posts.count)
+            BatchSummaryLiveActivityController.shared.start(subreddit: subreddit, totalPosts: summarizablePosts.count)
         }
         // Use iOS 26 background task for batch processing - CRITICAL for background performance
         let backgroundHandle = GeminiBackgroundTaskManager.shared.beginLongRunningTask(
             identifier: .summarization,
-            title: "Batch Summarizing \(posts.count) posts"
+            title: "Batch Summarizing \(summarizablePosts.count) posts"
         )
         backgroundHandle.registerCancellationHandler { [weak self] in
             self?.batchProcessingTask?.cancel()
@@ -9229,10 +9285,10 @@ class RedditSubredditViewModel: ObservableObject {
                 
                 var batchStartIndex = 0
                 
-                while batchStartIndex < posts.count {
+                while batchStartIndex < summarizablePosts.count {
                     try Task.checkCancellation()
                     
-                    let batchEnd = min(batchStartIndex + batchSize, posts.count)
+                    let batchEnd = min(batchStartIndex + batchSize, summarizablePosts.count)
                     var attempt = 0
                     var batchSucceeded = false
                     var lastBatchError: Error? = nil
@@ -9240,7 +9296,7 @@ class RedditSubredditViewModel: ObservableObject {
                     while attempt < maxBatchAttempts && !batchSucceeded {
                         try Task.checkCancellation()
                         
-                        let batchPosts = Array(posts[batchStartIndex..<batchEnd])
+                        let batchPosts = Array(summarizablePosts[batchStartIndex..<batchEnd])
                         
                         await MainActor.run {
                             self.batchCurrentPost = batchEnd
@@ -9543,7 +9599,7 @@ class RedditSubredditViewModel: ObservableObject {
                         )
                     }
                     
-                    if batchEnd < posts.count {
+                    if batchEnd < summarizablePosts.count {
                         await MainActor.run {
                             self.batchCurrentPostTitle = "Waiting \(currentDelay / 1_000_000_000)s before next batch..."
                             #if os(iOS)
@@ -9619,7 +9675,7 @@ class RedditSubredditViewModel: ObservableObject {
         isBatchProcessing = true
         batchProgress = 0.0
         batchCurrentPost = 0
-        batchTotalPosts = posts.count
+        batchTotalPosts = summarizablePosts.count
         batchSummaries = []
         batchFinalSummary = nil
         batchFinalSummaryCondensed = nil
@@ -9632,8 +9688,8 @@ class RedditSubredditViewModel: ObservableObject {
         batchCapturedSources = []
         batchCoverage = ResearchCoverageInput(
             postsRequested: max(
-                posts.count,
-                Int(postLimit.trimmingCharacters(in: .whitespacesAndNewlines)) ?? posts.count
+                summarizablePosts.count,
+                Int(postLimit.trimmingCharacters(in: .whitespacesAndNewlines)) ?? summarizablePosts.count
             ),
             postsFetched: 0,
             postsAnalyzed: 0,
@@ -9998,7 +10054,7 @@ class RedditSubredditViewModel: ObservableObject {
 	        let isAppleCloudFamily = selectedProvider == .appleCloud || selectedProvider == .appleLocal
 	        let feedDescription = feedContextDescription(for: subreddit)
 
-        print("📊 [LimitedContext Batch] Starting batch processing for \(posts.count) posts from \(feedDescription) (provider: \(selectedProvider.displayName))")
+        print("📊 [LimitedContext Batch] Starting batch processing for \(summarizablePosts.count) posts from \(feedDescription) (provider: \(selectedProvider.displayName))")
 
         let totalPostsForProgress = max(1, batchTotalPosts)
         var allPostData: [(title: String, comments: String, permalink: String)] = []
@@ -10015,7 +10071,7 @@ class RedditSubredditViewModel: ObservableObject {
             }
         }
 
-        for (index, post) in posts.enumerated() {
+        for (index, post) in summarizablePosts.enumerated() {
             try Task.checkCancellation()
 
             await MainActor.run {
@@ -10112,7 +10168,7 @@ class RedditSubredditViewModel: ObservableObject {
             throw NSError(domain: "BatchProcessing", code: 1, userInfo: [NSLocalizedDescriptionKey: "Failed to fetch any posts"])
         }
 
-        print("📊 [LimitedContext Batch] Fetched \(allPostData.count)/\(posts.count) posts")
+        print("📊 [LimitedContext Batch] Fetched \(allPostData.count)/\(summarizablePosts.count) posts")
 
         // Store raw comments for Q&A
         await MainActor.run {
@@ -10582,7 +10638,7 @@ class RedditSubredditViewModel: ObservableObject {
         }
 
         var coverage = batchCoverage
-        coverage.postsRequested = max(coverage.postsRequested, max(batchTotalPosts, posts.count))
+        coverage.postsRequested = max(coverage.postsRequested, max(batchTotalPosts, summarizablePosts.count))
         coverage.postsAnalyzed = max(coverage.postsAnalyzed, summariesToSave.count)
         if let batchError, !batchError.isEmpty, !coverage.failureMessages.contains(batchError) {
             coverage.failureMessages.append(batchError)
@@ -10635,7 +10691,7 @@ class RedditSubredditViewModel: ObservableObject {
         perPostCommentLimit: Int = 500,
         progress: @MainActor @escaping (_ current: Int, _ total: Int, _ status: String) -> Void = { _, _, _ in }
     ) async throws -> String {
-        let postsSnapshot = await MainActor.run { self.posts }
+        let postsSnapshot = await MainActor.run { self.summarizablePosts }
         guard !postsSnapshot.isEmpty else { return "" }
 
         let total = postsSnapshot.count
@@ -10714,7 +10770,7 @@ class RedditSubredditViewModel: ObservableObject {
         perPostCommentLimit: Int = 500,
         progress: @MainActor @escaping (_ current: Int, _ total: Int, _ status: String) -> Void = { _, _, _ in }
     ) async throws -> [BatchExtractedPost] {
-        let postsSnapshot = await MainActor.run { self.posts }
+        let postsSnapshot = await MainActor.run { self.summarizablePosts }
         guard !postsSnapshot.isEmpty else { return [] }
 
         let total = postsSnapshot.count
@@ -10897,6 +10953,7 @@ class RedditSubredditViewModel: ObservableObject {
             self.batchCurrentPostTitle = "Generating overall summary..."
             self.showBatchResults = true
             self.batchFinalSummary = ""
+            self.batchFinalSummaryStream.reset()
             self.batchFinalSummaryWasPCC = selectedProvider == .applePCCGateway
             self.isGeneratingBatchOverallSummary = true
             #if os(iOS)
@@ -10937,7 +10994,7 @@ class RedditSubredditViewModel: ObservableObject {
                 finalSummary = try await SummaryService.shared.summarize(
                     text: finalPrompt,
                     onPartial: { token in
-                        self.batchFinalSummary = (self.batchFinalSummary ?? "") + token
+                        self.batchFinalSummaryStream.append(token)
                     }
                 )
             }
@@ -10952,6 +11009,7 @@ class RedditSubredditViewModel: ObservableObject {
                 self.batchCurrentPostTitle = ""
                 self.isBatchProcessing = false
                 self.isGeneratingBatchOverallSummary = false
+                self.batchFinalSummaryStream.reset()
                 self.showBatchResults = true
                 self.requiresImmediateWidgetRefresh = true
                 self.isApplyingFinalSummaryUpdate = false
@@ -10973,6 +11031,12 @@ class RedditSubredditViewModel: ObservableObject {
         } catch {
             await MainActor.run {
                 self.batchError = "Failed to generate final summary: \(error.localizedDescription)"
+                // Keep whatever streamed before the failure on screen.
+                let partialSummary = self.batchFinalSummaryStream.flush()
+                if !partialSummary.isEmpty {
+                    self.batchFinalSummary = partialSummary
+                }
+                self.batchFinalSummaryStream.reset()
                 self.isBatchProcessing = false
                 self.isGeneratingBatchOverallSummary = false
                 #if os(iOS)
@@ -11308,7 +11372,7 @@ class RedditSubredditViewModel: ObservableObject {
         guard !contextName.isEmpty else { return }
         let feedName = feedDisplayName(for: contextName)
 
-        let baseTotal = batchTotalPosts > 0 ? batchTotalPosts : max(posts.count, 0)
+        let baseTotal = batchTotalPosts > 0 ? batchTotalPosts : max(summarizablePosts.count, 0)
         let totalPosts = max(baseTotal, max(batchSummaries.count, 1))
         let processedCandidate = batchCurrentPost > 0 ? batchCurrentPost : batchSummaries.count
         let processedPosts = min(processedCandidate, totalPosts)
@@ -11562,12 +11626,10 @@ struct CommentAnalyticsView: View {
                             }
                         }
 
-                        if let throughput = summaryService.mlxThroughputState,
-                           throughput.provider == summaryService.settings.selectedSummaryProvider,
-                           throughput.provider != .appleCloud {
-                            Text(mlxThroughputInlineText(throughput))
-                                .font(.caption)
-                                .foregroundStyle(RedappDesign.inkSecondary)
+                        MLXThroughputText { text in
+                            Text(text)
+                                    .font(.caption)
+                                    .foregroundStyle(RedappDesign.inkSecondary)
                         }
 
                         if isThematicAnalysisLoading {
@@ -12071,28 +12133,6 @@ struct CommentAnalyticsView: View {
         }
     }
 
-    private func mlxThroughputInlineText(_ state: SummaryService.MLXThroughputState) -> String {
-        let providerLabel: String = {
-            switch state.provider {
-            case .gemini: return "Gemini"
-            case .appleLocal: return "Apple Local"
-            case .appleCloud: return "Apple Cloud"
-            case .mlxLocal: return "LiteRT"
-            case .coreAIMLXLocal: return "CoreAI MLX"
-            case .webAI: return "Web AI"
-            case .summarizeDaemon: return "Codex/Summarize"
-            case .applePCCGateway: return "Apple PCC Gateway"
-            case .chatGPT: return "ChatGPT"
-            }
-        }()
-        if state.tokens == 0 && !state.isFinal {
-            return "\(providerLabel) generating..."
-        }
-        if state.isFinal {
-            return String(format: "\(providerLabel) avg %.1f tok/s • %d tok", state.tokensPerSecond, state.tokens)
-        }
-        return String(format: "\(providerLabel) %.1f tok/s • %d tok", state.tokensPerSecond, state.tokens)
-    }
 
     private func getSentimentMajority(analytics: CommentAnalytics) -> String {
         let (positive, neutral, negative) = analytics.sentimentPercentages
@@ -12416,12 +12456,10 @@ struct PostSummaryView: View {
                         Text("Post Summary")
                             .font(.largeTitle)
                             .fontWeight(.bold)
-                        if let throughput = summaryService.mlxThroughputState,
-                           throughput.provider == summaryService.settings.selectedSummaryProvider,
-                           throughput.provider != .appleCloud {
-                            Text(mlxThroughputInlineText(throughput))
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
+                        MLXThroughputText { text in
+                            Text(text)
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
                         }
                     }
                     
@@ -12489,6 +12527,7 @@ struct PostSummaryView: View {
             }
             .padding(.top)
         }
+        .pausesStreamingWhileScrolling()
         .scrollContentBackground(.hidden)
         .background(.clear)
         .modifier(RedappSummarySheetChrome(isEnabled: !isEmbeddedInPanel))
@@ -12547,28 +12586,6 @@ struct PostSummaryView: View {
         #endif
     }
 
-    private func mlxThroughputInlineText(_ state: SummaryService.MLXThroughputState) -> String {
-        let providerLabel: String = {
-            switch state.provider {
-            case .gemini: return "Gemini"
-            case .appleLocal: return "Apple Local"
-            case .appleCloud: return "Apple Cloud"
-            case .mlxLocal: return "LiteRT"
-            case .coreAIMLXLocal: return "CoreAI MLX"
-            case .webAI: return "Web AI"
-            case .summarizeDaemon: return "Codex/Summarize"
-            case .applePCCGateway: return "Apple PCC Gateway"
-            case .chatGPT: return "ChatGPT"
-            }
-        }()
-        if state.tokens == 0 && !state.isFinal {
-            return "\(providerLabel) generating..."
-        }
-        if state.isFinal {
-            return String(format: "\(providerLabel) avg %.1f tok/s • %d tok", state.tokensPerSecond, state.tokens)
-        }
-        return String(format: "\(providerLabel) %.1f tok/s • %d tok", state.tokensPerSecond, state.tokens)
-    }
 }
 
 // MARK: - Comment Summary View
@@ -12650,12 +12667,10 @@ struct CommentSummaryView: View {
                         Text("\(commentCount) comments analyzed • \(summaryType)")
                             .font(.subheadline)
                             .foregroundColor(.secondary)
-                        if let throughput = summaryService.mlxThroughputState,
-                           throughput.provider == summaryService.settings.selectedSummaryProvider,
-                           throughput.provider != .appleCloud {
-                            Text(mlxThroughputInlineText(throughput))
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
+                        MLXThroughputText { text in
+                            Text(text)
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
                         }
                     }
                     
@@ -12753,13 +12768,11 @@ struct CommentSummaryView: View {
                     if isAnswering {
                         ProgressView("Answering...")
                             .padding(.horizontal)
-                        if let throughput = summaryService.mlxThroughputState,
-                           throughput.provider == summaryService.settings.selectedSummaryProvider,
-                           throughput.provider != .appleCloud {
-                            Text(mlxThroughputInlineText(throughput))
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
-                                .padding(.horizontal)
+                        MLXThroughputText { text in
+                            Text(text)
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                                    .padding(.horizontal)
                         }
                     }
 
@@ -12813,6 +12826,7 @@ struct CommentSummaryView: View {
             }
             .padding(.top)
         }
+        .pausesStreamingWhileScrolling()
         .scrollContentBackground(.hidden)
         .background(.clear)
         .modifier(RedappSummarySheetChrome(isEnabled: !isEmbeddedInPanel))
@@ -12883,28 +12897,6 @@ struct CommentSummaryView: View {
         #endif
     }
 
-    private func mlxThroughputInlineText(_ state: SummaryService.MLXThroughputState) -> String {
-        let providerLabel: String = {
-            switch state.provider {
-            case .gemini: return "Gemini"
-            case .appleLocal: return "Apple Local"
-            case .appleCloud: return "Apple Cloud"
-            case .mlxLocal: return "LiteRT"
-            case .coreAIMLXLocal: return "CoreAI MLX"
-            case .webAI: return "Web AI"
-            case .summarizeDaemon: return "Codex/Summarize"
-            case .applePCCGateway: return "Apple PCC Gateway"
-            case .chatGPT: return "ChatGPT"
-            }
-        }()
-        if state.tokens == 0 && !state.isFinal {
-            return "\(providerLabel) generating..."
-        }
-        if state.isFinal {
-            return String(format: "\(providerLabel) avg %.1f tok/s • %d tok", state.tokensPerSecond, state.tokens)
-        }
-        return String(format: "\(providerLabel) %.1f tok/s • %d tok", state.tokensPerSecond, state.tokens)
-    }
     
     // MARK: - Q&A Functions
     
@@ -13644,8 +13636,11 @@ struct PostRowView: View {
         post.selftext.count > 10 || !post.imageURLs.isEmpty || !post.links.isEmpty
     }
 
+    private var isPinned: Bool { post.stickied == true }
+
     private var footerText: String {
         var parts = ["\(RedappNumber.compact(post.num_comments)) comment\(post.num_comments == 1 ? "" : "s")"]
+        if isPinned { parts.insert("Pinned", at: 0) }
         if let ageText { parts.append(ageText == "now" ? "just now" : "\(ageText) ago") }
         return parts.joined(separator: " · ")
     }
@@ -13688,10 +13683,18 @@ struct PostRowView: View {
                     expandedContent
                 }
 
-                Text(footerText)
-                    .font(.footnote)
-                    .foregroundStyle(RedappDesign.inkSecondary)
-                    .padding(.top, 1)
+                HStack(spacing: 4) {
+                    if isPinned {
+                        Image(systemName: "pin.fill")
+                            .font(.caption2)
+                            .foregroundStyle(RedappDesign.accent)
+                            .accessibilityHidden(true)
+                    }
+                    Text(footerText)
+                }
+                .font(.footnote)
+                .foregroundStyle(RedappDesign.inkSecondary)
+                .padding(.top, 1)
             }
             Spacer(minLength: 0)
 
@@ -13933,6 +13936,168 @@ struct ReadableReplyText: View {
             fontScale: fontScale,
             sourceLinks: sourceLinks
         )
+    }
+}
+
+/// The live tokens-per-second readout while a model streams. Kept apart from
+/// `SummaryService` so its updates (several a second) do not redraw whole screens.
+final class MLXThroughputReadout: ObservableObject {
+    static let shared = MLXThroughputReadout()
+    @Published var state: SummaryService.MLXThroughputState?
+
+    static func inlineText(_ state: SummaryService.MLXThroughputState) -> String {
+        let providerLabel: String = {
+            switch state.provider {
+            case .gemini: return "Gemini"
+            case .appleLocal: return "Apple Local"
+            case .appleCloud: return "Apple Cloud"
+            case .mlxLocal: return "LiteRT"
+            case .coreAIMLXLocal: return "CoreAI MLX"
+            case .webAI: return "Web AI"
+            case .summarizeDaemon: return "Codex/Summarize"
+            case .applePCCGateway: return "Apple PCC Gateway"
+            case .chatGPT: return "ChatGPT"
+            }
+        }()
+        if state.tokens == 0 && !state.isFinal {
+            return "\(providerLabel) generating..."
+        }
+        if state.isFinal {
+            return String(format: "\(providerLabel) avg %.1f tok/s • %d tok", state.tokensPerSecond, state.tokens)
+        }
+        return String(format: "\(providerLabel) %.1f tok/s • %d tok", state.tokensPerSecond, state.tokens)
+    }
+}
+
+/// Shows the readout for the selected provider (not Apple Cloud), styled by `content`.
+struct MLXThroughputText<Content: View>: View {
+    @ObservedObject private var readout = MLXThroughputReadout.shared
+    @ViewBuilder let content: (String) -> Content
+
+    var body: some View {
+        if let state = readout.state,
+           state.provider == SummaryService.shared.settings.selectedSummaryProvider,
+           state.provider != .appleCloud {
+            content(MLXThroughputReadout.inlineText(state))
+        }
+    }
+}
+
+/// Live text of a reply while it streams. Kept out of the view model so each
+/// chunk redraws only the view showing it, not every view observing the model,
+/// and batched so a fast stream updates the screen about 12 times a second.
+final class StreamingTextBuffer: ObservableObject {
+    @Published private(set) var text = ""
+    private var coalescer: ChatGPTStreamCoalescer?
+
+    @MainActor
+    func append(_ chunk: String) {
+        if coalescer == nil {
+            coalescer = ChatGPTStreamCoalescer { [weak self] batch in
+                self?.text += batch
+            }
+        }
+        coalescer?.append(chunk)
+    }
+
+    /// Delivers any held-back tail and returns everything streamed so far.
+    @MainActor
+    func flush() -> String {
+        coalescer?.flush()
+        return text
+    }
+
+    @MainActor
+    func reset() {
+        coalescer = nil
+        text = ""
+    }
+}
+
+#if os(iOS)
+/// Keeps the reader's place while a block above them grows, such as a reply streaming in.
+/// When the block is entirely above the visible area, the scroll offset moves by the same
+/// amount in the same layout pass, so the content under the finger stays put instead of
+/// being pushed down on every update.
+private struct ScrollPositionKeeper: UIViewRepresentable {
+    func makeUIView(context: Context) -> KeeperView { KeeperView() }
+    func updateUIView(_ uiView: KeeperView, context: Context) {}
+
+    final class KeeperView: UIView {
+        private var lastHeight: CGFloat?
+
+        override init(frame: CGRect) {
+            super.init(frame: frame)
+            isUserInteractionEnabled = false
+            backgroundColor = .clear
+        }
+
+        required init?(coder: NSCoder) {
+            fatalError("init(coder:) has not been implemented")
+        }
+
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            let height = bounds.height
+            defer { lastHeight = height }
+            guard let lastHeight, height != lastHeight, let scrollView = enclosingScrollView() else { return }
+            let previousBottom = convert(bounds, to: scrollView).minY + lastHeight
+            let visibleTop = scrollView.contentOffset.y + scrollView.adjustedContentInset.top
+            guard previousBottom <= visibleTop else { return }
+            scrollView.contentOffset.y += height - lastHeight
+        }
+
+        private func enclosingScrollView() -> UIScrollView? {
+            var view = superview
+            while let current = view {
+                if let scrollView = current as? UIScrollView, !(current is UITextView) {
+                    return scrollView
+                }
+                view = current.superview
+            }
+            return nil
+        }
+    }
+}
+#endif
+
+extension View {
+    /// Holds streamed text while the first scroll view in this view scrolls; it is delivered
+    /// once the scroll settles (see `ChatGPTStreamCoalescer`).
+    func pausesStreamingWhileScrolling() -> some View {
+        onScrollPhaseChange { _, phase in
+            StreamingScrollActivity.isScrolling = phase.isScrolling
+        }
+        // A screen closed mid-scroll never reports the scroll ending.
+        .onDisappear { StreamingScrollActivity.isScrolling = false }
+    }
+
+    /// See `ScrollPositionKeeper`. Apply to a block that can grow above the content being read.
+    func keepsReadingPositionWhenGrowing() -> some View {
+        #if os(iOS)
+        background(ScrollPositionKeeper())
+        #else
+        self
+        #endif
+    }
+}
+
+/// Renders a `StreamingTextBuffer`, showing `placeholder` until text arrives.
+struct StreamingReplyText<Placeholder: View>: View {
+    @ObservedObject var stream: StreamingTextBuffer
+    var fontScale: CGFloat = 1.0
+    var sourceLinks: [String: URL] = [:]
+    @ViewBuilder let placeholder: () -> Placeholder
+
+    var body: some View {
+        if stream.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            placeholder()
+        } else {
+            ReadableReplyText(content: stream.text, fontScale: fontScale, sourceLinks: sourceLinks)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.vertical, 4)
+        }
     }
 }
 
@@ -17008,6 +17173,9 @@ struct SidebarControls: View {
     @ObservedObject private var communities = RedappCommunitiesModel.shared
     var onCompose: (() -> Void)? = nil
     var onShowSidebar: (() -> Void)? = nil
+    #if os(iOS)
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    #endif
 
     private static let postLimitPresets = [10, 25, 50, 75, 100]
 
@@ -17037,7 +17205,20 @@ struct SidebarControls: View {
                     composeButton
                 }
 
-                feedTitleBlock
+                if showsAnalyzeBesideTitle {
+                    // Compact width: Analyze shares the title's row so the header stays short. A long
+                    // community name gets the shorter label, then the button's own row.
+                    ViewThatFits(in: .horizontal) {
+                        titleRowWithAnalyze(shortLabel: false)
+                        titleRowWithAnalyze(shortLabel: true)
+                        VStack(alignment: .leading, spacing: 14) {
+                            feedTitleBlock
+                            analyzeRow
+                        }
+                    }
+                } else {
+                    feedTitleBlock
+                }
             } else {
                 HStack(alignment: .top, spacing: 10) {
                     feedTitleBlock
@@ -17049,11 +17230,8 @@ struct SidebarControls: View {
                 }
             }
 
-            if !viewModel.posts.isEmpty {
-                HStack {
-                    Spacer()
-                    analyzeControl
-                }
+            if !showsAnalyzeBesideTitle && !viewModel.summarizablePosts.isEmpty {
+                analyzeRow
             }
 
             if isExportingBatchComments {
@@ -17096,14 +17274,12 @@ struct SidebarControls: View {
                         .lineLimit(1)
                         .truncationMode(.tail)
 
-                    if let throughput = summaryService.mlxThroughputState,
-                       throughput.provider == summaryService.settings.selectedSummaryProvider,
-                       throughput.provider != .appleCloud {
-                        Text(mlxThroughputInlineText(throughput))
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
+                    MLXThroughputText { text in
+                        Text(text)
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
                     }
                 }
                 .tint(RedappDesign.accent)
@@ -17129,15 +17305,41 @@ struct SidebarControls: View {
 #endif
     }
 
+    private var showsAnalyzeBesideTitle: Bool {
+        #if os(iOS)
+        // Compact width: iPhone, and iPad in a narrow (iPhone-style) window.
+        return onShowSidebar != nil
+            && horizontalSizeClass == .compact
+            && !viewModel.summarizablePosts.isEmpty
+        #else
+        return false
+        #endif
+    }
+
+    private var analyzeRow: some View {
+        HStack {
+            Spacer()
+            analyzeControl()
+        }
+    }
+
+    private func titleRowWithAnalyze(shortLabel: Bool) -> some View {
+        HStack(alignment: .center, spacing: 10) {
+            feedTitleBlock
+            Spacer(minLength: 8)
+            analyzeControl(shortLabel: shortLabel)
+        }
+    }
+
     /// "Analyze community": batch summarize (settings or web model) and export.
     @ViewBuilder
-    private var analyzeControl: some View {
+    private func analyzeControl(shortLabel: Bool = false) -> some View {
         if viewModel.isBatchProcessing {
             Button(action: {
                 focusedField.wrappedValue = nil
                 viewModel.cancelBatchProcessing()
             }) {
-                Label("Stop analysis", systemImage: "stop.circle.fill")
+                Label(shortLabel ? "Stop" : "Stop analysis", systemImage: "stop.circle.fill")
             }
             .buttonStyle(RedappSecondaryButtonStyle())
             .disabled(viewModel.isLoading || isExportingBatchComments)
@@ -17194,7 +17396,7 @@ struct SidebarControls: View {
                     } else {
                         Image(systemName: "chart.bar.xaxis")
                     }
-                    Text(viewModel.selectedFeedMode == .home ? "Analyze feed" : "Analyze community")
+                    Text(shortLabel ? "Analyze" : (viewModel.selectedFeedMode == .home ? "Analyze feed" : "Analyze community"))
                 }
             }
             .buttonStyle(RedappSecondaryButtonStyle())
@@ -17298,28 +17500,6 @@ struct SidebarControls: View {
         }
     }
 
-    private func mlxThroughputInlineText(_ state: SummaryService.MLXThroughputState) -> String {
-        let providerLabel: String = {
-            switch state.provider {
-            case .gemini: return "Gemini"
-            case .appleLocal: return "Apple Local"
-            case .appleCloud: return "Apple Cloud"
-            case .mlxLocal: return "LiteRT"
-            case .coreAIMLXLocal: return "CoreAI MLX"
-            case .webAI: return "Web AI"
-            case .summarizeDaemon: return "Codex/Summarize"
-            case .applePCCGateway: return "Apple PCC Gateway"
-            case .chatGPT: return "ChatGPT"
-            }
-        }()
-        if state.tokens == 0 && !state.isFinal {
-            return "\(providerLabel) generating..."
-        }
-        if state.isFinal {
-            return String(format: "\(providerLabel) avg %.1f tok/s • %d tok", state.tokensPerSecond, state.tokens)
-        }
-        return String(format: "\(providerLabel) %.1f tok/s • %d tok", state.tokensPerSecond, state.tokens)
-    }
 
     private var favoritesMenu: some View {
         Menu {
@@ -17548,7 +17728,7 @@ struct SidebarControls: View {
 
     private func exportBatchComments(subreddit: String) {
         guard !isExportingBatchComments else { return }
-        guard !viewModel.posts.isEmpty else { return }
+        guard !viewModel.summarizablePosts.isEmpty else { return }
 
         isExportingBatchComments = true
         batchCommentsExportProgress = 0
@@ -18294,14 +18474,13 @@ struct BatchResultsView: View {
                         )
                         .frame(width: 0, height: 0)
                         #endif
-                        if !isWebBatchMode,
-                           let throughput = summaryService.mlxThroughputState,
-                           throughput.provider == summaryService.settings.selectedSummaryProvider,
-                           throughput.provider != .appleCloud {
-                            Text(mlxThroughputInlineText(throughput))
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
-                                .padding(.horizontal)
+                        if !isWebBatchMode {
+                            MLXThroughputText { text in
+                                Text(text)
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                                    .padding(.horizontal)
+                            }
                         }
                         Color.clear
                             .frame(height: 0)
@@ -18364,15 +18543,21 @@ struct BatchResultsView: View {
                                 .id("overviewSection")
 
                                 if viewModel.isGeneratingBatchOverallSummary && finalSummaryIsEmpty {
-                                    HStack(spacing: 8) {
-                                        ProgressView()
-                                            .scaleEffect(0.85)
-                                        Text("Generating overall summary...")
-                                            .font(.caption)
-                                            .foregroundColor(.secondary)
+                                    StreamingReplyText(
+                                        stream: viewModel.batchFinalSummaryStream,
+                                        fontScale: 0.9,
+                                        sourceLinks: batchSourceLinks
+                                    ) {
+                                        HStack(spacing: 8) {
+                                            ProgressView()
+                                                .scaleEffect(0.85)
+                                            Text("Generating overall summary...")
+                                                .font(.caption)
+                                                .foregroundColor(.secondary)
+                                        }
+                                        .padding(.vertical, 4)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
                                     }
-                                    .padding(.vertical, 4)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
                                 } else {
                                     ReadableReplyText(content: finalSummary, fontScale: 0.9, sourceLinks: batchSourceLinks)
                                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -18396,6 +18581,7 @@ struct BatchResultsView: View {
                                 }
                             }
                             .padding(.horizontal)
+                            .keepsReadingPositionWhenGrowing()
                         }
                         
                         // Q&A Section
@@ -18429,13 +18615,11 @@ struct BatchResultsView: View {
                                     }
                                     .padding(.horizontal)
 
-                                    if let throughput = summaryService.mlxThroughputState,
-                                       throughput.provider == summaryService.settings.selectedSummaryProvider,
-                                       throughput.provider != .appleCloud {
-                                        Text(mlxThroughputInlineText(throughput))
-                                            .font(.caption2)
-                                            .foregroundColor(.secondary)
-                                            .padding(.horizontal)
+                                    MLXThroughputText { text in
+                                        Text(text)
+                                                .font(.caption2)
+                                                .foregroundColor(.secondary)
+                                                .padding(.horizontal)
                                     }
                                 }
                                 
@@ -18581,6 +18765,7 @@ struct BatchResultsView: View {
                             }
                             .padding(.horizontal)
                             .id("questionSection")
+                            .keepsReadingPositionWhenGrowing()
                         }
                         
                         // Overall Summary Section
@@ -18688,6 +18873,7 @@ struct BatchResultsView: View {
                                 .padding(.vertical, 4)
                             }
                             .id("llmSummarySection")
+                            .keepsReadingPositionWhenGrowing()
                             .padding(.horizontal)
                         }
 
@@ -18771,6 +18957,7 @@ struct BatchResultsView: View {
                     .padding(.horizontal, isBatchResultsCompactLayout ? 12 : 0)
                     #endif
                 }
+                .pausesStreamingWhileScrolling()
                 .scrollPosition($batchScrollPosition)
                 .environment(\.askAISelectionHandler, askAIHandler)
                 .environment(\.askAIWebSelectionHandler, askAIWebHandler)
@@ -21115,12 +21302,18 @@ struct BatchResultsView: View {
                 }
 
                 if viewModel.isGeneratingBatchOverallSummary && finalSummaryIsEmpty {
-                    HStack(spacing: 8) {
-                        ProgressView()
-                            .scaleEffect(0.8)
-                        Text("Generating subreddit overview...")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
+                    StreamingReplyText(
+                        stream: viewModel.batchFinalSummaryStream,
+                        fontScale: 0.9,
+                        sourceLinks: batchSourceLinks
+                    ) {
+                        HStack(spacing: 8) {
+                            ProgressView()
+                                .scaleEffect(0.8)
+                            Text("Generating subreddit overview...")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
                     }
                 } else if !finalSummaryIsEmpty {
                     ReadableReplyText(content: finalSummary, fontScale: 0.9, sourceLinks: batchSourceLinks)
@@ -21130,6 +21323,7 @@ struct BatchResultsView: View {
                 }
             }
             .padding(.horizontal)
+            .keepsReadingPositionWhenGrowing()
         }
 
         if isSendingBatchResultsToLLM {
@@ -21784,28 +21978,6 @@ struct BatchResultsView: View {
         #endif
     }
 
-    private func mlxThroughputInlineText(_ state: SummaryService.MLXThroughputState) -> String {
-        let providerLabel: String = {
-            switch state.provider {
-            case .gemini: return "Gemini"
-            case .appleLocal: return "Apple Local"
-            case .appleCloud: return "Apple Cloud"
-            case .mlxLocal: return "LiteRT"
-            case .coreAIMLXLocal: return "CoreAI MLX"
-            case .webAI: return "Web AI"
-            case .summarizeDaemon: return "Codex/Summarize"
-            case .applePCCGateway: return "Apple PCC Gateway"
-            case .chatGPT: return "ChatGPT"
-            }
-        }()
-        if state.tokens == 0 && !state.isFinal {
-            return "\(providerLabel) generating..."
-        }
-        if state.isFinal {
-            return String(format: "\(providerLabel) avg %.1f tok/s • %d tok", state.tokensPerSecond, state.tokens)
-        }
-        return String(format: "\(providerLabel) %.1f tok/s • %d tok", state.tokensPerSecond, state.tokens)
-    }
 
     private func sendBatchResultsToLLM() {
         guard !isSendingBatchResultsToLLM else { return }
@@ -25992,6 +26164,7 @@ struct RedditCommentsView: View {
                         }
                     )
                     .redappCard(cornerRadius: RedappDesign.Radius.large, padding: 18)
+                    .keepsReadingPositionWhenGrowing()
                     .id(askPanelID)
                     .transition(.move(edge: .top).combined(with: .opacity))
                 }
@@ -26183,11 +26356,16 @@ struct RedditCommentsView: View {
                         .foregroundStyle(RedappDesign.ink)
                         .lineLimit(1)
                         .fixedSize()
-                    Text("\(post?.num_comments ?? allComments.count) comments")
-                        .font(.subheadline)
-                        .foregroundStyle(RedappDesign.inkSecondary)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.85)
+                    // On a narrow screen the count drops its word before the sort label can wrap.
+                    ViewThatFits(in: .horizontal) {
+                        Text("\(post?.num_comments ?? allComments.count) comments")
+                        Text("\(post?.num_comments ?? allComments.count)")
+                    }
+                    .font(.subheadline)
+                    .foregroundStyle(RedappDesign.inkSecondary)
+                    .lineLimit(1)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("\(post?.num_comments ?? allComments.count) comments")
                     Spacer(minLength: 8)
                     Menu {
                         Picker("Sort comments", selection: $commentSort) {
@@ -26204,7 +26382,10 @@ struct RedditCommentsView: View {
                                 .foregroundStyle(RedappDesign.inkSecondary)
                         }
                         .font(.subheadline.weight(.medium))
+                        .lineLimit(1)
+                        .fixedSize()
                     }
+                    .fixedSize()
                     .disabled(allComments.isEmpty)
                 }
             }
@@ -26387,13 +26568,11 @@ struct RedditCommentsView: View {
             if isAnswering {
                 ProgressView("Answering...")
                     .padding(.horizontal)
-                if let throughput = summaryService.mlxThroughputState,
-                   throughput.provider == summaryService.settings.selectedSummaryProvider,
-                   throughput.provider != .appleCloud {
-                    Text(mlxThroughputInlineText(throughput))
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
-                        .padding(.horizontal)
+                MLXThroughputText { text in
+                    Text(text)
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                            .padding(.horizontal)
                 }
             }
 
@@ -26442,13 +26621,11 @@ struct RedditCommentsView: View {
                     .padding(.horizontal)
             }
 
-            if let throughput = summaryService.mlxThroughputState,
-               throughput.provider == summaryService.settings.selectedSummaryProvider,
-               throughput.provider != .appleCloud {
-                Text(mlxThroughputInlineText(throughput))
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
-                    .padding(.horizontal)
+            MLXThroughputText { text in
+                Text(text)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                        .padding(.horizontal)
             }
         }
         }
@@ -26731,6 +26908,7 @@ struct RedditCommentsView: View {
                         .padding(.bottom, 40)
                     }
                     }
+                    .pausesStreamingWhileScrolling()
                 }
             }
             .background(RedappDesign.canvas)
@@ -26801,12 +26979,10 @@ struct RedditCommentsView: View {
                                  "Summarizing post…")
                                 .font(.subheadline.weight(.semibold))
                                 .foregroundStyle(RedappDesign.ink)
-                            if let throughput = summaryService.mlxThroughputState,
-                               throughput.provider == summaryService.settings.selectedSummaryProvider,
-                               throughput.provider != .appleCloud {
-                                Text(mlxThroughputInlineText(throughput))
-                                    .font(.caption)
-                                    .foregroundStyle(RedappDesign.inkSecondary)
+                            MLXThroughputText { text in
+                                Text(text)
+                                        .font(.caption)
+                                        .foregroundStyle(RedappDesign.inkSecondary)
                             }
                         }
                     }
@@ -28783,28 +28959,6 @@ struct RedditCommentsView: View {
             }
         }
 
-        private func mlxThroughputInlineText(_ state: SummaryService.MLXThroughputState) -> String {
-            let providerLabel: String = {
-                switch state.provider {
-                case .gemini: return "Gemini"
-                case .appleLocal: return "Apple Local"
-                case .appleCloud: return "Apple Cloud"
-                case .mlxLocal: return "LiteRT"
-                case .coreAIMLXLocal: return "CoreAI MLX"
-                case .webAI: return "Web AI"
-                case .summarizeDaemon: return "Codex/Summarize"
-            case .applePCCGateway: return "Apple PCC Gateway"
-            case .chatGPT: return "ChatGPT"
-                }
-            }()
-            if state.tokens == 0 && !state.isFinal {
-                return "\(providerLabel) generating..."
-            }
-            if state.isFinal {
-                return String(format: "\(providerLabel) avg %.1f tok/s • %d tok", state.tokensPerSecond, state.tokens)
-            }
-            return String(format: "\(providerLabel) %.1f tok/s • %d tok", state.tokensPerSecond, state.tokens)
-        }
 
     }
     
