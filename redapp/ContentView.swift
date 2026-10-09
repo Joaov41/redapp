@@ -25392,6 +25392,9 @@ struct ContentView: View {
                     // iPhone: swipe right from the left edge of the list to open the
                     // sidebar (the system back swipe is off because the bar is custom).
                     .simultaneousGesture(sidebarEdgeSwipe(whileReading: false))
+                    .trackpadSwipe { translation, _ in
+                        sidebarTrackpadSwipeEnded(translation, whileReading: false)
+                    }
                     // A thin edge strip owns swipes that start at the left edge, so
                     // they open the sidebar instead of tapping the post underneath.
                     .overlay(alignment: .leading) {
@@ -25420,6 +25423,9 @@ struct ContentView: View {
                     feedColumn
                         // Sidebar hidden (half-screen iPad): swipe right on the list to show it.
                         .simultaneousGesture(sidebarEdgeSwipe(whileReading: true))
+                        .trackpadSwipe { translation, _ in
+                            sidebarTrackpadSwipeEnded(translation, whileReading: true)
+                        }
                         .overlay(alignment: .leading) {
                             if isSidebarHidden {
                                 Color.clear
@@ -25689,6 +25695,14 @@ struct ContentView: View {
             }
     }
 
+    /// Two-finger trackpad swipe right on the post list reveals a hidden sidebar.
+    private func sidebarTrackpadSwipeEnded(_ translation: CGFloat, whileReading: Bool) {
+        guard isSidebarHidden, whileReading || selectedPost == nil else { return }
+        if translation > 80 {
+            showSidebar()
+        }
+    }
+
     private func showDetailOnCompact() {
         guard isSingleColumnLayout else { return }
         preferredCompactColumn = .detail
@@ -25728,6 +25742,19 @@ struct ContentView: View {
                 .ignoresSafeArea(edges: .bottom)
                 .offset(x: max(dragOffset, 0))
                 .simultaneousGesture(backSwipeGesture)
+                // Two-finger trackpad swipe right goes back too (touch swipes use backSwipeGesture).
+                .trackpadSwipe(onChanged: { translation in
+                    dragOffset = max(0, translation)
+                }, onEnded: { translation, velocity in
+                    let projected = max(translation, translation + velocity * 0.15)
+                    if projected > 140 {
+                        completeInteractiveDismissal(predictedEnd: projected)
+                    } else {
+                        withAnimation(.spring(response: 0.3, dampingFraction: 0.82)) {
+                            dragOffset = 0
+                        }
+                    }
+                })
             }
             .animation(.easeInOut(duration: 0.2), value: dragOffset)
         }
